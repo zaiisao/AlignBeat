@@ -188,23 +188,14 @@ def get_results_from_model(audio, target, model, iou_threshold=0.5, score_thresh
         audio = audio.to('cuda')
         target = target.to('cuda')
 
-    if model.module.dstcn is not None:
-        nblocks = len(model.module.dstcn.blocks)
-
-        target_length = -(audio.size(dim=2) // -2**nblocks) * 2**nblocks
-        audio_pad = (0, target_length - audio.size(dim=2))
-        audio = torch.nn.functional.pad(audio, audio_pad, "constant", 0)
-
     # run network
-    # scores, labels, boxes = model(audio.permute(2, 0, 1).cuda().float().unsqueeze(dim=0))
-    # predicted_scores, predicted_labels, predicted_boxes = model((audio, target))
-
-    predicted_scores, predicted_labels, predicted_boxes, losses = model( #MJ: shape =(15,) (15,) (15,2)
-        (audio, target),
-        iou_threshold=iou_threshold,
-        score_threshold=score_threshold,
-        max_thresh=max_thresh
-    ) #MJ: The results of model() has been obtained by applying the nms process
+    with torch.no_grad():
+        predicted_scores, predicted_labels, predicted_boxes, losses = model( #MJ: shape =(15,) (15,) (15,2)
+            (audio, target),
+            iou_threshold=iou_threshold,
+            score_threshold=score_threshold,
+            max_thresh=max_thresh
+        ) #MJ: The results of model() has been obtained by applying the nms process
 
     predicted_scores = predicted_scores.cpu()
     predicted_labels = predicted_labels.cpu()

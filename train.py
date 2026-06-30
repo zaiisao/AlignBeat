@@ -59,9 +59,9 @@ parser.add_argument('--rwc_popular_audio_dir', type=str, default=None)
 parser.add_argument('--rwc_popular_annot_dir', type=str, default=None)
 parser.add_argument('--carnatic_audio_dir', type=str, default=None)
 parser.add_argument('--carnatic_annot_dir', type=str, default=None)
-parser.add_argument('--preload', default=True, action="store_true")
+parser.add_argument('--preload', default=False, action="store_true")
 parser.add_argument('--audio_sample_rate', type=int, default=22050)
-parser.add_argument('--audio_downsampling_factor', type=int, default=128) # block 하나당 곱하기 2
+parser.add_argument('--audio_downsampling_factor', type=int, default=512)  # 128 → 512 (hop_length)
 parser.add_argument('--shuffle', type=bool, default=True)
 parser.add_argument('--train_subset', type=str, default='train')
 parser.add_argument('--val_subset', type=str, default='val')
@@ -90,7 +90,7 @@ parser.add_argument('--skip_connections', default=False, action="store_true")
 parser.add_argument('--norm_type', type=str, default='BatchNorm')
 parser.add_argument('--act_type', type=str, default='PReLU')
 parser.add_argument('--downbeat_weight', type=float, default=0.6)
-parser.add_argument('--pretrained', default=True, action="store_true")
+parser.add_argument('--pretrained', default=False, action="store_true")  # True → False
 parser.add_argument('--freeze_backbone', default=False, action="store_true")
 parser.add_argument('--centerness', default=False, action="store_true")
 parser.add_argument('--postprocessing_type', type=str, default='soft_nms')
@@ -98,6 +98,14 @@ parser.add_argument('--no_adj', default=False, action="store_true")
 parser.add_argument('--validation_fold', type=int, default=None)
 parser.add_argument('--backbone_type', type=str, default="wavebeat")
 parser.add_argument('--hop_length_in_seconds', type=float, default=0.01) # This is from Spectral TCN
+parser.add_argument('--dmodel', type=int, default=128)
+parser.add_argument('--nhead', type=int, default=2)
+parser.add_argument('--d_hid', type=int, default=512)
+parser.add_argument('--nlayers', type=int, default=9)
+parser.add_argument('--attn_len', type=int, default=5)
+parser.add_argument('--dropout', type=float, default=0.1)
+
+
 
 # THIS LINE IS KEY TO PULL THE MODEL NAME
 temp_args, _ = parser.parse_known_args()
@@ -106,7 +114,7 @@ temp_args, _ = parser.parse_known_args()
 args = parser.parse_args()
 
 # datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles"]
-datasets = ["ballroom"]
+datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles"]
 #MJ: for testing: datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles"]
 
 # set the seed
@@ -118,7 +126,7 @@ np.random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 #
 args.default_root_dir = os.path.join("lightning_logs", "full")
@@ -179,7 +187,7 @@ for dataset in datasets:
                                     preload=args.preload,
                                     length=args.train_length,
                                     dry_run=args.dry_run,
-                                    spectral=True if args.backbone_type == "tcn2019" else False,
+                                    spectral=True,  # "True if args.backbone_type == "tcn2019" else False" 제거
                                     validation_fold=args.validation_fold)
     train_datasets.append(train_dataset)
 
@@ -194,7 +202,7 @@ for dataset in datasets:
                                  preload=args.preload,
                                  length=args.eval_length,
                                  dry_run=args.dry_run,
-                                 spectral=True if args.backbone_type == "tcn2019" else False,
+                                 spectral=True,
                                  validation_fold=args.validation_fold)
     val_datasets.append(val_dataset)
 
@@ -247,8 +255,8 @@ dict_args = vars(args)
 
 if __name__ == '__main__':
     # Create the model
-    training_data_clusters = get_training_data_clusters()
-    # training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.24245649, 1.93286828, 2.78558922])
+    #training_data_clusters = get_training_data_clusters()
+    training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.24245649, 1.93286828, 2.78558922])
 
     beatfcos = model_module.create_beatfcos_model(num_classes=2, clusters=training_data_clusters, args=args, **dict_args)
 
@@ -264,6 +272,7 @@ if __name__ == '__main__':
         beatfcos.load_state_dict(torch.load(checkpoint_path, device))
 
     beatfcos.training = True
+    print(f'[MEM] after model init: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
 
     optimizer = torch.optim.Adam(beatfcos.parameters(), lr=args.lr, weight_decay=1e-4) # Default weight decay is 0
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, verbose=True)
@@ -287,6 +296,8 @@ if __name__ == '__main__':
         lft_losses = []
         adj_losses = []
 
+        print(f'[MEM] epoch {epoch_num} start: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
+
         for iter_num, data in enumerate(train_dataloader): #target[:,:,0:2]=interval, target[:,:,2]=class
             audio, target = data  #MJ: audio:shape =(16,1,3000,81); target:shape=(16,128,3)
             if torch.cuda.is_available():
@@ -299,7 +310,7 @@ if __name__ == '__main__':
                 classification_loss, regression_loss,\
                 leftness_loss, adjacency_constraint_loss =\
                     beatfcos((audio, target))
-    
+
                 classification_loss = classification_loss.mean()
                 regression_loss = regression_loss.mean()
                 leftness_loss = leftness_loss.mean()
@@ -331,20 +342,26 @@ if __name__ == '__main__':
                         float(leftness_loss), float(adjacency_constraint_loss), np.mean(loss_hist))
                 )
 
+                if iter_num % 10 == 0:
+                    print(f'[MEM] iter {iter_num}: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB, audio={audio.shape}')
+
                 del classification_loss
                 del regression_loss
                 del leftness_loss
                 del adjacency_constraint_loss
+                del loss
             except KeyboardInterrupt:
                 sys.exit()
             except Exception as e:
                 print(e)
                 traceback.print_exc()
+                torch.cuda.empty_cache()
                 continue
 
         # End of: for iter_num, data in enumerate(train_dataloader)
 
         # Evaluate the evaluation dataset in each epoch
+        print(f'[MEM] before eval: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
         print('Evaluating dataset')
         beat_mean_f_measure, downbeat_mean_f_measure, _ = evaluate_beat_f_measure(
             val_dataloader, beatfcos, args.audio_downsampling_factor, args.audio_sample_rate, score_threshold=0.20)

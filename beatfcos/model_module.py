@@ -8,7 +8,8 @@ from beatfcos.utils import AnchorPointTransform, ClipBoxes, nms_2d, soft_nms
 from beatfcos.anchors import Anchors
 from beatfcos import losses
 from beatfcos.losses import CombinedLoss
-from beatfcos.dstcn import dsTCNModel
+from beatfcos.beat_transformer_encoder import BeatTransformerEncoder
+
 
 model_urls = {
     'wavebeat8': './backbone/wavebeat8.pth',
@@ -29,51 +30,43 @@ class PyramidFeatures(nn.Module):
     # >256 => 288 =>  320: C3=256, C=288, C5 = 320
 
     #def __init__(self, C3_size, C4_size, C5_size, feature_size=256):
-    def __init__(self, C4_size, C5_size, feature_size=256):
+    def __init__(self, C1_size, C2_size, C3_size, feature_size=256):
         super(PyramidFeatures, self).__init__()
-        # upsample C5 to get P5 from the FPN paper
-        self.P5_1 = nn.Conv1d(C5_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P5_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.P5_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
+        # C3 (coarsest, T/4) → P3
+        self.P3_1 = nn.Conv1d(C3_size, feature_size, kernel_size=1, stride=1, padding=0)
+        self.P3_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
+        self.P3_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
 
-        # add P5 elementwise to C4
-        self.P4_1 = nn.Conv1d(C4_size, feature_size, kernel_size=1, stride=1, padding=0)
-        self.P4_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.P4_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
+        # C2 (T/2) + P3_upsampled → P2
+        self.P2_1 = nn.Conv1d(C2_size, feature_size, kernel_size=1, stride=1, padding=0)
+        self.P2_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
+        self.P2_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
 
-        # "P6 is obtained via a 3x3 stride-2 conv on C5"
-        self.P6 = nn.Conv1d(C5_size, feature_size, kernel_size=3, stride=2, padding=1)
+        # C1 (finest, T) + P2_upsampled → P1
+        self.P1_1 = nn.Conv1d(C1_size, feature_size, kernel_size=1, stride=1, padding=0)
+        self.P1_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=1, padding=1)
 
-        # "P7 is computed by applying ReLU followed by a 3x3 stride-2 conv on P6"
-        self.P7_1 = nn.ReLU()
-        self.P7_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=2, padding=1)
-        
-        self.P8_1 = nn.ReLU()
-        self.P8_2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, stride=2, padding=1)
 
-    def forward(self, inputs): #MJ: called by feature_maps = self.fpn([x2, x3])
-        # C3, C4, C5 = inputs
-        C4, C5 = inputs
 
-        P5_x = self.P5_1(C5)
-        P5_upsampled_x = self.P5_upsampled(P5_x)
-        P5_x = self.P5_2(P5_x)
+    def forward(self, inputs):
+        C1, C2, C3 = inputs  # C1=finest(T), C2=(T/2), C3=coarsest(T/4)
 
-        P4_x = self.P4_1(C4)
-        P4_x = P5_upsampled_x + P4_x
-        P4_upsampled_x = self.P4_upsampled(P4_x)
-        P4_x = self.P4_2(P4_x)
+        P3_x = self.P3_1(C3)
+        P3_upsampled_x = self.P3_upsampled(P3_x)
+        P3_x = self.P3_2(P3_x)
 
-        P6_x = self.P6(C5)
+        P2_x = self.P2_1(C2)
+        P2_x = P3_upsampled_x + P2_x
+        P2_upsampled_x = self.P2_upsampled(P2_x)
+        P2_x = self.P2_2(P2_x)
 
-        P7_x = self.P7_1(P6_x)
-        P7_x = self.P7_2(P7_x)
+        P1_x = self.P1_1(C1)
+        P1_x = P2_upsampled_x + P1_x
+        P1_x = self.P1_2(P1_x)
 
-        P8_x = self.P8_1(P7_x)
-        P8_x = self.P8_2(P8_x)
+        return [P1_x, P2_x, P3_x]
 
-        # return [P3_x, P4_x, P5_x, P6_x, P7_x]
-        return [P4_x, P5_x, P6_x, P7_x, P8_x]
+
 
 
 class RegressionModel(nn.Module):
@@ -179,21 +172,20 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
         self.backbone_type = backbone_type
 
-        self.dstcn = None
-        self.tcn2019 = None
+        dmodel = kwargs.get('dmodel', 128)
+        encoder_keys = ['dmodel', 'nhead', 'd_hid', 'nlayers', 'attn_len', 'dropout', 'norm_first']
+        encoder_kwargs = {k: kwargs[k] for k in encoder_keys if k in kwargs}
+        self.encoder = BeatTransformerEncoder(**encoder_kwargs)
 
-        if self.backbone_type == "wavebeat":
-            self.dstcn = dsTCNModel(**kwargs)
-        elif self.backbone_type == "tcn2019":
-            from tcn2019.beat_tracking_tcn.models.beat_net import BeatNet
-            self.tcn2019 = BeatNet(downbeats=True)
 
-        if backbone_type == "wavebeat":
-            C4_size, C5_size = self.dstcn.blocks[-2].out_ch, self.dstcn.blocks[-1].out_ch
-        elif backbone_type == "tcn2019":
-            C4_size, C5_size = self.tcn2019.tcn.blocks[-2].out_ch, self.tcn2019.tcn.blocks[-1].out_ch
+        self.rho1 = nn.Identity()
+        self.rho2 = nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
+        self.rho3 = nn.Sequential(
+            nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1),
+            nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
+        )
 
-        self.fpn = PyramidFeatures(C4_size, C5_size)
+        self.fpn = PyramidFeatures(dmodel, dmodel, dmodel)
 
         self.classificationModel = ClassificationModel(256, num_classes=num_classes)
         self.regressionModel = RegressionModel(256)
@@ -249,29 +241,19 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             audio_batch = inputs
 
 
-        number_of_backbone_layers = 2 #MJ: now execute the backbone net
+        C1, C2, C3 = self.encoder(audio_batch)
 
-        if self.backbone_type == "wavebeat":
-            # audio_batch is the original audio sampled at 22050 Hz
+        C1 = C1.transpose(1, 2)
+        C2 = C2.transpose(1, 2)
+        C3 = C3.transpose(1, 2)
 
-            # From WaveBeat model
-            # With 8 layers, each with stride 2, we downsample the signal by a factor of 2^8 = 256,
-            # which, given an input sample rate of 22.05 kHz produces an output signal with a
-            # sample rate of 86 Hz
+        C1 = self.rho1(C1)
+        C2 = self.rho2(C2)
+        C3 = self.rho3(C3)
 
-            base_image_level = math.log2(self.audio_downsampling_factor)    # The image at level 7 is the downsampled base on which the regression targets are defined
-                                                                            # and the feature map strides are defined relative to it
-            tcn_layers, base_level_image_shape = self.dstcn(audio_batch, number_of_backbone_layers, base_image_level)
-        elif self.backbone_type == "tcn2019":
-            # JA: here the audio_batch is a batch of spectrograms
-            base_image_level_from_top = 1   #MJ: audio_batch: shape =(1,3000,81)
-            tcn_layers, base_level_image_shape = self.tcn2019(audio_batch, number_of_backbone_layers, base_image_level_from_top)
-            # tcn_layers[-1] = self.tcn2019_last_output_conv(tcn_layers[-1])
+        base_level_image_shape = C1.shape
 
-        x2 = tcn_layers[-2]  #MJ: shape = (16/1,16,3000)
-        x3 = tcn_layers[-1]  #MJ: shape = (16/1,16,1500)
-
-        feature_maps = self.fpn([x2, x3]) #MJ feature_maps[0].shape=(16,256,3000)...feature_maps[4].shape=(16,256,188)=(B,C,L)
+        feature_maps = self.fpn([C1, C2, C3])
 
         classification_outputs = torch.cat([self.classificationModel(feature_map) for feature_map in feature_maps], dim=1)
         regression_outputs = []
@@ -326,7 +308,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 strides_for_all_anchors = torch.cat((strides_for_all_anchors, stride_per_level_for_anchors), dim=0)
 
             transformed_regression_boxes = self.anchor_point_transform(all_anchors, regression_outputs, strides_for_all_anchors)
-            transformed_regression_boxes = self.clipBoxes(transformed_regression_boxes, audio_batch)
+            transformed_regression_boxes = self.clipBoxes(transformed_regression_boxes, audio_batch.transpose(1, 2))
 
             for class_id in range(classification_outputs.shape[2]): # the shape of classification_output is (B, number of anchor points per level, class ID)
                 scores = classification_outputs[:, :, class_id] * leftness_outputs[:, :, 0] # We predict the max number for beats will be less than the num of anchors
@@ -400,43 +382,4 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
 def create_beatfcos_model(num_classes, clusters, args, **kwargs):
     model = BeatFCOS(num_classes, clusters, **kwargs)
-
-    if args.pretrained:
-        if args.backbone_type == "wavebeat":
-            model_key = 'wavebeat8'
-        elif args.backbone_type == "tcn2019":
-            model_key = 'tcn2019'
-
-        if args.validation_fold is not None:
-            if args.backbone_type == "wavebeat":
-                model_key = f"wavebeat_fold_{args.validation_fold}"
-
-        if args.backbone_type == "wavebeat":
-            state_dict = torch.load(model_urls[model_key])
-            state_dict = state_dict['state_dict']
-        elif args.backbone_type == "tcn2019":
-            state_dict = torch.load(model_urls[model_key], map_location='cuda:0')
-
-        new_dict = OrderedDict()
-
-        for k, v in state_dict.items():
-            key = k
-            #key = k.replace('module.', '') # The parameter key that starts with "module." means that these parameters are from the parallelized model
-            # For example, if the name of the parallelized module is "model_ddp" then the module_ddp.module refers to the original unwrapped model
-            new_dict[key] = v
-
-        if args.backbone_type == "wavebeat":
-            missing_keys, unexpected_keys = model.dstcn.load_state_dict(new_dict, strict=False)
-        elif args.backbone_type == "tcn2019":
-            missing_keys, unexpected_keys = model.tcn2019.load_state_dict(new_dict, strict=False)
-
-        print(f"Loaded {model_key} backbone. Missing keys: {missing_keys}, Unexpected keys: {unexpected_keys}")
-
-        print("Freezing batch norm...")
-        model.freeze_bn()
-
-        if args.freeze_backbone:
-            print("Freezing DSTCN...")
-            model.dstcn.freeze()
-
     return model

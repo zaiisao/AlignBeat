@@ -11,7 +11,7 @@ class Anchors(nn.Module):
 
         #self.pyramid_levels = [8, 9, 10, 11, 12] # Actual strides we use are [2 ** 0, 2 ** 1, 2 ** 2, 2 ** 3, 2 ** 4]
         #self.pyramid_levels = [1, 2, 3, 4, 5]
-        self.pyramid_levels = [0, 1, 2, 3, 4]
+        self.pyramid_levels = [0, 1, 2]
         
         # # (1, 2, 3, 4, 5) with base_level=0. Actual strides are [2 ** 1, 2 ** 2, 2 ** 3, 2 ** 4, 2 ** 5]
         self.strides = [2 ** x for x in self.pyramid_levels]
