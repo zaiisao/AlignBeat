@@ -140,9 +140,19 @@ class SetPredictionHead(nn.Module):
 
         self.query_embed = nn.Embedding(num_queries, feature_size)
 
+        # norm_first=True (Pre-LN): 기본값인 Post-LN은 학습 초반 gradient가 커서
+        # self-attention이 몇몇 토큰에만 쏠리는 형태로 빠르게 굳어버리기 쉽고,
+        # 그 결과 query_embed 자체는 서로 다른 값(diverse)을 유지하는데도
+        # decoder를 통과한 뒤에는 대부분 비슷한 출력으로 뭉치는
+        # 현상(representation collapse)이 생길 수 있다 (Xiong et al. 2020).
+        # 실제로 retinanet_1.pt를 진단해보니 query_embed 자체의 pairwise cosine
+        # similarity는 랜덤 초기화 수준(~0.0004)으로 전혀 안 뭉쳐 있었는데,
+        # decoder 출력(예측된 박스 위치)은 300개 중 7~10곳으로 뭉쳐 있었다 —
+        # 즉 collapse가 embedding이 아니라 decoder 내부에서 일어난다는 뜻이라
+        # Pre-LN으로 바꿔서 이 부분을 안정화함.
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=feature_size, nhead=nhead, dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True
+            dropout=dropout, batch_first=True, norm_first=True
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=decoder_layers)
 
@@ -285,11 +295,21 @@ class SetCriterion(nn.Module):
         # 동등하게 취급하다가, 학습되면서 모델이 알아서 상대적 중요도를 조정함.
         self.log_vars = nn.Parameter(torch.zeros(3))
 
+        # log_var에 아무 제약이 없으면 한쪽으로 계속 커지거나(runaway) 작아질 수
+        # 있고(Kendall et al. 2018 방식의 알려진 약점), 실제로 학습 중 bbox 쪽
+        # log_var가 epoch마다 계속 더 작아지면서(-0.07→-0.29→-0.31) 성능이
+        # 갑자기 무너지는 게 관찰됨. exp(-log_var)가 너무 커지면 그 loss 항이
+        # 갑자기 폭증해서 학습 전체를 흔들 수 있어서, [-2, 2] 범위로 clamp함
+        # (implicit weight 기준 대략 0.135~7.39배 사이로 제한).
+        self.log_var_clamp = 2.0
+
     def forward(self, class_logits, boxes, targets):
+        clamped_log_vars = torch.clamp(self.log_vars, -self.log_var_clamp, self.log_var_clamp)
+
         # 매칭 비용도 지금 학습 중인 상대적 중요도(log_var)를 그대로 써서,
         # 매칭 기준과 최종 loss 기준이 항상 일치하게 함(고정된 별도 숫자 없음).
         with torch.no_grad():
-            implicit_weights = torch.exp(-self.log_vars)
+            implicit_weights = torch.exp(-clamped_log_vars)
         indices = self.matcher(
             class_logits, boxes, targets,
             weight_class=implicit_weights[0].item(),
@@ -336,9 +356,11 @@ class SetCriterion(nn.Module):
         # 각 항에 이미 포함해서 반환하므로, train.py에서 셋을 단순히 더하기만
         # 해도(train.py는 4개 반환값을 그대로 sum함) 올바른 uncertainty-weighted
         # 총 loss가 됨.
-        weighted_class = torch.exp(-self.log_vars[0]) * loss_class + self.log_vars[0]
-        weighted_bbox = torch.exp(-self.log_vars[1]) * loss_bbox + self.log_vars[1]
-        weighted_giou = torch.exp(-self.log_vars[2]) * loss_giou + self.log_vars[2]
+        # clamp된 log_var로 계산 - clamp는 범위 안에서는 그대로 gradient가
+        # 흐르고, 경계를 넘어서려 할 때만 gradient를 막아 더 못 벗어나게 함.
+        weighted_class = torch.exp(-clamped_log_vars[0]) * loss_class + clamped_log_vars[0]
+        weighted_bbox = torch.exp(-clamped_log_vars[1]) * loss_bbox + clamped_log_vars[1]
+        weighted_giou = torch.exp(-clamped_log_vars[2]) * loss_giou + clamped_log_vars[2]
 
         return {
             "loss_class": weighted_class,

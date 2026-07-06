@@ -334,7 +334,16 @@ if __name__ == '__main__':
 
                 loss.backward()
 
-                torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), 0.1)
+                # 0.1은 원래 FCOS(조밀 anchor) 쪽에 맞춰 튜닝된 값. hungarian head는
+                # 새로 초기화된 transformer decoder를 처음부터 학습시켜야 하는데,
+                # 이 전역 clip 값이 전체 파라미터(backbone+decoder+query_embed)에
+                # 공통으로 걸리다 보니 decoder/query_embed 쪽에 돌아가는 실질적인
+                # gradient가 지나치게 작아짐 (query_embed는 여전히 랜덤 초기화
+                # 수준으로 diverse한데, decoder를 통과하면 몇 곳으로 뭉치는 현상과
+                # 관련 있는 것으로 추정). DETR류 학습에서 흔히 쓰는 값(1.0)으로
+                # hungarian 경로만 완화하고, 기존 FCOS 경로는 그대로 0.1 유지.
+                clip_norm = 1.0 if args.head_type == "hungarian" else 0.1
+                torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
 
                 optimizer.step()
 
