@@ -341,12 +341,24 @@ if __name__ == '__main__':
                 loss_hist.append(float(loss))
                 epoch_loss.append(float(loss))
 
-                print(
-                    'Epoch: {} | Iteration: {} | CLS: {:1.5f} | REG: {:1.5f} | LFT: {:1.5f} | ADJ: {:1.5f} | Running loss: {:1.5f}'.format(
-                        epoch_num, iter_num,
-                        float(classification_loss), float(regression_loss),
-                        float(leftness_loss), float(adjacency_constraint_loss), np.mean(loss_hist))
-                )
+                # head_type="hungarian"에는 leftness/adjacency 개념 자체가 없음 (anchor
+                # 기반 FCOS 전용 개념). REG/LFT 자리는 실제로 bbox L1 / GIoU loss이고
+                # ADJ는 아예 안 쓰이므로(model_module.py의 _forward_hungarian 참고),
+                # 헷갈리지 않게 라벨을 다르게 출력한다.
+                if args.head_type == "hungarian":
+                    print(
+                        'Epoch: {} | Iteration: {} | CLS: {:1.5f} | BBOX(L1): {:1.5f} | GIOU: {:1.5f} | Running loss: {:1.5f}'.format(
+                            epoch_num, iter_num,
+                            float(classification_loss), float(regression_loss),
+                            float(leftness_loss), np.mean(loss_hist))
+                    )
+                else:
+                    print(
+                        'Epoch: {} | Iteration: {} | CLS: {:1.5f} | REG: {:1.5f} | LFT: {:1.5f} | ADJ: {:1.5f} | Running loss: {:1.5f}'.format(
+                            epoch_num, iter_num,
+                            float(classification_loss), float(regression_loss),
+                            float(leftness_loss), float(adjacency_constraint_loss), np.mean(loss_hist))
+                    )
 
                 if iter_num % 10 == 0:
                     print(f'[MEM] iter {iter_num}: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB, audio={audio.shape}')
@@ -375,7 +387,10 @@ if __name__ == '__main__':
         joint_f_measure = (beat_mean_f_measure + downbeat_mean_f_measure)/2
 
         print(f"Epoch = {epoch_num} | Beat score: {beat_mean_f_measure:0.3f} | Downbeat score: {downbeat_mean_f_measure:0.3f} | Joint score: {joint_f_measure:0.3f}")
-        print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | REG: {np.mean(reg_losses):0.3f} | LFT: {np.mean(lft_losses):0.3f} | ADJ: {np.mean(adj_losses):0.3f}")
+        if args.head_type == "hungarian":
+            print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | BBOX(L1): {np.mean(reg_losses):0.3f} | GIOU: {np.mean(lft_losses):0.3f}")
+        else:
+            print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | REG: {np.mean(reg_losses):0.3f} | LFT: {np.mean(lft_losses):0.3f} | ADJ: {np.mean(adj_losses):0.3f}")
         scheduler.step(joint_f_measure)
 
         should_save_checkpoint = False

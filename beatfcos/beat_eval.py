@@ -642,7 +642,13 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
 
 
             print(f"{index}/{len(dataloader)} {metadata['Filename']}")
-            print(f"BEAT (F-measure): {beat_scores['F-measure']:0.3f} | DOWNBEAT (F-measure): {downbeat_scores['F-measure']:0.3f} | CLS: {losses[0]:0.3f} | REG: {losses[1]:0.3f} | LFT: {losses[2]:0.3f} | ADJ: {losses[3]:0.3f}")
+            # head_type="hungarian"에는 leftness/adjacency 개념이 없음(anchor 기반
+            # FCOS 전용) - losses[1]/losses[2]는 실제로 bbox L1 / GIoU, losses[3](ADJ)은
+            # 항상 0이라 헷갈리지 않게 라벨을 다르게 출력한다.
+            if getattr(model, 'module', model).head_type == "hungarian":
+                print(f"BEAT (F-measure): {beat_scores['F-measure']:0.3f} | DOWNBEAT (F-measure): {downbeat_scores['F-measure']:0.3f} | CLS: {losses[0]:0.3f} | BBOX(L1): {losses[1]:0.3f} | GIOU: {losses[2]:0.3f}")
+            else:
+                print(f"BEAT (F-measure): {beat_scores['F-measure']:0.3f} | DOWNBEAT (F-measure): {downbeat_scores['F-measure']:0.3f} | CLS: {losses[0]:0.3f} | REG: {losses[1]:0.3f} | LFT: {losses[2]:0.3f} | ADJ: {losses[3]:0.3f}")
             #print("LEFT")
             # print(f"BEAT (F-measure): {beat_scores_left['F-measure']:0.3f} | DOWNBEAT (F-measure): {downbeat_scores_left['F-measure']:0.3f}")
             # print(f"(DBN)  BEAT (F-measure): {dbn_beat_scores_left['F-measure']:0.3f} | DOWNBEAT (F-measure): {dbn_downbeat_scores_left['F-measure']:0.3f}")
@@ -729,7 +735,10 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
 
         print(f"Average beat F-measure: {beat_mean_f_measure:0.3f}")
         print(f"Average downbeat F-measure: {downbeat_mean_f_measure:0.3f}")
-        print(f"Average losses | CLS: {cls_loss_mean:0.3f} | REG: {reg_loss_mean:0.3f} | LFT: {lft_loss_mean:0.3f} | ADJ: {adj_loss_mean:0.3f}")
+        if getattr(model, 'module', model).head_type == "hungarian":
+            print(f"Average losses | CLS: {cls_loss_mean:0.3f} | BBOX(L1): {reg_loss_mean:0.3f} | GIOU: {lft_loss_mean:0.3f}")
+        else:
+            print(f"Average losses | CLS: {cls_loss_mean:0.3f} | REG: {reg_loss_mean:0.3f} | LFT: {lft_loss_mean:0.3f} | ADJ: {adj_loss_mean:0.3f}")
         # print(f"Average left beat F-measure: {left_beat_mean_f_measure:0.3f}")
         # print(f"Average left downbeat F-measure: {left_downbeat_mean_f_measure:0.3f}")
         #print(f"Average right beat F-measure: {right_beat_mean_f_measure:0.3f}")

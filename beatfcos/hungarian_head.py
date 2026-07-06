@@ -7,7 +7,7 @@ query가 (class, interval) 쌍을 직접 예측하는 헤드. 예측 개수가 �
 중복 억제가 학습 과정에서 end-to-end로 이루어지므로(DETR과 동일한 원리),
 추론 시 NMS/Soft-NMS가 필요 없다.
 
-[왜] Soft-NMS 같은 후처리 자체를 없애고 싶다는 요청이 있었음. 후처리(NMS)를
+[왜] Soft-NMS 같은 후처리 자체를 없애야 함. 후처리(NMS)를
 없애려면 "조밀한 anchor 예측 + NMS로 중복 제거" 구조를 버리고, 고정 개수
 query가 직접 최종 예측을 내놓는 구조로 가야 하기 때문에 이 새 헤드를 추가함.
 기존 FCOS 경로(model_module.py의 head_type="fcos", 기본값)는 전혀 건드리지
@@ -28,22 +28,41 @@ query가 직접 최종 예측을 내놓는 구조로 가야 하기 때문에 이
 selection, denoising training 등은 없음. NMS-free/anchor-free 방향이
 실제로 동작하는지 먼저 확인해보기 위한 축소판이다.
 """
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+def sinusoidal_position_encoding(length, dim, device):
+    """표준 sinusoidal positional encoding (Transformer 원 논문 방식).
+
+    query가 cross-attention으로 FPN memory를 볼 때 "내용(무슨 소리인지)"만
+    보고 "시간축 몇 번째 위치인지"는 전혀 알 수 없었던 문제(query 300개가
+    거의 같은 위치/클래스로 뭉치는 collapse의 원인으로 추정)를 고치기 위해
+    추가함. concat된 memory 시퀀스 전체 길이에 대해 계산하므로, P1/P2/P3의
+    어느 레벨에 있든 각 토큰이 고유한 위치 신호를 갖게 된다.
+    """
+    position = torch.arange(length, device=device).unsqueeze(1).float()
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device).float() * (-math.log(10000.0) / dim))
+    pe = torch.zeros(length, dim, device=device)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
 def monotonic_match(cost):
-    """Optimal order-preserving assignment of M targets into Q sorted
-    candidates, via O(Q*M) DP (a 1D monotonic special case of the assignment
-    problem - see module docstring for why this is valid here).
+    """정렬된 Q개 후보 중 M개 target을 순서를 지키며 최적으로 배정하는
+    O(Q*M) DP (일반 할당 문제의 1차원 monotonic 특수 케이스 — 왜 이게
+    여기서 유효한지는 파일 상단 docstring 참고).
 
-    cost: (Q, M) numpy array where rows/cols are already sorted by position.
-    Assumes Q >= M (excess rows are simply left unmatched).
+    cost: (Q, M) numpy 배열, 행/열이 이미 위치 순으로 정렬돼 있다고 가정.
+    Q >= M을 가정함 (남는 행은 그냥 매칭 안 됨으로 처리).
 
-    Returns (query_indices, target_indices): both (M,) int64 arrays, indices
-    into the Q/M *sorted* order, one query per target, strictly increasing.
+    반환값 (query_indices, target_indices): 둘 다 (M,) int64 배열이고,
+    Q/M의 *정렬된* 순서 안에서의 인덱스임. target 하나당 query 하나씩,
+    인덱스는 항상 증가하는 순서.
     """
     Q, M = cost.shape
     if M == 0:
@@ -80,9 +99,9 @@ def monotonic_match(cost):
 
 
 def pairwise_giou_1d(a, b):
-    """1D generalized IoU between every pair of intervals in a and b.
+    """a와 b의 모든 구간 쌍에 대한 1D GIoU(generalized IoU).
 
-    a: (N, 2), b: (M, 2), both (l, r) with l <= r. Returns (N, M).
+    a: (N, 2), b: (M, 2), 둘 다 (l, r) 형태이고 l <= r. (N, M) 반환.
     """
     area_a = (a[:, 1] - a[:, 0]).unsqueeze(1)  # (N, 1)
     area_b = (b[:, 1] - b[:, 0]).unsqueeze(0)  # (1, M)
@@ -131,13 +150,19 @@ class SetPredictionHead(nn.Module):
         self.bbox_head = nn.Sequential(
             nn.Linear(feature_size, feature_size),
             nn.ReLU(),
-            nn.Linear(feature_size, 2),  # (center, length), sigmoid-normalized
+            nn.Linear(feature_size, 2),  # (center, length), sigmoid로 정규화
         )
 
     def forward(self, feature_maps):
-        # concat multi-scale FPN tokens into a single memory sequence (no
-        # deformable attention / positional encoding per level - simplified)
+        # 멀티스케일 FPN 토큰들을 하나의 memory 시퀀스로 이어붙임
+        # (deformable attention 없이 단순 concat - 축소판이라 생략함)
         memory = torch.cat([f.transpose(1, 2) for f in feature_maps], dim=1)  # (B, sum(L_i), feature_size)
+
+        # positional encoding 추가: 이게 없으면 query가 "무슨 소리인지"만 보고
+        # "시간축 몇 번째 위치인지"를 알 방법이 없어서, 음향적으로 비슷한
+        # 여러 위치를 구분 못 하고 query들끼리 서로 뭉치는 원인이 됨.
+        pos_embed = sinusoidal_position_encoding(memory.shape[1], memory.shape[2], memory.device)
+        memory = memory + pos_embed.unsqueeze(0)
 
         batch_size = memory.shape[0]
         queries = self.query_embed.weight.unsqueeze(0).expand(batch_size, -1, -1)  # (B, Q, feature_size)
@@ -158,21 +183,27 @@ class SetPredictionHead(nn.Module):
 class OrderedMatcher(nn.Module):
     """순서를 보존하는 매칭기 (자세한 근거는 파일 상단 docstring 참고).
     query를 예측 위치로, target을 실제 위치로 각각 정렬한 뒤, 일반 Hungarian
-    대신 O(Q*M) DP로 순서를 지키는 최적 부분집합 매칭을 찾는다."""
-    def __init__(self, cost_class=1.0, cost_bbox=5.0, cost_giou=2.0):
-        super().__init__()
-        self.cost_class = cost_class
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
+    대신 O(Q*M) DP로 순서를 지키는 최적 부분집합 매칭을 찾는다.
 
+    class/bbox/giou 비용을 섞는 가중치는 고정 숫자(예: DETR의 5.0, 2.0)를
+    갖고 있지 않다 — 이 가중치도 결국 "각 항목이 매칭 결정에 얼마나
+    중요한가"를 정하는 문제라, SetCriterion.forward()가 이번 학습에서
+    학습 중인 log_var로부터 매 스텝 실제 가중치(exp(-log_var))를 계산해
+    forward() 호출 시 넘겨준다. 매칭과 최종 loss가 항상 같은(학습된) 기준을
+    쓰게 되고, 어디에도 다른 task에서 가져온 임의의 숫자가 안 남는다.
+    """
     @torch.no_grad()
-    def forward(self, class_logits, boxes, targets):
+    def forward(self, class_logits, boxes, targets, weight_class=1.0, weight_bbox=1.0, weight_giou=1.0):
         """
         class_logits: (B, Q, num_classes + 1)
-        boxes: (B, Q, 2) normalized (l, r)
-        targets: list of length B, each {"labels": (M_b,), "boxes": (M_b, 2)}
-        returns: list of (query_idx, target_idx) index pairs (original,
-        unsorted indices), one per sample.
+        boxes: (B, Q, 2), (l, r)로 [0,1] 정규화됨
+        targets: 길이 B인 리스트, 각 원소는 {"labels": (M_b,), "boxes": (M_b, 2)}
+        weight_class/bbox/giou: 매칭 비용을 합칠 때 쓸 상대적 가중치.
+        SetCriterion이 학습 중인 log_var 기반 값을 넘겨줌 (기본값 1.0은
+        독립적으로 테스트할 때를 위한 것일 뿐, 실제 학습에서는 항상 호출
+        쪽에서 값을 넘김).
+        반환값: (query_idx, target_idx) 인덱스 쌍의 리스트(원본, 정렬 전
+        인덱스 기준), 샘플 하나당 한 쌍씩.
         """
         bs, num_queries = class_logits.shape[:2]
         out_prob = class_logits.softmax(-1)  # (B, Q, num_classes+1)
@@ -194,9 +225,9 @@ class OrderedMatcher(nn.Module):
             pred_centers = pred_boxes.mean(dim=-1)
             tgt_centers = tgt_boxes.mean(dim=-1)
 
-            # sort by position - this is what makes the monotonic-DP shortcut valid
+            # 위치 순으로 정렬 - 이게 있어야 monotonic DP 지름길이 성립함
             q_order = torch.argsort(pred_centers)
-            t_order = torch.argsort(tgt_centers)  # annotations should already be time-ordered; sorted defensively
+            t_order = torch.argsort(tgt_centers)  # 원래도 시간 순 정렬돼 있어야 하지만 방어적으로 한 번 더 정렬
 
             sorted_pred_boxes = pred_boxes[q_order]
             sorted_tgt_boxes = tgt_boxes[t_order]
@@ -206,11 +237,11 @@ class OrderedMatcher(nn.Module):
             cost_giou = -pairwise_giou_1d(sorted_pred_boxes, sorted_tgt_boxes)
             cost_class = -out_prob[b][q_order][:, sorted_tgt_labels]
 
-            C = (self.cost_bbox * cost_bbox + self.cost_giou * cost_giou + self.cost_class * cost_class)
+            C = (weight_bbox * cost_bbox + weight_giou * cost_giou + weight_class * cost_class)
 
-            # num_queries is set high relative to typical beat/downbeat counts per
-            # clip; if a clip somehow has more targets than queries, the excess
-            # (lowest-priority, i.e. last in sorted order) targets are left unmatched.
+            # num_queries는 한 곡당 실제 beat/downbeat 개수보다 넉넉하게 잡아뒀음.
+            # 혹시라도 target이 query보다 많은 경우, 우선순위가 낮은(정렬 순서상
+            # 뒤쪽) target들은 매칭 안 되고 남겨짐.
             num_targets_eff = min(num_queries, num_targets)
             C_np = C[:, :num_targets_eff].cpu().numpy()
 
@@ -228,20 +259,43 @@ class SetCriterion(nn.Module):
     """DETR 스타일 set prediction loss: OrderedMatcher가 정한 매칭 결과를 바탕으로
     분류 loss(CE, "no object" 클래스는 eos_coef로 가중치를 낮춤)와 매칭된 쌍에
     대해서만 계산하는 L1 + GIoU 회귀 loss를 합친다. 기존 CombinedLoss(FCOS,
-    losses.py)를 대체하는 역할."""
-    def __init__(self, num_classes, matcher, eos_coef=0.1, weight_bbox=5.0, weight_giou=2.0):
+    losses.py)를 대체하는 역할.
+
+    분류/bbox/GIoU 세 loss를 합칠 때 쓰던 고정 가중치(bbox×5, giou×2)는
+    DETR 논문의 2D 이미지 박스(cx,cy,w,h 4개 값) 기준으로 튜닝된 숫자라,
+    1D 구간(l,r 2개 값)인 우리 task에 그대로 옮겨올 근거가 없다(실제로 GIoU
+    loss가 raw 상태에서도 이미 다른 loss보다 커서, 거기에 원본 가중치를 또
+    곱하면 불균형이 더 커지는 것으로 확인됨). 그렇다고 사람이 임의로 다른
+    숫자를 새로 골라도 똑같이 근거 없는 선택이 되므로, 대신 Kendall et al.
+    2018(homoscedastic uncertainty weighting)을 적용해 각 loss의 상대적
+    가중치(log_var) 자체를 학습 파라미터로 두어 모델이 학습 중 스스로
+    찾아가게 한다 — 별도의 사전 체크포인트 없이 이번 학습에서 처음부터
+    (0으로 초기화되어 균등한 상태에서 시작해) 다른 파라미터들과 같이 학습됨.
+    """
+    def __init__(self, num_classes, matcher, eos_coef=0.1):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
-        self.weight_bbox = weight_bbox
-        self.weight_giou = weight_giou
 
         empty_weight = torch.ones(num_classes + 1)
         empty_weight[-1] = eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
+        # [class, bbox, giou] 순서. 0으로 초기화 = exp(-0)=1, 즉 처음엔 세 loss를
+        # 동등하게 취급하다가, 학습되면서 모델이 알아서 상대적 중요도를 조정함.
+        self.log_vars = nn.Parameter(torch.zeros(3))
+
     def forward(self, class_logits, boxes, targets):
-        indices = self.matcher(class_logits, boxes, targets)
+        # 매칭 비용도 지금 학습 중인 상대적 중요도(log_var)를 그대로 써서,
+        # 매칭 기준과 최종 loss 기준이 항상 일치하게 함(고정된 별도 숫자 없음).
+        with torch.no_grad():
+            implicit_weights = torch.exp(-self.log_vars)
+        indices = self.matcher(
+            class_logits, boxes, targets,
+            weight_class=implicit_weights[0].item(),
+            weight_bbox=implicit_weights[1].item(),
+            weight_giou=implicit_weights[2].item(),
+        )
 
         no_object_class = self.num_classes
         target_classes = torch.full(
@@ -274,8 +328,20 @@ class SetCriterion(nn.Module):
             loss_bbox = torch.zeros((), device=class_logits.device)
             loss_giou = torch.zeros((), device=class_logits.device)
 
+        # Kendall et al. 2018 homoscedastic uncertainty weighting:
+        # 각 loss_i를 exp(-log_var_i)*loss_i + log_var_i 형태로 감싸서 반환.
+        # log_var_i가 커지면(=이 loss가 불확실/신뢰도 낮다고 학습되면) 그 loss의
+        # 실제 기여도는 자동으로 줄고, 대신 +log_var_i 항이 그만큼 커져서 "그냥
+        # 다 무시해버리는" 손쉬운 회피는 못 하게 막아준다 — 이 regularizer 항을
+        # 각 항에 이미 포함해서 반환하므로, train.py에서 셋을 단순히 더하기만
+        # 해도(train.py는 4개 반환값을 그대로 sum함) 올바른 uncertainty-weighted
+        # 총 loss가 됨.
+        weighted_class = torch.exp(-self.log_vars[0]) * loss_class + self.log_vars[0]
+        weighted_bbox = torch.exp(-self.log_vars[1]) * loss_bbox + self.log_vars[1]
+        weighted_giou = torch.exp(-self.log_vars[2]) * loss_giou + self.log_vars[2]
+
         return {
-            "loss_class": loss_class,
-            "loss_bbox": loss_bbox * self.weight_bbox,
-            "loss_giou": loss_giou * self.weight_giou,
+            "loss_class": weighted_class,
+            "loss_bbox": weighted_bbox,
+            "loss_giou": weighted_giou,
         }

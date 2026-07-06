@@ -286,11 +286,11 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             )
         else:
             probs = class_logits.softmax(-1)
-            scores, labels = probs[..., :-1].max(-1)  # drop the "no object" class
-            boxes_raw = boxes * T  # de-normalize back to frame-index scale, like the FCOS path
+            scores, labels = probs[..., :-1].max(-1)  # "no object" 클래스는 제외
+            boxes_raw = boxes * T  # 정규화된 [0,1]을 다시 frame-index 스케일로 (FCOS 경로와 동일한 단위로 맞춤)
 
-            # NOTE: assumes batch_size == 1 in eval, matching how beat_eval.py
-            # drives evaluation for the FCOS path above.
+            # 참고: eval 시 batch_size==1을 가정함 (위 FCOS 경로에서 beat_eval.py가
+            # 평가를 돌리는 방식과 동일).
             finalScores = scores[0]
             finalAnchorBoxesIndexes = labels[0]
             finalAnchorBoxesCoordinates = boxes_raw[0]
