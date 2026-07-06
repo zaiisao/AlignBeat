@@ -104,6 +104,12 @@ parser.add_argument('--d_hid', type=int, default=512)
 parser.add_argument('--nlayers', type=int, default=9)
 parser.add_argument('--attn_len', type=int, default=5)
 parser.add_argument('--dropout', type=float, default=0.1)
+# Soft-NMS 후처리를 없앤 축소판 RT-DETR 헤드(순서 보존 매칭 기반, 자세한 내용은
+# beatfcos/hungarian_head.py 참고)를 쓰려면 --head_type hungarian으로 지정.
+# 기본값 'fcos'는 기존 anchor+Soft-NMS 파이프라인을 그대로 유지함(비교용).
+parser.add_argument('--head_type', type=str, default='fcos', choices=['fcos', 'hungarian'])
+parser.add_argument('--num_queries', type=int, default=300)
+parser.add_argument('--decoder_layers', type=int, default=3)
 
 
 

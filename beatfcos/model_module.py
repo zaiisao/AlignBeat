@@ -160,6 +160,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         postprocessing_type="soft_nms",
         backbone_type="wavebeat",
         audio_sample_rate=22050,
+        head_type="fcos",
+        num_queries=300,
+        decoder_layers=3,
         **kwargs
     ):
         self.inplanes = 256
@@ -171,6 +174,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         self.postprocessing_type = postprocessing_type
 
         self.backbone_type = backbone_type
+        self.head_type = head_type
 
         dmodel = kwargs.get('dmodel', 128)
         encoder_keys = ['dmodel', 'nhead', 'd_hid', 'nlayers', 'attn_len', 'dropout', 'norm_first']
@@ -187,18 +191,33 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
         self.fpn = PyramidFeatures(dmodel, dmodel, dmodel)
 
-        self.classificationModel = ClassificationModel(256, num_classes=num_classes)
-        self.regressionModel = RegressionModel(256)
+        if self.head_type == "hungarian":
+            # [무엇] Soft-NMS 후처리를 없애기 위해 추가한 축소판 RT-DETR 경로.
+            # 조밀한 anchor(Anchors/ClassificationModel/RegressionModel/CombinedLoss)
+            # 대신, 고정 개수 query가 FPN을 보고 (class, interval)을 직접 예측하고
+            # 순서 보존 매칭(OrderedMatcher)으로 학습한다. 자세한 근거는
+            # beatfcos/hungarian_head.py 파일 상단 docstring 참고.
+            # [왜 옵션인가] 기존 head_type="fcos"(기본값) 경로는 전혀 안 건드려서,
+            # 두 방식을 나중에 나란히 비교할 수 있게 남겨둠.
+            from beatfcos.hungarian_head import SetPredictionHead, OrderedMatcher, SetCriterion
+            self.set_prediction_head = SetPredictionHead(
+                feature_size=256, num_classes=num_classes,
+                num_queries=num_queries, decoder_layers=decoder_layers
+            )
+            self.set_criterion = SetCriterion(num_classes, OrderedMatcher())
+        else:
+            self.classificationModel = ClassificationModel(256, num_classes=num_classes)
+            self.regressionModel = RegressionModel(256)
 
-        self.anchors = Anchors(clusters, audio_downsampling_factor, audio_sample_rate)
-         #MJ: The audio base level is changed from 8 to 7, allowing a more fine-grained audio input
-         #  => The target sampling level in wavebeat should be changed to 2^7 from 2^8 as well
+            self.anchors = Anchors(clusters, audio_downsampling_factor, audio_sample_rate)
+             #MJ: The audio base level is changed from 8 to 7, allowing a more fine-grained audio input
+             #  => The target sampling level in wavebeat should be changed to 2^7 from 2^8 as well
 
-        self.anchor_point_transform = AnchorPointTransform()
+            self.anchor_point_transform = AnchorPointTransform()
 
-        self.clipBoxes = ClipBoxes()
+            self.clipBoxes = ClipBoxes()
 
-        self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness)
+            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness)
 
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
@@ -212,17 +231,18 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 m.bias.data.zero_()
         # End of for m in self.modules()
 
-        # The reinitialization of the final layer of the classification head
-        prior = 0.01
+        if self.head_type != "hungarian":
+            # The reinitialization of the final layer of the classification head
+            prior = 0.01
 
-        self.classificationModel.output.weight.data.fill_(0)
-        self.classificationModel.output.bias.data.fill_(-math.log((1.0 - prior) / prior))
+            self.classificationModel.output.weight.data.fill_(0)
+            self.classificationModel.output.bias.data.fill_(-math.log((1.0 - prior) / prior))
 
-        self.regressionModel.regression.weight.data.fill_(0)
-        self.regressionModel.regression.bias.data.fill_(0)
+            self.regressionModel.regression.weight.data.fill_(0)
+            self.regressionModel.regression.bias.data.fill_(0)
 
-        self.regressionModel.leftness.weight.data.fill_(0)
-        self.regressionModel.leftness.bias.data.fill_(0)
+            self.regressionModel.leftness.weight.data.fill_(0)
+            self.regressionModel.leftness.bias.data.fill_(0)
         # self.freeze_bn() # If we do not freeze the batch normalization layers, the layers will be trained as was done in WaveBeat
 
     def freeze_bn(self):
@@ -230,6 +250,62 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         for layer in self.modules():
             if isinstance(layer, nn.BatchNorm1d):
                 layer.eval()
+
+    def _forward_hungarian(self, feature_maps, base_level_image_shape, audio_batch, inputs):
+        # 참고: 함수명은 hungarian_head.py와의 일관성을 위해 유지했지만, 실제
+        # 매칭은 OrderedMatcher(순서 보존 DP)를 쓴다 — 일반 Hungarian 아님.
+        # 자세한 근거는 beatfcos/hungarian_head.py 파일 상단 docstring 참고.
+        class_logits, boxes = self.set_prediction_head(feature_maps)  # boxes normalized (l, r) in [0, 1]
+        T = base_level_image_shape[-1]
+
+        annotations = inputs[1] if len(inputs) == 2 else None
+
+        targets = None
+        if annotations is not None:
+            targets = []
+            for j in range(annotations.shape[0]):
+                jth = annotations[j]
+                jth = jth[jth[:, 2] != -1]
+                targets.append({
+                    "labels": jth[:, 2].long(),
+                    "boxes": (jth[:, 0:2].float() / T).clamp(0, 1),
+                })
+            losses = self.set_criterion(class_logits, boxes, targets)
+
+        if self.training:
+            zero = torch.zeros((), device=class_logits.device)
+            # train.py의 4-tuple 언패킹/출력("CLS/REG/LFT/ADJ")을 그대로 재사용하기
+            # 위해 같은 모양으로 반환함: CLS<-분류loss, REG<-bbox(L1), LFT<-giou,
+            # ADJ<-미사용(0). 출력에 찍히는 라벨 이름은 FCOS 시절 그대로라 의미가
+            # 안 맞지만, 값 자체는 실제 set-prediction loss가 맞다.
+            return (
+                losses["loss_class"].unsqueeze(0),
+                losses["loss_bbox"].unsqueeze(0),
+                losses["loss_giou"].unsqueeze(0),
+                zero.unsqueeze(0),
+            )
+        else:
+            probs = class_logits.softmax(-1)
+            scores, labels = probs[..., :-1].max(-1)  # drop the "no object" class
+            boxes_raw = boxes * T  # de-normalize back to frame-index scale, like the FCOS path
+
+            # NOTE: assumes batch_size == 1 in eval, matching how beat_eval.py
+            # drives evaluation for the FCOS path above.
+            finalScores = scores[0]
+            finalAnchorBoxesIndexes = labels[0]
+            finalAnchorBoxesCoordinates = boxes_raw[0]
+
+            if annotations is not None:
+                eval_losses = (
+                    losses["loss_class"].item(),
+                    losses["loss_bbox"].item(),
+                    losses["loss_giou"].item(),
+                    0.0,
+                )
+            else:
+                eval_losses = (0.0, 0.0, 0.0, 0.0)
+
+            return [finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates, eval_losses]
 
     def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1): #:forward_call = forward
         # inputs = audio, target
@@ -254,6 +330,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         base_level_image_shape = C1.shape
 
         feature_maps = self.fpn([C1, C2, C3])
+
+        if self.head_type == "hungarian":
+            return self._forward_hungarian(feature_maps, base_level_image_shape, audio_batch, inputs)
 
         classification_outputs = torch.cat([self.classificationModel(feature_map) for feature_map in feature_maps], dim=1)
         regression_outputs = []
