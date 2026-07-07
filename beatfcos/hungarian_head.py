@@ -35,18 +35,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def sinusoidal_position_encoding(length, dim, device):
+def sinusoidal_position_encoding(positions, dim, device):
     """표준 sinusoidal positional encoding (Transformer 원 논문 방식).
 
     query가 cross-attention으로 FPN memory를 볼 때 "내용(무슨 소리인지)"만
     보고 "시간축 몇 번째 위치인지"는 전혀 알 수 없었던 문제(query 300개가
     거의 같은 위치/클래스로 뭉치는 collapse의 원인으로 추정)를 고치기 위해
-    추가함. concat된 memory 시퀀스 전체 길이에 대해 계산하므로, P1/P2/P3의
-    어느 레벨에 있든 각 토큰이 고유한 위치 신호를 갖게 된다.
+    추가함.
+
+    positions: (N,) 실수/정수 위치 값 텐서. 예전에는 그냥 "이어붙인 시퀀스
+    안에서 몇 번째냐"(0..sum(L_i)-1)를 넣었는데, 그러면 P1/P2/P3처럼 stride가
+    다른 레벨들을 이어붙였을 때 실제로는 같은 시간대를 가리키는 토큰들이
+    서로 다른(관련 없는) 위치값을 받게 되는 문제가 있었다 (예: P1의 0번째와
+    P2의 0번째는 둘 다 곡 시작 부근인데, 이어붙인 순번 기준으로는 전혀 다른
+    수가 됨). 그래서 지금은 호출하는 쪽(SetPredictionHead)에서 각 레벨의
+    stride를 반영한 "실제 base-해상도 프레임 좌표"를 넘겨주고, 여기서는 그
+    좌표에 대해서만 sin/cos를 계산한다 — 같은 시간대의 토큰들은 레벨이
+    달라도 비슷한 위치 인코딩을 갖게 됨 (레벨 구분은 별도의 level embedding이
+    담당, SetPredictionHead.forward() 참고).
     """
-    position = torch.arange(length, device=device).unsqueeze(1).float()
+    position = positions.unsqueeze(1).float()
     div_term = torch.exp(torch.arange(0, dim, 2, device=device).float() * (-math.log(10000.0) / dim))
-    pe = torch.zeros(length, dim, device=device)
+    pe = torch.zeros(positions.shape[0], dim, device=device)
     pe[:, 0::2] = torch.sin(position * div_term)
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe
@@ -140,6 +150,16 @@ class SetPredictionHead(nn.Module):
 
         self.query_embed = nn.Embedding(num_queries, feature_size)
 
+        # feature_maps는 항상 [P1, P2, P3] (model_module.py의 rho1=Identity,
+        # rho2=stride-2 conv, rho3=stride-2 conv 두 번 구조와 고정적으로 대응) —
+        # 그래서 stride를 (1, 2, 4)로 하드코딩함. 레벨별 학습 임베딩: 같은
+        # 시간대의 P1/P2/P3 토큰이 (아래 forward에서) 실제 시간 좌표 기준으로는
+        # 비슷한 positional encoding을 받게 되는데, 그래도 "세밀한 P1 정보"와
+        # "개략적인 P3 정보"는 성격이 다르므로 그 차이를 attention이 구분할 수
+        # 있게 레벨마다 하나씩 학습되는 벡터를 추가로 더해준다.
+        self.fpn_strides = (1, 2, 4)
+        self.level_embed = nn.Embedding(len(self.fpn_strides), feature_size)
+
         # norm_first=True (Pre-LN): 기본값인 Post-LN은 학습 초반 gradient가 커서
         # self-attention이 몇몇 토큰에만 쏠리는 형태로 빠르게 굳어버리기 쉽고,
         # 그 결과 query_embed 자체는 서로 다른 값(diverse)을 유지하는데도
@@ -166,12 +186,31 @@ class SetPredictionHead(nn.Module):
     def forward(self, feature_maps):
         # 멀티스케일 FPN 토큰들을 하나의 memory 시퀀스로 이어붙임
         # (deformable attention 없이 단순 concat - 축소판이라 생략함)
-        memory = torch.cat([f.transpose(1, 2) for f in feature_maps], dim=1)  # (B, sum(L_i), feature_size)
+        device = feature_maps[0].device
+        feature_size = feature_maps[0].shape[1]
+
+        tokens = []
+        pos_embeds = []
+        for level, (f, stride) in enumerate(zip(feature_maps, self.fpn_strides)):
+            f = f.transpose(1, 2)  # (B, L_i, feature_size)
+            tokens.append(f)
+
+            L_i = f.shape[1]
+            # 이어붙인 시퀀스 안에서의 순번이 아니라, stride를 반영한 실제
+            # base(P1) 해상도 프레임 좌표로 위치를 계산 - P1/P2/P3의 같은
+            # 시간대 토큰이 비슷한 인코딩을 갖게 하기 위함 (파일 상단 함수
+            # docstring 참고).
+            real_positions = torch.arange(L_i, device=device).float() * stride
+            level_pos = sinusoidal_position_encoding(real_positions, feature_size, device)
+            level_pos = level_pos + self.level_embed.weight[level]  # 레벨(해상도) 식별 정보
+            pos_embeds.append(level_pos)
+
+        memory = torch.cat(tokens, dim=1)  # (B, sum(L_i), feature_size)
 
         # positional encoding 추가: 이게 없으면 query가 "무슨 소리인지"만 보고
         # "시간축 몇 번째 위치인지"를 알 방법이 없어서, 음향적으로 비슷한
         # 여러 위치를 구분 못 하고 query들끼리 서로 뭉치는 원인이 됨.
-        pos_embed = sinusoidal_position_encoding(memory.shape[1], memory.shape[2], memory.device)
+        pos_embed = torch.cat(pos_embeds, dim=0)  # (sum(L_i), feature_size)
         memory = memory + pos_embed.unsqueeze(0)
 
         batch_size = memory.shape[0]
