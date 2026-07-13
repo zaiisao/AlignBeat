@@ -178,7 +178,7 @@ def compute_ap(recall, precision):
     ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
     return ap
 
-def get_results_from_model(audio, target, model, iou_threshold=0.5, score_threshold=0.05, max_thresh=1):
+def get_results_from_model(audio, target, model, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None):
     #data = dataset[index]
     #scale = data['scale']
     #audio, target = data
@@ -194,7 +194,8 @@ def get_results_from_model(audio, target, model, iou_threshold=0.5, score_thresh
             (audio, target),
             iou_threshold=iou_threshold,
             score_threshold=score_threshold,
-            max_thresh=max_thresh
+            max_thresh=max_thresh,
+            downbeat_score_threshold=downbeat_score_threshold
         ) #MJ: The results of model() has been obtained by applying the nms process
 
     predicted_scores = predicted_scores.cpu()
@@ -397,8 +398,9 @@ def evaluate_beat_ap(
     return average_precisions
 
 def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_sample_rate,
-                            score_threshold=0.2, iou_threshold=0.5, max_thresh=1):
+                            score_threshold=0.2, iou_threshold=0.5, max_thresh=1, downbeat_score_threshold=None):
     model.eval()
+    effective_downbeat_threshold = downbeat_score_threshold if downbeat_score_threshold is not None else score_threshold
     
     with torch.no_grad():
         # start collecting results
@@ -413,7 +415,7 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
             # if we have metadata, it is only during evaluation where batch size is always 1
             metadata = metadata[0] #MJ: predicted_labels[] = all 0 = all downbeats?
         
-            predicted_scores, predicted_labels, predicted_boxes, losses = get_results_from_model(audio, target, model, score_threshold=score_threshold, iou_threshold=iou_threshold, max_thresh=max_thresh)
+            predicted_scores, predicted_labels, predicted_boxes, losses = get_results_from_model(audio, target, model, score_threshold=score_threshold, iou_threshold=iou_threshold, max_thresh=max_thresh, downbeat_score_threshold=downbeat_score_threshold)
             #MJ: Note that the results predicted_scores, predicted_labels, predicted_boxes have been obtained by applying the nms process
 
             beat_pred_left_positions = []
@@ -434,7 +436,8 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
 
                 # scores are sorted, so we can break
                 # but this filtering is redundant, as the filtering is done within the evaluation part of the model
-                if predicted_score < score_threshold:
+                effective_threshold = effective_downbeat_threshold if predicted_label == 0 else score_threshold
+                if predicted_score < effective_threshold:
                     continue
 
                 # if beat (label 1), first row (index 0)
@@ -486,7 +489,7 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
             beat_ious = torch.zeros(1, 0).to(sorted_beat_intervals.device) #MJ: Shape (1, 0) means it is a tensor with one row and zero columns.
 
             downbeat_scores = predicted_scores[predicted_labels == 0]
-            downbeat_intervals = predicted_boxes[predicted_labels == 0][downbeat_scores >= score_threshold]
+            downbeat_intervals = predicted_boxes[predicted_labels == 0][downbeat_scores >= effective_downbeat_threshold]
             if downbeat_scores.size(dim=0) == 0:
                 sorted_downbeat_intervals = downbeat_intervals
             else:

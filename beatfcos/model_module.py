@@ -155,6 +155,8 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         num_classes,
         clusters,
         downbeat_weight=0.6,
+        beat_radius=2.5,
+        downbeat_radius=4.5,
         audio_downsampling_factor=32,
         centerness=False,
         postprocessing_type="soft_nms",
@@ -217,7 +219,12 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
             self.clipBoxes = ClipBoxes()
 
-            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness)
+            # downbeat_weight: 예전엔 self.downbeat_weight로 저장만 되고 실제 loss
+            # 계산에는 전달이 안 되고 있었음(생성자 인자만 있고 미사용 상태) - FocalLoss가
+            # beat/downbeat에 같은 alpha를 쓰다 보니 인스턴스가 훨씬 적은 downbeat
+            # 채널이 상대적으로 약한 신호만 받아 F-measure가 유독 불안정했던 것으로
+            # 관찰되어(자세한 내용은 losses.py의 FocalLoss 참고), 실제로 연결함.
+            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness, downbeat_weight=downbeat_weight, beat_radius=beat_radius, downbeat_radius=downbeat_radius)
 
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
@@ -307,7 +314,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
             return [finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates, eval_losses]
 
-    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1): #:forward_call = forward
+    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None): #:forward_call = forward
         # inputs = audio, target
         # self.training = len(inputs) == 2
 
@@ -392,7 +399,10 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             for class_id in range(classification_outputs.shape[2]): # the shape of classification_output is (B, number of anchor points per level, class ID)
                 scores = classification_outputs[:, :, class_id] * leftness_outputs[:, :, 0] # We predict the max number for beats will be less than the num of anchors
 
-                scores_over_thresh = torch.logical_and(scores > score_threshold, scores <= max_thresh)
+                # class_id 0 = downbeat, class_id 1 = beat (see get_jth_targets in losses.py)
+                class_score_threshold = downbeat_score_threshold if (class_id == 0 and downbeat_score_threshold is not None) else score_threshold
+
+                scores_over_thresh = torch.logical_and(scores > class_score_threshold, scores <= max_thresh)
                 if scores_over_thresh.sum() == 0:
                     # no boxes to NMS, just continue
                     continue
@@ -433,7 +443,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                     #MJ: regression_boxes are those obtained by filtering out whose scores are less than score_threshold
                     #    Get all the filtered detections and store them for use in training gnet.
                 elif self.postprocessing_type == 'soft_nms':
-                    anchors_nms_idx = soft_nms(regression_boxes, scores, sigma=0.5, thresh=0.2)  #MJ: = 16
+                    anchors_nms_idx = soft_nms(regression_boxes, scores, sigma=0.5, thresh=class_score_threshold)
                 elif self.postprocessing_type == 'none':
                     anchors_nms_idx = torch.arange(0, regression_boxes.size(dim=0))
 

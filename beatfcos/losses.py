@@ -142,8 +142,28 @@ def get_fcos_positives(jth_annotations, anchors_list, interval_length_ranges,
         normalized_l_star_for_anchors, normalized_r_star_for_anchors, levels_for_all_anchors#,\
 
 class FocalLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, downbeat_weight=0.5):
         super(FocalLoss, self).__init__()
+        # jth_classification_targets의 column 0 = downbeat, column 1 = beat
+        # (get_jth_targets/beat_eval.py 컨벤션과 동일). downbeat는 한 곡에서
+        # beat보다 인스턴스 수가 훨씬 적은데(4/4박자 기준 약 1/4), alpha=0.25가
+        # 두 클래스에 동일하게 적용되다 보니 downbeat 채널이 상대적으로 약한
+        # 학습 신호만 받고, 실제로 downbeat F-measure가 beat보다 훨씬 불안정하게
+        # (epoch마다 크게 출렁이는 형태로) 관찰됨.
+        #
+        # downbeat_weight는 "downbeat이 전체 분류 loss에서 차지하는 비중"으로
+        # 해석함 (기존 프로젝트 기본값 0.6이 0.5보다 큰 것도 이미 downbeat 쪽에
+        # 약간 더 힘을 싣겠다는 의도였던 것으로 보임 - 다만 이전엔 실제로 어디에도
+        # 연결이 안 돼 있었음). 0.5면 두 클래스에 동일 가중치(=기존 동작과 완전히
+        # 같음, no-op)이고, 0.5보다 크면 downbeat 채널의 loss가 그만큼 커지고
+        # beat 채널은 그만큼 작아짐 (두 가중치의 합은 항상 2.0로 고정해서, 0.5일
+        # 때 각각 1.0/1.0이 되어 기존 동작과 정확히 일치하게 함).
+        self.downbeat_weight = downbeat_weight
+
+    def _class_weight(self, device):
+        downbeat_w = 2.0 * self.downbeat_weight
+        beat_w = 2.0 * (1.0 - self.downbeat_weight)
+        return torch.tensor([downbeat_w, beat_w], device=device)
 
     def forward(self, jth_classification_pred, jth_classification_targets, jth_annotations, num_positive_anchors):
         alpha = 0.25
@@ -162,7 +182,7 @@ class FocalLoss(nn.Module):
 
                 bce = -(torch.log(1.0 - jth_classification_pred))
 
-                cls_loss = focal_weight * bce
+                cls_loss = focal_weight * bce * self._class_weight(jth_classification_pred.device)
                 return cls_loss.sum()
             else:
                 alpha_factor = torch.ones(jth_classification_pred.shape) * alpha
@@ -173,7 +193,7 @@ class FocalLoss(nn.Module):
 
                 bce = -(torch.log(1.0 - jth_classification_pred))
 
-                cls_loss = focal_weight * bce
+                cls_loss = focal_weight * bce * self._class_weight(jth_classification_pred.device)
                 return cls_loss.sum()
 
         # num_positive_anchors = positive_anchor_indices.sum() # We will do this outside in the new implementation
@@ -189,7 +209,7 @@ class FocalLoss(nn.Module):
 
         bce = -(jth_classification_targets * torch.log(jth_classification_pred) + (1.0 - jth_classification_targets) * torch.log(1.0 - jth_classification_pred))
 
-        cls_loss = focal_weight * bce
+        cls_loss = focal_weight * bce * self._class_weight(jth_classification_pred.device)
 
         if torch.cuda.is_available(): #MJ: 
             cls_loss = torch.where(torch.ne(jth_classification_targets, -1.0), cls_loss, torch.zeros(cls_loss.shape).cuda())
@@ -430,18 +450,20 @@ class AdjacencyConstraintLoss(nn.Module):
         return all_adjacency_constraint_losses.mean()
 
 class CombinedLoss(nn.Module):
-    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, centerness=False):
+    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, centerness=False, downbeat_weight=0.5, beat_radius=2.5, downbeat_radius=4.5):
         super(CombinedLoss, self).__init__()
 
-        self.classification_loss = FocalLoss()
+        self.classification_loss = FocalLoss(downbeat_weight=downbeat_weight)
         self.regression_loss = RegressionLoss()
         self.leftness_loss = LeftnessLoss()
         self.adjacency_constraint_loss = AdjacencyConstraintLoss()
-        
+
         self.clusters = clusters
         self.audio_downsampling_factor = audio_downsampling_factor
         self.audio_sample_rate = audio_sample_rate
         self.centerness = centerness
+        self.beat_radius = beat_radius
+        self.downbeat_radius = downbeat_radius
 
     def get_jth_targets(
         self,
@@ -503,7 +525,8 @@ class CombinedLoss(nn.Module):
             l_star_for_anchors, r_star_for_anchors, normalized_l_star_for_anchors, \
             normalized_r_star_for_anchors, levels_for_anchors = get_fcos_positives(
                 jth_annotations, anchors_list, interval_length_ranges,
-                self.audio_downsampling_factor, self.audio_sample_rate, self.centerness
+                self.audio_downsampling_factor, self.audio_sample_rate, self.centerness,
+                beat_radius=self.beat_radius, downbeat_radius=self.downbeat_radius
             )
 
             all_anchor_points = torch.cat(anchors_list, dim=0)

@@ -49,13 +49,6 @@ Epoch 18~32: 0.185~0.189 완전 정체 (15 epoch 연속 사실상 그대로)
    FPN 레벨 간 위치 정렬 불일치. 그때마다 확실한 개선이 있었음(0.001 → 0.181 → 0.195).
 2. 그럼에도 FCOS 베이스라인(~0.8)과는 여전히 큰 격차가 있고, 15 epoch 연속 정체를
    보면 이 구조/설정의 한계치에 도달한 것으로 판단됨.
-3. 원인은 개별 버그라기보다 더 근본적인 이유로 추정됨: beat/downbeat처럼 이벤트가
-   극도로 조밀하고(query 300개로 감당하기엔 곡당 이벤트 수가 훨씬 많음) 순서가
-   고정된 1D task는, DETR류의 전역 attention 기반 고정 query-set 예측보다 FCOS류의
-   조밀한 로컬 anchor 기반 예측이 구조적으로 더 적합함. NMS 제거가 목표였다면,
-   탐지 패러다임 전체를 바꾸기보다 FCOS의 후처리(Soft-NMS)만 도메인 지식
-   (최소 비트 간격 등)을 이용한 가벼운 방식으로 대체하는 게 더 나은 접근이었을 것으로
-   보임.
 
 ## 관련 파일
 - `beatfcos/hungarian_head.py` — SetPredictionHead, OrderedMatcher, SetCriterion, 위치 인코딩
@@ -63,3 +56,50 @@ Epoch 18~32: 0.185~0.189 완전 정체 (15 epoch 연속 사실상 그대로)
 - `train.py` — `--head_type`, `--num_queries`, `--decoder_layers` CLI 옵션, grad clip 분기
 - `beatfcos/beat_eval.py` — hungarian 경로 eval 출력
 - `diag_checkpoint_collapse.py` — 체크포인트의 query 위치 다양성/collapse 진단 스크립트
+
+---
+
+## FCOS+DSA 백본 (baseline 재확인) 실험 현황
+
+hungarian 결과가 안 좋아서, "DSA+FPN 백본 교체만 하고 기존 FCOS 헤드는 그대로 둔"
+조합이 잘 도는지 별도로 재확인 중.
+
+### 현재 학습 환경/설정
+- `head_type`: `fcos` (기본값, 안 건드림 — anchor 기반 ClassificationModel/RegressionModel/
+  Anchors/CombinedLoss + Soft-NMS 그대로)
+- 백본: DSA(BeatTransformerEncoder) + FPN (dmodel=128, nhead=2, d_hid=512, nlayers=9,
+  attn_len=5, dropout=0.1 — 전부 기본값)
+- 데이터셋 4개: ballroom, beatles, rwc_popular, hainsworth (train.py에 gtzan/smc는
+  CLI 인자 자체가 없어서 연결 안 돼 있음)
+- `--lr`: 기본값 1e-3
+- `--patience`: **10** (기본값 3에서 변경 — 이전 run이 patience=3일 때 15 epoch
+  넘게 완전히 정체돼서, LR이 너무 일찍/자주 깎여서 그런 것 아닌지 확인하려고 변경)
+- `--downbeat_weight`: 기본값 0.6, **이번부터 실제로 loss에 반영됨** (아래 참고)
+- `--epochs`: 100 (기본값)
+- `--batch_size`: 32 (기본값)
+
+### 이번에 같이 반영된 코드 수정: downbeat_weight 연결
+- 문제: `downbeat_weight` 인자가 모델에 저장만 되고 `losses.py`의 `FocalLoss`
+  어디에도 실제로 안 쓰이고 있었음 (죽은 파라미터). Beat는 downbeat보다 인스턴스가
+  ~4배 많은데 loss는 두 클래스에 동일한 `alpha=0.25`를 써서, downbeat 채널이
+  상대적으로 약한 학습 신호만 받음 — 실제로 이전 run에서 Beat F(0.85~0.88, 안정적)
+  대비 Downbeat F(0.30~0.37, epoch마다 크게 출렁임)가 훨씬 불안정하게 관찰됨.
+- 수정: `FocalLoss.__init__(downbeat_weight=0.5)`가 "중립"(=기존 동작과 100%
+  동일, no-op)이 되도록 하고, 0.5보다 크면 downbeat 채널 loss를 그만큼 키우고
+  beat 채널은 그만큼 줄이게 구현 (가중치 합은 항상 2.0으로 고정). 프로젝트 기본값
+  0.6이 이제 실제로 [downbeat 1.2, beat 0.8] 가중치로 적용됨.
+- 검증: `downbeat_weight=0.5`일 때 결과가 수정 전 FocalLoss를 수동으로 재현한
+  값과 정확히 일치함을 확인 (회귀 없음).
+
+### 이전(patience=3, downbeat_weight 미반영) run 결과 요약
+- epoch 1부터 Beat F 0.8 돌파, epoch 9에서 Joint 최고 **0.633**
+- 이후 20+ epoch 동안 그 최고점을 못 넘고 0.57~0.63 사이에서 정체
+- 뜯어보니 Beat F는 안정적(0.85~0.88)이고 Downbeat F만 불안정(0.30~0.37)해서
+  Joint 전체가 그 노이즈에 흔들리는 것으로 확인 → 위 downbeat_weight 수정의 근거
+
+### 지금 이 run의 목적
+1. `patience=10`이 "LR이 너무 일찍 깎여서 생기는 조기 정체"를 완화하는지
+2. `downbeat_weight` 수정이 Downbeat F의 epoch간 변동폭을 줄이고 Joint 최고점을
+   0.633보다 끌어올리는지
+
+진행 상황은 이 섹션에 계속 업데이트 예정.

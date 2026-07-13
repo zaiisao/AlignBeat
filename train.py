@@ -32,13 +32,13 @@ class Logger(object):
     def flush(self):
         self.terminal.flush()
 
-def configure_log():
-    log_file_name = ospj("./", 'log.log')
+def configure_log(log_file_name):
     Logger(log_file_name)
 
-configure_log()
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# 원래는 log.log/GPU/checkpoints 경로가 전부 하드코딩이라, 8-fold CV처럼 여러 run을
+# 동시에/순차적으로 돌리면 서로 같은 log.log와 checkpoints/ 폴더를 덮어써버림.
+# --log_file, --gpu, --checkpoint_dir로 fold별로 분리할 수 있게 argparse 이후로
+# 옮김 (아래 args 파싱 직후 참고).
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -90,6 +90,14 @@ parser.add_argument('--skip_connections', default=False, action="store_true")
 parser.add_argument('--norm_type', type=str, default='BatchNorm')
 parser.add_argument('--act_type', type=str, default='PReLU')
 parser.add_argument('--downbeat_weight', type=float, default=0.6)
+# beat_radius/downbeat_radius: FCOS positive anchor 할당 시 GT 위치로부터 이
+# 배수*stride 이내의 anchor를 positive로 인정하는 반경. downbeat_radius가
+# beat_radius보다 넓으면(기존 기본값 4.5 vs 2.5) downbeat GT 하나당 학습되는
+# positive anchor 범위가 더 넓어져서, 학습 신호가 흐릿해지고(진짜 downbeat의
+# confidence도 낮아짐) 인접 anchor들도 downbeat로 오검출되는 원인이 됨(2~3배
+# 과다예측 관찰됨). beat 수준(2.5~3.0)으로 낮춰서 재학습 검증 중.
+parser.add_argument('--beat_radius', type=float, default=2.5)
+parser.add_argument('--downbeat_radius', type=float, default=4.5)
 parser.add_argument('--pretrained', default=False, action="store_true")  # True → False
 parser.add_argument('--freeze_backbone', default=False, action="store_true")
 parser.add_argument('--centerness', default=False, action="store_true")
@@ -111,13 +119,34 @@ parser.add_argument('--head_type', type=str, default='fcos', choices=['fcos', 'h
 parser.add_argument('--num_queries', type=int, default=300)
 parser.add_argument('--decoder_layers', type=int, default=3)
 
+# 8-fold CV처럼 여러 run을 병렬/순차로 돌릴 때 서로 log.log나 checkpoints/를
+# 안 덮어쓰게 fold(run)마다 분리할 수 있는 옵션. 기본값은 기존 동작과 동일.
+parser.add_argument('--gpu', type=str, default='0')
+parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
+parser.add_argument('--log_file', type=str, default='./log.log')
 
+# 원 논문(BeatFCOS) Section 3: "unlike WaveBeat, we did not clip our gradients."
+# 근데 지금까지는 fcos 경로에 0.1로 항상 clip이 걸려 있었음 (hungarian 경로
+# 안정화하면서 우연히 발견함). None(기본값)이면 기존처럼 자동 선택
+# (hungarian=1.0, fcos=0.1) - 이미 검증된 hungarian 쪽은 그대로 두기 위함.
+# 0 이하 값을 주면 clipping을 아예 안 함(논문 방식, fcos용).
+parser.add_argument('--grad_clip', type=float, default=None)
+
+# 원 논문 Section 3: "we also made each dataset represent 1000 music excerpts
+# per epoch... in order to prevent one dataset from dominating another in
+# representation". 0이면(기본값) 기존처럼 그냥 4개 데이터셋 전체를 이어붙여서
+# 씀(데이터셋 크기 차이로 인한 불균형 있음) - 이 값을 주면 데이터셋마다 매
+# epoch 이 개수만큼만 무작위로 뽑아서 균형을 맞춤.
+parser.add_argument('--samples_per_dataset', type=int, default=0)
 
 # THIS LINE IS KEY TO PULL THE MODEL NAME
 temp_args, _ = parser.parse_known_args()
 
 # parse them args
 args = parser.parse_args()
+
+configure_log(args.log_file)
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
 # datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles"]
 datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles"]
@@ -138,7 +167,7 @@ torch.backends.cudnn.benchmark = False
 args.default_root_dir = os.path.join("lightning_logs", "full")
 print(args.default_root_dir)
 
-state_dicts = glob.glob('./checkpoints/*.pt')
+state_dicts = glob.glob(os.path.join(args.checkpoint_dir, '*.pt'))
 start_epoch = 0
 checkpoint_path = None
 
@@ -215,12 +244,54 @@ for dataset in datasets:
 train_dataset_list = torch.utils.data.ConcatDataset(train_datasets)
 val_dataset_list = torch.utils.data.ConcatDataset(val_datasets)
 
-train_dataloader = torch.utils.data.DataLoader(train_dataset_list, 
-                                                shuffle=args.shuffle,
-                                                batch_size=args.batch_size,
-                                                num_workers=args.num_workers,
-                                                pin_memory=True,
-                                                collate_fn=collater)
+class PerDatasetBalancedSampler(torch.utils.data.Sampler):
+    """원 논문 Section 3: "we also made each dataset represent 1000 music
+    excerpts per epoch... in order to prevent one dataset from dominating
+    another in representation". ConcatDataset을 그냥 이어붙여서 shuffle하면
+    큰 데이터셋(ballroom 등)이 작은 데이터셋(hainsworth 등)보다 한 epoch 안에
+    훨씬 더 많이 등장해서 대표성이 커짐 - 이 Sampler는 데이터셋마다 정확히
+    samples_per_dataset개를 (모자라면 중복 허용해서) 무작위로 뽑아 균등하게
+    섞어서, 매 epoch마다 데이터셋 개수 x samples_per_dataset개씩만 나오게 함.
+    """
+    def __init__(self, datasets, samples_per_dataset):
+        self.samples_per_dataset = samples_per_dataset
+        # ConcatDataset 안에서 각 sub-dataset이 차지하는 [start, end) 오프셋
+        self.offsets = []
+        start = 0
+        for d in datasets:
+            self.offsets.append((start, start + len(d)))
+            start += len(d)
+
+    def __iter__(self):
+        indices = []
+        for start, end in self.offsets:
+            n = end - start
+            replacement = n < self.samples_per_dataset
+            local_indices = torch.randint(0, n, (self.samples_per_dataset,)) if replacement \
+                else torch.randperm(n)[:self.samples_per_dataset]
+            indices.append(local_indices + start)
+        indices = torch.cat(indices)
+        indices = indices[torch.randperm(len(indices))]
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self.samples_per_dataset * len(self.offsets)
+
+if args.samples_per_dataset > 0:
+    train_sampler = PerDatasetBalancedSampler(train_datasets, args.samples_per_dataset)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset_list,
+                                                    sampler=train_sampler,
+                                                    batch_size=args.batch_size,
+                                                    num_workers=args.num_workers,
+                                                    pin_memory=True,
+                                                    collate_fn=collater)
+else:
+    train_dataloader = torch.utils.data.DataLoader(train_dataset_list,
+                                                    shuffle=args.shuffle,
+                                                    batch_size=args.batch_size,
+                                                    num_workers=args.num_workers,
+                                                    pin_memory=True,
+                                                    collate_fn=collater)
 val_dataloader = torch.utils.data.DataLoader(val_dataset_list, 
                                             shuffle=args.shuffle,
                                             batch_size=1,
@@ -262,7 +333,16 @@ dict_args = vars(args)
 if __name__ == '__main__':
     # Create the model
     #training_data_clusters = get_training_data_clusters()
-    training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.24245649, 1.93286828, 2.78558922])
+    # anchors.py의 pyramid_levels=[0,1,2]가 실제 FPN 레벨 3개(P1/P2/P3)와 일치하는데,
+    # 예전 5개 클러스터(beat 2개+downbeat 3개, 원래 5-level FPN을 염두에 두고 설계된
+    # 값)를 그대로 쓰면 get_fcos_positives가 레벨 0~2만 순회하기 때문에
+    # interval_length_ranges의 뒤 2구간(다운비트 전용, 1.59s~ 이상)이 죽은 코드가
+    # 됨 - 실측 결과 실제 downbeat GT의 74.5%가 이 때문에 positive anchor를 하나도
+    # 못 받고 있었음(verify_level_assignment_bug.py). beat 클러스터 2개는 그대로
+    # 두고 downbeat 3개를 대표값 1개로 합쳐 클러스터 개수(3개)를 실제 레벨 개수와
+    # 맞춤 - clusters_to_interval_length_ranges가 마지막 구간을 항상 무한대로
+    # 열어두므로, 이렇게 하면 모든 downbeat 길이가 반드시 어떤 레벨에는 걸리게 됨.
+    training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.93286828])
 
     beatfcos = model_module.create_beatfcos_model(num_classes=2, clusters=training_data_clusters, args=args, **dict_args)
 
@@ -288,8 +368,8 @@ if __name__ == '__main__':
 
     print('Num training images: {}'.format(len(train_dataset_list)))
 
-    if not os.path.exists("./checkpoints"):
-        os.makedirs("./checkpoints")
+    if not os.path.exists(args.checkpoint_dir):
+        os.makedirs(args.checkpoint_dir)
 
     highest_joint_f_measure = 0
 
@@ -334,16 +414,16 @@ if __name__ == '__main__':
 
                 loss.backward()
 
-                # 0.1은 원래 FCOS(조밀 anchor) 쪽에 맞춰 튜닝된 값. hungarian head는
-                # 새로 초기화된 transformer decoder를 처음부터 학습시켜야 하는데,
-                # 이 전역 clip 값이 전체 파라미터(backbone+decoder+query_embed)에
-                # 공통으로 걸리다 보니 decoder/query_embed 쪽에 돌아가는 실질적인
-                # gradient가 지나치게 작아짐 (query_embed는 여전히 랜덤 초기화
-                # 수준으로 diverse한데, decoder를 통과하면 몇 곳으로 뭉치는 현상과
-                # 관련 있는 것으로 추정). DETR류 학습에서 흔히 쓰는 값(1.0)으로
-                # hungarian 경로만 완화하고, 기존 FCOS 경로는 그대로 0.1 유지.
-                clip_norm = 1.0 if args.head_type == "hungarian" else 0.1
-                torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
+                # --grad_clip을 명시적으로 안 주면 기존처럼 자동 선택
+                # (hungarian=1.0, fcos=0.1). 0 이하로 주면 원 논문 방식대로
+                # clipping을 아예 안 함 (자세한 이유는 위 argparse 주석 참고).
+                if args.grad_clip is None:
+                    clip_norm = 1.0 if args.head_type == "hungarian" else 0.1
+                else:
+                    clip_norm = args.grad_clip
+
+                if clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
 
                 optimizer.step()
 
@@ -410,7 +490,7 @@ if __name__ == '__main__':
 
         #should_save_checkpoint = True # FOR DEBUGGING
         if should_save_checkpoint:
-            new_checkpoint_path = './checkpoints/retinanet_{}.pt'.format(epoch_num)
+            new_checkpoint_path = os.path.join(args.checkpoint_dir, 'retinanet_{}.pt'.format(epoch_num))
             print(f"Saving checkpoint at {new_checkpoint_path}")
             torch.save(beatfcos.state_dict(), new_checkpoint_path)
 
@@ -419,4 +499,4 @@ if __name__ == '__main__':
 
     beatfcos.eval()
 
-    torch.save(beatfcos, './checkpoints/model_final.pt')
+    torch.save(beatfcos, os.path.join(args.checkpoint_dir, 'model_final.pt'))

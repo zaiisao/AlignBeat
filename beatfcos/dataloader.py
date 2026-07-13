@@ -129,7 +129,12 @@ class BeatDataset(torch.utils.data.Dataset):
         else:
             raise ValueError(f"Invalid dataset: {self.dataset}")
 
-        fold_files = glob.glob(os.path.join(self.annot_dir, "*.folds"))  #MJ: /mount/beat-tracking/ballroom/label/???.folds etc
+        # 각 annot_dir에 "*_8-fold_cv_*.folds"와 "*_80_10_10.folds"가 둘 다
+        # 있어서, 예전처럼 "*.folds"로 다 긁으면 glob 순서에 따라 8-fold CV용
+        # 파일 대신 80/10/10용 파일이 잘못 선택될 수 있었음(둘 다 있을 때
+        # 어느 게 먼저 나올지 보장이 안 됨). validation_fold를 실제 8-fold CV로
+        # 쓰려는 것이므로 "8-fold"가 파일명에 들어간 것만 명시적으로 찾음.
+        fold_files = glob.glob(os.path.join(self.annot_dir, "*8-fold*.folds"))  #MJ: /mount/beat-tracking/ballroom/label/???.folds etc
         if self.validation_fold is not None and len(fold_files) > 0 and self.subset in ["train", "val", "test"]:
             fold_file = fold_files[0]  #MJ: len(fold_files) = 1
             self.audio_files = []
