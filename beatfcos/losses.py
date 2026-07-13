@@ -462,6 +462,9 @@ class CombinedLoss(nn.Module):
         self.audio_downsampling_factor = audio_downsampling_factor
         self.audio_sample_rate = audio_sample_rate
         self.centerness = centerness
+        # get_fcos_positives(beat_radius=, downbeat_radius=)로 그대로 전달됨
+        # (파라미터 자체의 의미는 get_fcos_positives 정의부와 train.py의
+        # --beat_radius/--downbeat_radius 주석 참고)
         self.beat_radius = beat_radius
         self.downbeat_radius = downbeat_radius
 

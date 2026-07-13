@@ -155,6 +155,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         num_classes,
         clusters,
         downbeat_weight=0.6,
+        # beat_radius/downbeat_radius: FCOS positive anchor 할당 반경 (그대로
+        # CombinedLoss -> get_fcos_positives로 전달됨). 자세한 배경 설명은
+        # train.py의 --beat_radius/--downbeat_radius 주석 참고.
         beat_radius=2.5,
         downbeat_radius=4.5,
         audio_downsampling_factor=32,
@@ -314,6 +317,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
             return [finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates, eval_losses]
 
+    # downbeat_score_threshold: 안 주면(None) score_threshold가 beat/downbeat
+    # 둘 다에 적용됨(기존 동작과 동일). 값을 주면 downbeat 클래스만 그 threshold로
+    # 독립적으로 후처리됨 (아래 soft_nms 부분의 class_score_threshold 참고).
     def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None): #:forward_call = forward
         # inputs = audio, target
         # self.training = len(inputs) == 2
@@ -399,7 +405,10 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             for class_id in range(classification_outputs.shape[2]): # the shape of classification_output is (B, number of anchor points per level, class ID)
                 scores = classification_outputs[:, :, class_id] * leftness_outputs[:, :, 0] # We predict the max number for beats will be less than the num of anchors
 
-                # class_id 0 = downbeat, class_id 1 = beat (see get_jth_targets in losses.py)
+                # class_id 0 = downbeat, class_id 1 = beat (see get_jth_targets in losses.py).
+                # beat와 downbeat은 confidence 분포가 달라서 최적 threshold도 다름
+                # (실측: beat=0.2, downbeat=0.05가 최적) - downbeat_score_threshold를
+                # 안 주면 기존처럼 score_threshold 하나로 두 클래스에 동일 적용됨.
                 class_score_threshold = downbeat_score_threshold if (class_id == 0 and downbeat_score_threshold is not None) else score_threshold
 
                 scores_over_thresh = torch.logical_and(scores > class_score_threshold, scores <= max_thresh)
@@ -443,6 +452,12 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                     #MJ: regression_boxes are those obtained by filtering out whose scores are less than score_threshold
                     #    Get all the filtered detections and store them for use in training gnet.
                 elif self.postprocessing_type == 'soft_nms':
+                    # 원래 여기 thresh=0.2로 하드코딩되어 있어서, score_threshold를
+                    # 밖에서 아무리 낮춰도(0.05, 0.02 등) 최종 결과는 항상 바뀌지
+                    # 않았음 - score_threshold는 soft_nms에 들어갈 후보군만 거르는
+                    # 역할이고, 실제 최종 컷은 이 하드코딩된 값이었기 때문. 이제
+                    # class_score_threshold(클래스별로 다를 수 있음)를 그대로 써서
+                    # 밖에서 지정한 threshold가 실제로 최종 결과에 반영되게 함.
                     anchors_nms_idx = soft_nms(regression_boxes, scores, sigma=0.5, thresh=class_score_threshold)
                 elif self.postprocessing_type == 'none':
                     anchors_nms_idx = torch.arange(0, regression_boxes.size(dim=0))

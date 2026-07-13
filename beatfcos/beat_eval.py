@@ -400,6 +400,9 @@ def evaluate_beat_ap(
 def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_sample_rate,
                             score_threshold=0.2, iou_threshold=0.5, max_thresh=1, downbeat_score_threshold=None):
     model.eval()
+    # beat와 downbeat은 confidence 분포가 달라서 최적 threshold도 다름(실측:
+    # beat=0.2, downbeat=0.05가 최적). downbeat_score_threshold를 안 주면
+    # score_threshold 하나로 기존처럼 beat/downbeat 둘 다에 동일 적용됨.
     effective_downbeat_threshold = downbeat_score_threshold if downbeat_score_threshold is not None else score_threshold
     
     with torch.no_grad():
