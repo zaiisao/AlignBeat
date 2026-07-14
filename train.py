@@ -107,7 +107,13 @@ parser.add_argument('--validation_fold', type=int, default=None)
 parser.add_argument('--backbone_type', type=str, default="wavebeat")
 parser.add_argument('--hop_length_in_seconds', type=float, default=0.01) # This is from Spectral TCN
 parser.add_argument('--dmodel', type=int, default=128)
-parser.add_argument('--nhead', type=int, default=2)
+# DilatedTransformerLayer.py의 attention head 분할(k[:,0:4]=symmetric 4개,
+# k[:,4:5]/k[:,5:6]/k[:,6:7]x2=skewed/dilated 4개, 총 8개 전제)이 하드코딩돼
+# 있는데 nhead 기본값이 2였음 - head가 2개뿐이면 저 skewed 4개 슬라이스가 전부
+# 빈 텐서가 되어 dilated attention이 사실상 죽고 symmetric(shift=0)만 남는
+# 버그가 있었음 (Beat Transformer 백본의 핵심 메커니즘이 꺼진 상태로 지금까지
+# 모든 실험이 돌아간 것). 8로 맞춰서 실제로 dilated head가 동작하게 함.
+parser.add_argument('--nhead', type=int, default=8)
 parser.add_argument('--d_hid', type=int, default=512)
 parser.add_argument('--nlayers', type=int, default=9)
 parser.add_argument('--attn_len', type=int, default=5)

@@ -320,7 +320,11 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
     # downbeat_score_threshold: 안 주면(None) score_threshold가 beat/downbeat
     # 둘 다에 적용됨(기존 동작과 동일). 값을 주면 downbeat 클래스만 그 threshold로
     # 독립적으로 후처리됨 (아래 soft_nms 부분의 class_score_threshold 참고).
-    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None): #:forward_call = forward
+    # return_raw_scores: True면 soft-NMS/threshold를 전부 건너뛰고, anchor별
+    # 원본 점수(leftness 곱한 값)와 위치를 그대로 반환함 - madmom DBN처럼 NMS가
+    # 아닌 다른 디코딩 방식에 넣기 위한 진단용 경로 (beat_eval.py의 DBN 관련
+    # 주석/evaluate_with_dbn.py 참고).
+    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, return_raw_scores=False): #:forward_call = forward
         # inputs = audio, target
         # self.training = len(inputs) == 2
 
@@ -380,6 +384,14 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             # Start of evaluation mode
 
             all_anchors = torch.cat(anchors_list, dim=0)
+
+            if return_raw_scores:
+                # class_id 0 = downbeat, class_id 1 = beat (get_jth_targets 컨벤션과 동일)
+                raw_downbeat_scores = classification_outputs[:, :, 0] * leftness_outputs[:, :, 0]
+                raw_beat_scores = classification_outputs[:, :, 1] * leftness_outputs[:, :, 0]
+                # all_anchors: anchor point 위치 (base-level, audio_downsampling_factor
+                # 단위 - 초 단위 변환은 audio_downsampling_factor / audio_sample_rate 곱하면 됨)
+                return raw_beat_scores, raw_downbeat_scores, all_anchors
 
             finalResult = [[], [], []]
 

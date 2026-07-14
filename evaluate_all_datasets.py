@@ -25,6 +25,7 @@ import argparse
 import sys
 sys.path.insert(0, '/disk1/taegum/mnt/BeatFCOS')
 
+import numpy as np
 import torch
 from beatfcos import model_module
 from beatfcos.dataloader import BeatDataset, collater
@@ -36,6 +37,13 @@ parser.add_argument('--score_threshold', type=float, default=0.20)
 parser.add_argument('--downbeat_score_threshold', type=float, default=0.05)
 parser.add_argument('--validation_fold', type=int, default=0,
                      help="ballroom/beatles/hainsworth/rwc_popular의 8-fold CV held-out fold 번호 (체크포인트를 학습시킨 validation_fold와 일치해야 함)")
+# 체크포인트를 학습시킨 training_data_clusters와 반드시 일치해야 함 (anchor
+# base_size가 여기서 나오기 때문 - 학습 때와 다른 clusters로 평가하면 anchor
+# 스케일이 어긋남). 예전 5-클러스터 체크포인트는 기본값 그대로, FPN
+# 레벨/클러스터 개수 불일치를 고친 이후 체크포인트는 3개짜리로 넘겨야 함
+# (train.py의 training_data_clusters 줄 주석 참고).
+parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.24245649,1.93286828,2.78558922",
+                     help="콤마로 구분된 클러스터 값. 체크포인트 학습에 쓴 값과 일치시킬 것")
 args = parser.parse_args()
 
 # (audio_dir, annot_dir, subset, validation_fold)
@@ -53,7 +61,7 @@ AUDIO_DOWNSAMPLING_FACTOR = 512
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.24245649, 1.93286828, 2.78558922])
+training_data_clusters = torch.tensor([float(x) for x in args.clusters.split(",")])
 model = model_module.create_beatfcos_model(
     num_classes=2, clusters=training_data_clusters, args=None,
     head_type="fcos",
@@ -84,14 +92,26 @@ for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
         val_dataset, batch_size=1, shuffle=False, collate_fn=collater
     )
 
-    beat_f, downbeat_f, _ = evaluate_beat_f_measure(
+    beat_f, downbeat_f, song_results = evaluate_beat_f_measure(
         val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
         score_threshold=args.score_threshold,
         downbeat_score_threshold=args.downbeat_score_threshold,
     )
-    results[name] = (beat_f, downbeat_f)
-    print(f"[{name}] Beat F: {beat_f:.3f} | Downbeat F: {downbeat_f:.3f} | Joint: {(beat_f+downbeat_f)/2:.3f}")
+    # mir_eval.beat.evaluate가 곡마다 돌려주는 dict에서 CMLt(Correct Metric
+    # Level Total)/AMLt(Any Metric Level Total)를 뽑아서 곡 평균을 냄 -
+    # evaluate_beat_f_measure 자체는 F-measure만 집계해서 반환하기 때문.
+    beat_cmlt = np.mean([r['beat_scores']['Correct Metric Level Total'] for r in song_results])
+    beat_amlt = np.mean([r['beat_scores']['Any Metric Level Total'] for r in song_results])
+    downbeat_cmlt = np.mean([r['downbeat_scores']['Correct Metric Level Total'] for r in song_results])
+    downbeat_amlt = np.mean([r['downbeat_scores']['Any Metric Level Total'] for r in song_results])
+
+    results[name] = (beat_f, downbeat_f, beat_cmlt, beat_amlt, downbeat_cmlt, downbeat_amlt)
+    print(f"[{name}] Beat F: {beat_f:.3f} CMLt: {beat_cmlt:.3f} AMLt: {beat_amlt:.3f} | "
+          f"Downbeat F: {downbeat_f:.3f} CMLt: {downbeat_cmlt:.3f} AMLt: {downbeat_amlt:.3f} | "
+          f"Joint F: {(beat_f+downbeat_f)/2:.3f}")
 
 print("\n=== 요약 ===")
-for name, (beat_f, downbeat_f) in results.items():
-    print(f"{name:<12} Beat F: {beat_f:.3f}  Downbeat F: {downbeat_f:.3f}  Joint: {(beat_f+downbeat_f)/2:.3f}")
+for name, (beat_f, downbeat_f, beat_cmlt, beat_amlt, downbeat_cmlt, downbeat_amlt) in results.items():
+    print(f"{name:<12} Beat  F:{beat_f:.3f} CMLt:{beat_cmlt:.3f} AMLt:{beat_amlt:.3f}  |  "
+          f"Downbeat  F:{downbeat_f:.3f} CMLt:{downbeat_cmlt:.3f} AMLt:{downbeat_amlt:.3f}  |  "
+          f"Joint F:{(beat_f+downbeat_f)/2:.3f}")

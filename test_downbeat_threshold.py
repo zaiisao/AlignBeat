@@ -5,6 +5,7 @@ fold0 체크포인트로, score_threshold를 낮췄을 때 downbeat F-measure=0.
 안 나오는데 DOWNBEAT만 37.9%가 0.000이 나온 게, downbeat 채널의 confidence가
 threshold(0.20)를 못 넘어서 그런 건지(threshold 문제) 확인하기 위함.
 """
+import argparse
 import sys
 sys.path.insert(0, '/disk1/taegum/mnt/BeatFCOS')
 
@@ -13,9 +14,17 @@ from beatfcos import model_module
 from beatfcos.dataloader import BeatDataset, collater
 from beatfcos.beat_eval import evaluate_beat_f_measure
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--checkpoint', type=str, default="/disk1/taegum/mnt/BeatFCOS/checkpoints_fold0_test/retinanet_27.pt")
+# 체크포인트를 학습시킨 training_data_clusters와 반드시 일치시켜야 함
+# (evaluate_all_datasets.py의 --clusters 주석 참고)
+parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.24245649,1.93286828,2.78558922")
+parser.add_argument('--validation_fold', type=int, default=0)
+args = parser.parse_args()
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.24245649, 1.93286828, 2.78558922])
+training_data_clusters = torch.tensor([float(x) for x in args.clusters.split(",")])
 model = model_module.create_beatfcos_model(
     num_classes=2, clusters=training_data_clusters, args=None,
     head_type="fcos",
@@ -25,7 +34,7 @@ model = model_module.create_beatfcos_model(
     audio_sample_rate=22050, backbone_type="wavebeat",
 )
 
-state_dict = torch.load("/disk1/taegum/mnt/BeatFCOS/checkpoints_fold0_test/retinanet_27.pt", map_location="cpu")
+state_dict = torch.load(args.checkpoint, map_location="cpu")
 state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 model.load_state_dict(state_dict)
 model = model.to(device)
@@ -43,7 +52,7 @@ for name, (audio_dir, annot_dir) in DATASETS.items():
         audio_dir, annot_dir, dataset=name,
         audio_sample_rate=22050, audio_downsampling_factor=512,
         subset="val", augment=False, half=True, preload=False,
-        length=2097152, dry_run=False, spectral=True, validation_fold=0,
+        length=2097152, dry_run=False, spectral=True, validation_fold=args.validation_fold,
     ))
 val_dataset_list = torch.utils.data.ConcatDataset(val_datasets)
 val_dataloader = torch.utils.data.DataLoader(val_dataset_list, batch_size=1, shuffle=False, collate_fn=collater)
