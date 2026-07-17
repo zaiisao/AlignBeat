@@ -35,6 +35,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint', type=str, required=True)
 parser.add_argument('--score_threshold', type=float, default=0.20)
 parser.add_argument('--downbeat_score_threshold', type=float, default=0.05)
+parser.add_argument('--downbeat_sigma', type=float, default=None,
+                     help="soft-NMS의 downbeat 전용 sigma (안 주면 기존처럼 beat/downbeat 둘 다 0.5 사용)")
 parser.add_argument('--validation_fold', type=int, default=0,
                      help="ballroom/beatles/hainsworth/rwc_popular의 8-fold CV held-out fold 번호 (체크포인트를 학습시킨 validation_fold와 일치해야 함)")
 # 체크포인트를 학습시킨 training_data_clusters와 반드시 일치해야 함 (anchor
@@ -71,13 +73,20 @@ model = model_module.create_beatfcos_model(
     audio_sample_rate=AUDIO_SAMPLE_RATE, backbone_type="wavebeat",
 )
 
-state_dict = torch.load(args.checkpoint, map_location="cpu")
+state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-model.load_state_dict(state_dict)
+# strict=False: phase auxiliary head(regressionModel.phase.*)가 새로 추가돼서
+# phase 도입 이전 체크포인트에는 이 키가 없음 - eval(soft-NMS 후처리)에는 phase
+# 출력이 안 쓰이므로 누락돼도 무방함 (0으로 초기화된 채로 그냥 안 쓰이고 남음).
+missing, unexpected = model.load_state_dict(state_dict, strict=False)
+if unexpected:
+    raise RuntimeError(f"체크포인트에 모델에 없는 키가 있음: {unexpected}")
+if missing and missing != ["regressionModel.phase.weight", "regressionModel.phase.bias"]:
+    raise RuntimeError(f"예상 못한 키 누락: {missing}")
 model = model.to(device)
 
 print(f"체크포인트: {args.checkpoint}")
-print(f"score_threshold(beat)={args.score_threshold} | downbeat_score_threshold={args.downbeat_score_threshold}\n")
+print(f"score_threshold(beat)={args.score_threshold} | downbeat_score_threshold={args.downbeat_score_threshold} | downbeat_sigma={args.downbeat_sigma}\n")
 
 results = {}
 for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
@@ -96,6 +105,7 @@ for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
         val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
         score_threshold=args.score_threshold,
         downbeat_score_threshold=args.downbeat_score_threshold,
+        downbeat_sigma=args.downbeat_sigma,
     )
     # mir_eval.beat.evaluate가 곡마다 돌려주는 dict에서 CMLt(Correct Metric
     # Level Total)/AMLt(Any Metric Level Total)를 뽑아서 곡 평균을 냄 -

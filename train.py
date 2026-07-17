@@ -98,6 +98,14 @@ parser.add_argument('--downbeat_weight', type=float, default=0.6)
 # 과다예측 관찰됨). beat 수준(2.5~3.0)으로 낮춰서 재학습 검증 중.
 parser.add_argument('--beat_radius', type=float, default=2.5)
 parser.add_argument('--downbeat_radius', type=float, default=4.5)
+# phase_weight: downbeat 박스끼리 겹치는 문제(final_boxes.png로 시각화 확인,
+# 평균 IoU 0.101 vs beat 0.015)가 모델이 마디 내 위상/주기성을 명시적으로
+# 학습하지 못해서라는 가설을 테스트하기 위한 auxiliary target의 loss 가중치.
+# 각 anchor가 속한 downbeat 구간(마디) 안에서의 위상을 (sin, cos)로 인코딩해
+# regression head 옆에 새로 붙인 phase head가 예측하도록 함 (DBN 같은 수작업
+# 후처리나 실패했던 NMS-free 방식 대신, end-to-end로 리듬 일관성을 학습시키려는
+# 시도 - losses.py의 get_phase_targets/PhaseLoss 참고).
+parser.add_argument('--phase_weight', type=float, default=1.0)
 parser.add_argument('--pretrained', default=False, action="store_true")  # True → False
 parser.add_argument('--freeze_backbone', default=False, action="store_true")
 parser.add_argument('--centerness', default=False, action="store_true")
@@ -387,6 +395,7 @@ if __name__ == '__main__':
         reg_losses = []
         lft_losses = []
         adj_losses = []
+        pha_losses = []
 
         print(f'[MEM] epoch {epoch_num} start: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
 
@@ -400,20 +409,23 @@ if __name__ == '__main__':
                 optimizer.zero_grad()
 
                 classification_loss, regression_loss,\
-                leftness_loss, adjacency_constraint_loss =\
+                leftness_loss, adjacency_constraint_loss,\
+                phase_loss =\
                     beatfcos((audio, target))
 
                 classification_loss = classification_loss.mean()
                 regression_loss = regression_loss.mean()
                 leftness_loss = leftness_loss.mean()
                 adjacency_constraint_loss = torch.zeros(1).to(adjacency_constraint_loss.device) if args.no_adj else adjacency_constraint_loss.mean()
+                phase_loss = phase_loss.mean()
 
                 cls_losses.append(classification_loss.item())
                 reg_losses.append(regression_loss.item())
                 lft_losses.append(leftness_loss.item())
                 adj_losses.append(adjacency_constraint_loss.item())
+                pha_losses.append(phase_loss.item())
 
-                loss = classification_loss + regression_loss + leftness_loss + adjacency_constraint_loss
+                loss = classification_loss + regression_loss + leftness_loss + adjacency_constraint_loss + phase_loss
 
                 if bool(loss == 0):
                     continue
@@ -449,10 +461,11 @@ if __name__ == '__main__':
                     )
                 else:
                     print(
-                        'Epoch: {} | Iteration: {} | CLS: {:1.5f} | REG: {:1.5f} | LFT: {:1.5f} | ADJ: {:1.5f} | Running loss: {:1.5f}'.format(
+                        'Epoch: {} | Iteration: {} | CLS: {:1.5f} | REG: {:1.5f} | LFT: {:1.5f} | ADJ: {:1.5f} | PHA: {:1.5f} | Running loss: {:1.5f}'.format(
                             epoch_num, iter_num,
                             float(classification_loss), float(regression_loss),
-                            float(leftness_loss), float(adjacency_constraint_loss), np.mean(loss_hist))
+                            float(leftness_loss), float(adjacency_constraint_loss),
+                            float(phase_loss), np.mean(loss_hist))
                     )
 
                 if iter_num % 10 == 0:
@@ -462,6 +475,7 @@ if __name__ == '__main__':
                 del regression_loss
                 del leftness_loss
                 del adjacency_constraint_loss
+                del phase_loss
                 del loss
             except KeyboardInterrupt:
                 sys.exit()
@@ -485,7 +499,7 @@ if __name__ == '__main__':
         if args.head_type == "hungarian":
             print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | BBOX(L1): {np.mean(reg_losses):0.3f} | GIOU: {np.mean(lft_losses):0.3f}")
         else:
-            print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | REG: {np.mean(reg_losses):0.3f} | LFT: {np.mean(lft_losses):0.3f} | ADJ: {np.mean(adj_losses):0.3f}")
+            print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | REG: {np.mean(reg_losses):0.3f} | LFT: {np.mean(lft_losses):0.3f} | ADJ: {np.mean(adj_losses):0.3f} | PHA: {np.mean(pha_losses):0.3f}")
         scheduler.step(joint_f_measure)
 
         should_save_checkpoint = False

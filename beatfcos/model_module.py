@@ -85,6 +85,15 @@ class RegressionModel(nn.Module):
         self.leftness = nn.Conv1d(feature_size, 1, kernel_size=3, padding=1)
         self.leftness_act = nn.Sigmoid()
 
+        # phase/주기성 auxiliary target: downbeat 박스끼리 겹치는 문제
+        # (final_boxes.png, 평균 IoU 0.101 vs beat 0.015)가 모델이 마디 내
+        # 위상을 명시적으로 학습하지 못해서라는 가설을 검증하려고 추가함.
+        # 각 anchor가 속한 downbeat 구간(마디) 안에서의 위상을 (sin, cos) 단위원
+        # 좌표로 예측하게 함 - 자세한 배경은 losses.py의
+        # get_phase_targets/PhaseLoss 참고. tanh로 [-1,1] 범위로 bound.
+        self.phase = nn.Conv1d(feature_size, 2, kernel_size=3, padding=1)
+        self.phase_act = nn.Tanh()
+
     def forward(self, x):
         out = self.conv1(x)
         out = self.norm1(out)
@@ -107,7 +116,12 @@ class RegressionModel(nn.Module):
         leftness = leftness.permute(0, 2, 1)
         leftness = leftness.contiguous().view(leftness.shape[0], -1, 1)
 
-        return regression, leftness
+        phase = self.phase(out)
+        phase = self.phase_act(phase)
+        phase = phase.permute(0, 2, 1)
+        phase = phase.contiguous().view(phase.shape[0], -1, 2)
+
+        return regression, leftness, phase
 
 class ClassificationModel(nn.Module):
     def __init__(self, num_features_in, num_classes=2, prior=0.01, feature_size=256):
@@ -160,6 +174,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         # train.py의 --beat_radius/--downbeat_radius 주석 참고.
         beat_radius=2.5,
         downbeat_radius=4.5,
+        # phase_weight: 그대로 CombinedLoss -> PhaseLoss로 전달됨. 배경 설명은
+        # train.py의 --phase_weight 주석 참고.
+        phase_weight=1.0,
         audio_downsampling_factor=32,
         centerness=False,
         postprocessing_type="soft_nms",
@@ -227,7 +244,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             # beat/downbeat에 같은 alpha를 쓰다 보니 인스턴스가 훨씬 적은 downbeat
             # 채널이 상대적으로 약한 신호만 받아 F-measure가 유독 불안정했던 것으로
             # 관찰되어(자세한 내용은 losses.py의 FocalLoss 참고), 실제로 연결함.
-            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness, downbeat_weight=downbeat_weight, beat_radius=beat_radius, downbeat_radius=downbeat_radius)
+            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness, downbeat_weight=downbeat_weight, beat_radius=beat_radius, downbeat_radius=downbeat_radius, phase_weight=phase_weight)
 
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
@@ -253,6 +270,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
             self.regressionModel.leftness.weight.data.fill_(0)
             self.regressionModel.leftness.bias.data.fill_(0)
+
+            self.regressionModel.phase.weight.data.fill_(0)
+            self.regressionModel.phase.bias.data.fill_(0)
         # self.freeze_bn() # If we do not freeze the batch normalization layers, the layers will be trained as was done in WaveBeat
 
     def freeze_bn(self):
@@ -284,14 +304,17 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
         if self.training:
             zero = torch.zeros((), device=class_logits.device)
-            # train.py의 4-tuple 언패킹/출력("CLS/REG/LFT/ADJ")을 그대로 재사용하기
-            # 위해 같은 모양으로 반환함: CLS<-분류loss, REG<-bbox(L1), LFT<-giou,
-            # ADJ<-미사용(0). 출력에 찍히는 라벨 이름은 FCOS 시절 그대로라 의미가
-            # 안 맞지만, 값 자체는 실제 set-prediction loss가 맞다.
+            # train.py의 5-tuple 언패킹/출력("CLS/REG/LFT/ADJ/PHA")을 그대로
+            # 재사용하기 위해 같은 모양으로 반환함: CLS<-분류loss, REG<-bbox(L1),
+            # LFT<-giou, ADJ/PHA<-미사용(0). 출력에 찍히는 라벨 이름은 FCOS
+            # 시절 그대로라 의미가 안 맞지만, 값 자체는 실제 set-prediction
+            # loss가 맞다. hungarian head에는 anchor 자체가 없어서 phase/마디
+            # 위상 auxiliary target 개념도 적용 대상이 아님.
             return (
                 losses["loss_class"].unsqueeze(0),
                 losses["loss_bbox"].unsqueeze(0),
                 losses["loss_giou"].unsqueeze(0),
+                zero.unsqueeze(0),
                 zero.unsqueeze(0),
             )
         else:
@@ -324,7 +347,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
     # 원본 점수(leftness 곱한 값)와 위치를 그대로 반환함 - madmom DBN처럼 NMS가
     # 아닌 다른 디코딩 방식에 넣기 위한 진단용 경로 (beat_eval.py의 DBN 관련
     # 주석/evaluate_with_dbn.py 참고).
-    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, return_raw_scores=False): #:forward_call = forward
+    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None, return_raw_scores=False): #:forward_call = forward
         # inputs = audio, target
         # self.training = len(inputs) == 2
 
@@ -354,15 +377,18 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         classification_outputs = torch.cat([self.classificationModel(feature_map) for feature_map in feature_maps], dim=1)
         regression_outputs = []
         leftness_outputs = []
+        phase_outputs = []
 
         for feature_map in feature_maps:
-            bbx_regression_output, leftness_regression_output = self.regressionModel(feature_map)
+            bbx_regression_output, leftness_regression_output, phase_output = self.regressionModel(feature_map)
 
             regression_outputs.append(bbx_regression_output)
             leftness_outputs.append(leftness_regression_output)
+            phase_outputs.append(phase_output)
 
         regression_outputs = torch.cat(regression_outputs, dim=1)
         leftness_outputs = torch.cat(leftness_outputs, dim=1)
+        phase_outputs = torch.cat(phase_outputs, dim=1)
 
         anchors_list = self.anchors(base_level_image_shape)
 
@@ -374,12 +400,12 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         class_one_positive_indicators, class_two_positive_indicators = None, None
 
         # This combined loss will eventually replace the legacy losses we have been using
-        classification_loss, regression_loss, leftness_loss, adjacency_constraint_loss = self.combined_loss(
-            classification_outputs, regression_outputs, leftness_outputs, anchors_list, annotations
+        classification_loss, regression_loss, leftness_loss, adjacency_constraint_loss, phase_loss = self.combined_loss(
+            classification_outputs, regression_outputs, leftness_outputs, phase_outputs, anchors_list, annotations
         )
 
         if self.training:
-            return classification_loss, regression_loss, leftness_loss, adjacency_constraint_loss
+            return classification_loss, regression_loss, leftness_loss, adjacency_constraint_loss, phase_loss
         else:
             # Start of evaluation mode
 
@@ -470,7 +496,15 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                     # 역할이고, 실제 최종 컷은 이 하드코딩된 값이었기 때문. 이제
                     # class_score_threshold(클래스별로 다를 수 있음)를 그대로 써서
                     # 밖에서 지정한 threshold가 실제로 최종 결과에 반영되게 함.
-                    anchors_nms_idx = soft_nms(regression_boxes, scores, sigma=0.5, thresh=class_score_threshold)
+                    #
+                    # downbeat_sigma: downbeat box가 beat box보다 폭이 훨씬 넓어서
+                    # (박마디 길이) 연속된 두 박스가 겹치는 경우가 많음(final_boxes.png
+                    # 시각화로 확인됨, 평균 IoU 0.101 vs beat 0.015). soft-NMS의
+                    # sigma는 겹치는 이웃 박스의 점수를 얼마나 강하게 깎을지 결정하는
+                    # 파라미터라서, downbeat만 별도로 조정해 겹침을 더 강하게
+                    # 억제할 수 있는지 실험.
+                    class_sigma = downbeat_sigma if (class_id == 0 and downbeat_sigma is not None) else 0.5
+                    anchors_nms_idx = soft_nms(regression_boxes, scores, sigma=class_sigma, thresh=class_score_threshold)
                 elif self.postprocessing_type == 'none':
                     anchors_nms_idx = torch.arange(0, regression_boxes.size(dim=0))
 

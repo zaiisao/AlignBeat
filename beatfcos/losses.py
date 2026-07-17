@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -140,6 +141,55 @@ def get_fcos_positives(jth_annotations, anchors_list, interval_length_ranges,
         assigned_annotations_for_anchors, normalized_annotations_for_anchors,\
         l_star_for_anchors, r_star_for_anchors,\
         normalized_l_star_for_anchors, normalized_r_star_for_anchors, levels_for_all_anchors#,\
+
+def get_phase_targets(jth_annotations, anchor_points):
+    """
+    Downbeat 박스끼리 겹치는 문제(final_boxes.png로 확인, 평균 consecutive IoU
+    0.101 vs beat 0.015)가 모델이 마디(bar) 내에서의 위상/주기성을 명시적으로
+    학습하지 못해서라는 가설을 검증하기 위한 auxiliary target.
+
+    각 anchor point가 속한 downbeat 구간(class==0인 annotation, 즉 한 마디의
+    [downbeat, next_downbeat) 구간) 안에서 위상이 얼마인지 계산한다 - 0이면
+    마디 시작(downbeat 위치), 1에 가까울수록 다음 마디 직전. 어떤 downbeat
+    구간에도 속하지 않는 anchor(주로 곡의 맨 끝 등, annotation 범위 밖)는
+    mask=False로 표시해서 loss 계산에서 제외한다.
+
+    phase 값을 직접 회귀하면 0과 1이 실제로는 붙어있는 값인데 (막 다음 마디로
+    넘어간 직후 vs 마디 끝나기 직전) 회귀 타겟으로는 정반대 값이 되는 래핑
+    불연속 문제가 생긴다. 이를 피하려고 phase를 (sin, cos) 단위원 좌표로
+    인코딩해서 타겟으로 쓴다 (PhaseLoss와 짝을 이룸).
+    """
+    device = anchor_points.device
+    downbeat_annotations = jth_annotations[jth_annotations[:, 2] == 0]
+
+    if downbeat_annotations.size(dim=0) == 0:
+        mask = torch.zeros(anchor_points.shape[0], dtype=torch.bool, device=device)
+        targets = torch.zeros(anchor_points.shape[0], 2, device=device)
+        return mask, targets
+
+    anchor_points_nx1 = anchor_points.unsqueeze(1)  # (N, 1)
+    l = downbeat_annotations[:, 0].unsqueeze(0)  # (1, M)
+    r = downbeat_annotations[:, 1].unsqueeze(0)  # (1, M)
+
+    # downbeat 구간들은 서로 안 겹치는 게 정상(연속된 마디)이지만, 혹시 모를
+    # 중복 매칭에 대비해 겹치는 경우 가장 짧은 구간을 우선한다.
+    contains = (anchor_points_nx1 >= l) & (anchor_points_nx1 < r)  # (N, M)
+    mask = contains.any(dim=1)
+
+    lengths = (r - l).expand(anchor_points.shape[0], -1).clone()
+    lengths[~contains] = INF
+    min_idx = lengths.argmin(dim=1)
+
+    matched_l = downbeat_annotations[min_idx, 0]
+    matched_r = downbeat_annotations[min_idx, 1]
+    phase = (anchor_points - matched_l) / (matched_r - matched_l).clamp(min=1e-6)
+    phase = phase.clamp(0, 1)
+
+    angle = 2 * math.pi * phase
+    targets = torch.stack([torch.sin(angle), torch.cos(angle)], dim=1)
+    targets[~mask] = 0
+
+    return mask, targets
 
 class FocalLoss(nn.Module):
     def __init__(self, downbeat_weight=0.5):
@@ -449,14 +499,35 @@ class AdjacencyConstraintLoss(nn.Module):
 
         return all_adjacency_constraint_losses.mean()
 
+class PhaseLoss(nn.Module):
+    """
+    get_phase_targets가 만든 (sin, cos) 타겟과 RegressionModel의 phase head가
+    예측한 (sin, cos)를 비교하는 MSE loss. positive anchor만 쓰는 다른
+    loss들과 달리, 어떤 downbeat 구간에라도 속하는 모든 anchor(대부분의 anchor)
+    에 대해 조밀하게(densely) 걸리는 supervision이다 - 마디 위상/주기성이라는
+    전역적인 리듬 구조를 국소적인 anchor 하나하나가 학습하게 하려는 의도.
+    """
+    def __init__(self):
+        super(PhaseLoss, self).__init__()
+
+    def forward(self, jth_phase_pred, jth_phase_targets, phase_mask):
+        if phase_mask.sum() == 0:
+            return torch.zeros((), device=jth_phase_pred.device)
+
+        pred = jth_phase_pred[phase_mask]
+        target = jth_phase_targets[phase_mask]
+
+        return ((pred - target) ** 2).sum(dim=1).mean()
+
 class CombinedLoss(nn.Module):
-    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, centerness=False, downbeat_weight=0.5, beat_radius=2.5, downbeat_radius=4.5):
+    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, centerness=False, downbeat_weight=0.5, beat_radius=2.5, downbeat_radius=4.5, phase_weight=1.0):
         super(CombinedLoss, self).__init__()
 
         self.classification_loss = FocalLoss(downbeat_weight=downbeat_weight)
         self.regression_loss = RegressionLoss()
         self.leftness_loss = LeftnessLoss()
         self.adjacency_constraint_loss = AdjacencyConstraintLoss()
+        self.phase_loss = PhaseLoss()
 
         self.clusters = clusters
         self.audio_downsampling_factor = audio_downsampling_factor
@@ -467,6 +538,8 @@ class CombinedLoss(nn.Module):
         # --beat_radius/--downbeat_radius 주석 참고)
         self.beat_radius = beat_radius
         self.downbeat_radius = downbeat_radius
+        # phase_loss에 곱해지는 가중치 (train.py의 --phase_weight 주석 참고)
+        self.phase_weight = phase_weight
 
     def get_jth_targets(
         self,
@@ -497,7 +570,7 @@ class CombinedLoss(nn.Module):
 
         return jth_classification_targets, jth_regression_targets, jth_leftness_targets
 
-    def forward(self, classifications, regressions, leftnesses, anchors_list, annotations):
+    def forward(self, classifications, regressions, leftnesses, phases, anchors_list, annotations):
         # Classification, regression, and leftness should all have the same number of items in the batch
         assert classifications.shape[0] == regressions.shape[0] and regressions.shape[0] == leftnesses.shape[0]
         batch_size = classifications.shape[0]
@@ -506,11 +579,13 @@ class CombinedLoss(nn.Module):
         regression_losses_batch = []
         leftness_losses_batch = []
         adjacency_constraint_losses_batch = []
+        phase_losses_batch = []
 
         for j in range(batch_size):
             jth_classification_pred = classifications[j, :, :]   # (B, A, 2)
             jth_regression_pred = regressions[j, :, :]           # (B, A, 2)
             jth_leftness_pred = leftnesses[j, :, :]              # (B, A, 1)
+            jth_phase_pred = phases[j, :, :]                     # (B, A, 2)
 
             jth_padded_annotations = annotations[j, :, :] #MJ: jth_padded_annotations[:, 2]= class id
 
@@ -579,26 +654,37 @@ class CombinedLoss(nn.Module):
                 jth_annotations
             )
 
+            # positive anchor만 쓰는 위의 loss들과 달리, phase target은 어떤
+            # downbeat 구간에라도 속하는 모든 anchor에 대해 조밀하게 계산됨
+            # (get_phase_targets/PhaseLoss 주석 참고).
+            phase_mask, jth_phase_targets = get_phase_targets(jth_annotations, all_anchor_points)
+            jth_phase_loss = self.phase_loss(jth_phase_pred, jth_phase_targets, phase_mask) * self.phase_weight
+
             classification_losses_batch.append(jth_classification_loss)
             regression_losses_batch.append(jth_regression_loss)
             leftness_losses_batch.append(jth_leftness_loss)
             adjacency_constraint_losses_batch.append(jth_adjacency_constraint_loss)
+            phase_losses_batch.append(jth_phase_loss)
         # END for j in range(batch_size)
 
         if len(classification_losses_batch) == 0:
             classification_losses_batch.append(0)  #MJ: append zero tensor rather number 0
-            
+
         if len(regression_losses_batch) == 0:
             regression_losses_batch.append(0)
-            
+
         if len(leftness_losses_batch) == 0:
             leftness_losses_batch.append(0)
-            
+
         if len(adjacency_constraint_losses_batch) == 0:
             adjacency_constraint_losses_batch.append(0)
+
+        if len(phase_losses_batch) == 0:
+            phase_losses_batch.append(0)
 
         return \
             torch.stack(classification_losses_batch).mean(dim=0, keepdim=True), \
             torch.stack(regression_losses_batch).mean(dim=0, keepdim=True), \
             torch.stack(leftness_losses_batch).mean(dim=0, keepdim=True), \
-            torch.stack(adjacency_constraint_losses_batch).mean(dim=0, keepdim=True)
+            torch.stack(adjacency_constraint_losses_batch).mean(dim=0, keepdim=True), \
+            torch.stack(phase_losses_batch).mean(dim=0, keepdim=True)
