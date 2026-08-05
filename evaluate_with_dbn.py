@@ -46,7 +46,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint', type=str, required=True)
 parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.93286828")
 parser.add_argument('--validation_fold', type=int, default=0)
-parser.add_argument('--nhead', type=int, default=2)
+# nhead=2로 학습된 옛날 체크포인트를 평가하려면 --nhead 2로 명시할 것
+# (기본값 2는 dilated head가 죽는 버그 설정이라 8로 고침 - train.py 관련 주석 참고)
+parser.add_argument('--nhead', type=int, default=8)
 args = parser.parse_args()
 
 AUDIO_SAMPLE_RATE = 22050

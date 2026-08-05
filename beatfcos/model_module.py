@@ -347,7 +347,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
     # 원본 점수(leftness 곱한 값)와 위치를 그대로 반환함 - madmom DBN처럼 NMS가
     # 아닌 다른 디코딩 방식에 넣기 위한 진단용 경로 (beat_eval.py의 DBN 관련
     # 주석/evaluate_with_dbn.py 참고).
-    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None, return_raw_scores=False): #:forward_call = forward
+    def forward(self, inputs, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None, downbeat_phase_reweight=False, return_raw_scores=False): #:forward_call = forward
         # inputs = audio, target
         # self.training = len(inputs) == 2
 
@@ -440,8 +440,23 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             transformed_regression_boxes = self.anchor_point_transform(all_anchors, regression_outputs, strides_for_all_anchors)
             transformed_regression_boxes = self.clipBoxes(transformed_regression_boxes, audio_batch.transpose(1, 2))
 
+            # downbeat_phase_reweight: downbeat 후보는 (get_phase_targets 정의상) 위상이
+            # 0이어야 정상 - phase head가 예측한 (sin, cos)를 단위원으로 정규화한 뒤
+            # cos 성분을 [0,1]로 매핑하면(cos=1일 때 1, 즉 phase=0), "이 anchor가
+            # 실제로 마디 시작처럼 보이는 정도"를 나타내는 별도 신호가 된다. 이걸
+            # downbeat 점수에 곱해서, 분류/leftness 점수는 높지만 phase 예측과
+            # 안 맞는(위상이 마디 중간인) 후보를 soft-NMS 전에 미리 깎아 리듬
+            # 연속성(CMLt/AMLt)을 개선해보려는 시도 - 재학습 없이 이미 학습된
+            # phase head를 추론 단계에서 활용하는 것뿐이라 체크포인트는 그대로 씀.
+            if downbeat_phase_reweight:
+                phase_norm = phase_outputs.norm(dim=2, keepdim=True).clamp(min=1e-6)
+                downbeat_phase_agreement = ((phase_outputs[:, :, 1:2] / phase_norm) + 1) / 2
+
             for class_id in range(classification_outputs.shape[2]): # the shape of classification_output is (B, number of anchor points per level, class ID)
                 scores = classification_outputs[:, :, class_id] * leftness_outputs[:, :, 0] # We predict the max number for beats will be less than the num of anchors
+
+                if downbeat_phase_reweight and class_id == 0:
+                    scores = scores * downbeat_phase_agreement[:, :, 0]
 
                 # class_id 0 = downbeat, class_id 1 = beat (see get_jth_targets in losses.py).
                 # beat와 downbeat은 confidence 분포가 달라서 최적 threshold도 다름

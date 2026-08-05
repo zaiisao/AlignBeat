@@ -10,7 +10,7 @@ GPU 1을 써서 지금 GPU 0에서 도는 학습(v4 clamp run)과 절대 안 겹
 3) log_var 값 확인 (clamp 범위 안에 있는지, 어느 쪽으로 치우쳤는지)
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import sys
 sys.path.insert(0, '/disk1/taegum/mnt/BeatFCOS')
@@ -31,6 +31,9 @@ model = model_module.create_beatfcos_model(
     num_queries=300,
     decoder_layers=3,
     dmodel=128,
+    # v6_levelpos 체크포인트는 nhead 버그 고치기 전(7/7)에 학습된 거라 그 시절
+    # 그대로 nhead=2로 로드해야 함 (지금 collapse 자체를 재현/진단하는 게
+    # 목적이라 당시 설정을 그대로 재현하는 게 맞음).
     nhead=2,
     d_hid=512,
     nlayers=9,
@@ -44,7 +47,7 @@ model = model_module.create_beatfcos_model(
     backbone_type="wavebeat",
 )
 
-ckpt_path = "/disk1/taegum/mnt/BeatFCOS/checkpoints/retinanet_1.pt"
+ckpt_path = "/disk1/taegum/mnt/BeatFCOS/checkpoints_backup_v6_levelpos/retinanet_9.pt"
 state_dict = torch.load(ckpt_path, map_location="cpu")
 state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 model.load_state_dict(state_dict)

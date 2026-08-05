@@ -103,3 +103,90 @@ hungarian 결과가 안 좋아서, "DSA+FPN 백본 교체만 하고 기존 FCOS 
    0.633보다 끌어올리는지
 
 진행 상황은 이 섹션에 계속 업데이트 예정.
+
+---
+
+## FPN Ablation 실험 (안재훈 박사님 제안, 2026-07)
+
+박사님이 epoch 79 비교표를 보고 제안: FPN의 lower layer(P1) 제거 + classification/regression
+head 통합 구조, 그리고 FPN 자체(cross-scale fusion)를 완전히 제거하고 head를 encoder
+마지막 레이어에 직결하는 구조. 두 실험 모두 `head_type` 분기로 구현 (`model_module.py`,
+`losses.py`, `anchors.py`, `train.py`).
+
+### 실험군 (validation_fold 0, epochs 100, patience 10, nhead 8, 6개 데이터셋 공통)
+
+| head_type | GPU | 구조 | 상태 |
+|---|---|---|---|
+| `fcos` (baseline) | 0 | 원래 구조 (P1/P2/P3 + FPN fusion + 분리된 head) | **완료** (epoch 99) |
+| `fcos_lite` | 1 | P1 제거(P2/P3만 사용, FPN fusion은 유지), classification+regression head 통합 | 진행 중 (epoch 28~) |
+| `fcos_no_fpn` | 2 | FPN cross-scale fusion 자체를 끔(P1만, 단일 레벨), head는 분리 구조 유지 | 진행 중 (epoch 20~) |
+
+### 학습 중 자체 평가 최고점 (train.py 로그 기준, 세 실험 모두 100 epoch 완료)
+
+| head_type | 체크포인트(최고점) | Beat score | Downbeat score | Joint score |
+|---|---|---|---|---|
+| `fcos` (baseline) | retinanet_79.pt | 0.917 | 0.816 | 0.868 |
+| `fcos_lite` | retinanet_92.pt | 0.925 | 0.838 | 0.885 |
+| `fcos_no_fpn` | retinanet_35.pt | 0.858 | 0.520 | 0.690 |
+
+### 정식 평가 (evaluate_all_datasets.py, score_threshold=downbeat_score_threshold=0.20,
+데이터셋별 val fold 개별 평가 — train.py의 macro-average와 별개로 재확인)
+
+**fcos (baseline)**
+
+| dataset | Beat F | Beat CMLt | Beat AMLt | Downbeat F | Downbeat CMLt | Downbeat AMLt | Joint F |
+|---|---|---|---|---|---|---|---|
+| ballroom | 0.923 | 0.831 | 0.855 | 0.819 | 0.795 | 0.834 | 0.871 |
+| beatles | 0.958 | 0.923 | 0.923 | 0.896 | 0.833 | 0.863 | 0.927 |
+| hainsworth | 0.866 | 0.777 | 0.830 | 0.574 | 0.540 | 0.683 | 0.720 |
+| rwc_popular | 0.921 | 0.831 | 0.840 | 0.880 | 0.897 | 0.897 | 0.900 |
+| carnatic | 0.886 | 0.765 | 0.779 | 0.837 | 0.945 | 0.945 | 0.861 |
+| harmonix | 0.945 | 0.897 | 0.904 | 0.916 | 0.932 | 0.936 | 0.930 |
+| gtzan(held-out) | 0.834 | 0.696 | 0.776 | 0.606 | 0.539 | 0.711 | 0.720 |
+| smc(held-out) | 0.495 | 0.293 | 0.395 | 0.279 | 0.052 | 0.214 | 0.387 |
+
+**fcos_lite (P1 제거 + head 통합)**
+
+| dataset | Beat F | Beat CMLt | Beat AMLt | Downbeat F | Downbeat CMLt | Downbeat AMLt | Joint F |
+|---|---|---|---|---|---|---|---|
+| ballroom | 0.940 | 0.865 | 0.888 | 0.865 | 0.845 | 0.869 | 0.902 |
+| beatles | 0.946 | 0.872 | 0.899 | 0.901 | 0.814 | 0.888 | 0.923 |
+| hainsworth | 0.888 | 0.806 | 0.835 | 0.615 | 0.532 | 0.625 | 0.751 |
+| rwc_popular | 0.919 | 0.847 | 0.868 | 0.920 | 0.928 | 0.928 | 0.920 |
+| carnatic | 0.909 | 0.793 | 0.804 | 0.851 | 0.948 | 0.951 | 0.880 |
+| harmonix | 0.949 | 0.899 | 0.905 | 0.916 | 0.929 | 0.932 | 0.932 |
+| gtzan(held-out) | 0.839 | 0.691 | 0.773 | 0.614 | 0.539 | 0.702 | 0.726 |
+| smc(held-out) | 0.491 | 0.234 | 0.359 | 0.288 | 0.046 | 0.252 | 0.389 |
+
+**fcos_no_fpn (FPN fusion 제거)**
+
+| dataset | Beat F | Beat CMLt | Beat AMLt | Downbeat F | Downbeat CMLt | Downbeat AMLt | Joint F |
+|---|---|---|---|---|---|---|---|
+| ballroom | 0.888 | 0.747 | 0.778 | 0.579 | 0.321 | 0.390 | 0.734 |
+| beatles | 0.879 | 0.743 | 0.765 | 0.660 | 0.372 | 0.407 | 0.769 |
+| hainsworth | 0.847 | 0.733 | 0.761 | 0.364 | 0.148 | 0.225 | 0.605 |
+| rwc_popular | 0.841 | 0.700 | 0.738 | 0.637 | 0.430 | 0.462 | 0.739 |
+| carnatic | 0.767 | 0.493 | 0.631 | 0.401 | 0.165 | 0.240 | 0.584 |
+| harmonix | 0.883 | 0.770 | 0.793 | 0.537 | 0.233 | 0.370 | 0.710 |
+| gtzan(held-out) | 0.817 | 0.646 | 0.703 | 0.454 | 0.207 | 0.322 | 0.636 |
+| smc(held-out) | 0.500 | 0.235 | 0.332 | 0.308 | 0.078 | 0.159 | 0.404 |
+
+### 결론
+- fcos_lite는 거의 전 데이터셋에서 baseline과 동등하거나 소폭 앞섬 → P1 제거+head 통합은
+  성능 저하 요인이 아님.
+- fcos_no_fpn은 전 데이터셋에서 확실히 큰 폭으로 하락, 특히 Downbeat CMLt(정확한 metric
+  level 일치 비율)가 가장 크게 무너짐(예: carnatic 0.945→0.165, ballroom 0.795→0.321) →
+  FPN의 cross-scale fusion이 downbeat의 정확한 위상/주기 판단에 핵심적인 역할을 한다는
+  근거로 해석됨.
+- carnatic/harmonix(우리가 vanilla BT 대비 이기던 데이터셋)에서 fcos_no_fpn의 낙폭이
+  특히 큼 — FPN fusion이 그 우위의 구조적 원인 중 하나일 가능성을 뒷받침.
+
+### 미해결
+Vanilla Beat Transformer(우리 데이터로 from-scratch 재학습, `01_Beat_Transformer/Fold_0/
+model/trf_param_008.pt`)의 동일 breakdown(Beat/Downbeat F·CMLt·AMLt, 데이터셋별)은 아직
+계산된 적 없음 — 이전에 박사님께 보낸 "epoch 79 비교표"는 어디에도 파일로 안 남아있어서
+찾을 수 없었음. 필요하면 vanilla BT 전용 평가 스크립트를 새로 만들어서 돌려야 함.
+
+### 다음 할 일
+GPU 0, 1, 2 세 실험 모두 완료 및 정식 평가 완료. 남은 건 vanilla BT와의 직접 비교
+(위 "미해결" 참고) 및 박사님께 이 FPN ablation 결과 공유.

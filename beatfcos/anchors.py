@@ -6,12 +6,17 @@ import torch.nn as nn
 
 class Anchors(nn.Module):
     # def __init__(self, pyramid_levels=None, strides=None, sizes=None, ratios=None, scales=None):
-    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate): # We use base level 8
+    # pyramid_levels: 기본값 [0,1,2] (P1/P2/P3 전부 사용, 기존 동작과 동일).
+    # head_type="fcos_lite"(FPN lower layer=P1 제거 실험)처럼 레벨 개수/구성이
+    # 다를 때 [1,2] 등으로 명시적으로 넘겨서 맞출 수 있게 파라미터화함 - clusters
+    # 길이도 반드시 len(pyramid_levels)와 일치해야 함(self.sizes가 idx로 clusters를
+    # 인덱싱하므로).
+    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, pyramid_levels=None): # We use base level 8
         super(Anchors, self).__init__()
 
         #self.pyramid_levels = [8, 9, 10, 11, 12] # Actual strides we use are [2 ** 0, 2 ** 1, 2 ** 2, 2 ** 3, 2 ** 4]
         #self.pyramid_levels = [1, 2, 3, 4, 5]
-        self.pyramid_levels = [0, 1, 2]
+        self.pyramid_levels = pyramid_levels if pyramid_levels is not None else [0, 1, 2]
         
         # # (1, 2, 3, 4, 5) with base_level=0. Actual strides are [2 ** 1, 2 ** 2, 2 ** 3, 2 ** 4, 2 ** 5]
         self.strides = [2 ** x for x in self.pyramid_levels]

@@ -178,7 +178,7 @@ def compute_ap(recall, precision):
     ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
     return ap
 
-def get_results_from_model(audio, target, model, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None):
+def get_results_from_model(audio, target, model, iou_threshold=0.5, score_threshold=0.05, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None, downbeat_phase_reweight=False):
     #data = dataset[index]
     #scale = data['scale']
     #audio, target = data
@@ -196,7 +196,8 @@ def get_results_from_model(audio, target, model, iou_threshold=0.5, score_thresh
             score_threshold=score_threshold,
             max_thresh=max_thresh,
             downbeat_score_threshold=downbeat_score_threshold,
-            downbeat_sigma=downbeat_sigma
+            downbeat_sigma=downbeat_sigma,
+            downbeat_phase_reweight=downbeat_phase_reweight
         ) #MJ: The results of model() has been obtained by applying the nms process
 
     predicted_scores = predicted_scores.cpu()
@@ -399,7 +400,7 @@ def evaluate_beat_ap(
     return average_precisions
 
 def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_sample_rate,
-                            score_threshold=0.2, iou_threshold=0.5, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None):
+                            score_threshold=0.2, iou_threshold=0.5, max_thresh=1, downbeat_score_threshold=None, downbeat_sigma=None, downbeat_phase_reweight=False):
     model.eval()
     # beat와 downbeat은 confidence 분포가 달라서 최적 threshold도 다름(실측:
     # beat=0.2, downbeat=0.05가 최적). downbeat_score_threshold를 안 주면
@@ -419,7 +420,18 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
             # if we have metadata, it is only during evaluation where batch size is always 1
             metadata = metadata[0] #MJ: predicted_labels[] = all 0 = all downbeats?
         
-            predicted_scores, predicted_labels, predicted_boxes, losses = get_results_from_model(audio, target, model, score_threshold=score_threshold, iou_threshold=iou_threshold, max_thresh=max_thresh, downbeat_score_threshold=downbeat_score_threshold, downbeat_sigma=downbeat_sigma)
+            # CombinedLoss.forward()가 jth_classification_loss에 NaN이 뜨면 (특정
+            # 곡에서 모델 예측이 극단적으로 나빠질 때 발생 가능) 무조건 raise
+            # ValueError를 던져서, 이 곡 하나 때문에 eval 전체가 죽어버리는 문제가
+            # 있었음(harmonix 학습 중 실제로 발생, 프로세스 통째로 크래시). 학습
+            # 루프(train.py)는 이미 이런 NaN을 skip-and-continue로 처리하는데 eval
+            # 쪽엔 그 방어가 없었던 것 - 곡 하나를 스킵하고 나머지 val set은 계속
+            # 평가하도록 함.
+            try:
+                predicted_scores, predicted_labels, predicted_boxes, losses = get_results_from_model(audio, target, model, score_threshold=score_threshold, iou_threshold=iou_threshold, max_thresh=max_thresh, downbeat_score_threshold=downbeat_score_threshold, downbeat_sigma=downbeat_sigma, downbeat_phase_reweight=downbeat_phase_reweight)
+            except ValueError:
+                print(f"[eval] NaN loss로 스킵됨: index={index}, metadata={metadata}", flush=True)
+                continue
             #MJ: Note that the results predicted_scores, predicted_labels, predicted_boxes have been obtained by applying the nms process
 
             beat_pred_left_positions = []

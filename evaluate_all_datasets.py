@@ -34,9 +34,12 @@ from beatfcos.beat_eval import evaluate_beat_f_measure
 parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint', type=str, required=True)
 parser.add_argument('--score_threshold', type=float, default=0.20)
-parser.add_argument('--downbeat_score_threshold', type=float, default=0.05)
+parser.add_argument('--downbeat_score_threshold', type=float, default=0.20,
+                     help="train.py가 학습 중 자체 평가에 쓰는 값과 동일하게 0.20이 기본값 (beat/downbeat 동일 threshold). 다르게 주면 train.py 로그의 epoch별 점수와 비교가 안 맞음")
 parser.add_argument('--downbeat_sigma', type=float, default=None,
                      help="soft-NMS의 downbeat 전용 sigma (안 주면 기존처럼 beat/downbeat 둘 다 0.5 사용)")
+parser.add_argument('--downbeat_phase_reweight', action='store_true',
+                     help="phase head 예측을 이용해 downbeat 점수를 재조정 (재학습 불필요, model_module.py 주석 참고)")
 parser.add_argument('--validation_fold', type=int, default=0,
                      help="ballroom/beatles/hainsworth/rwc_popular의 8-fold CV held-out fold 번호 (체크포인트를 학습시킨 validation_fold와 일치해야 함)")
 # 체크포인트를 학습시킨 training_data_clusters와 반드시 일치해야 함 (anchor
@@ -46,6 +49,12 @@ parser.add_argument('--validation_fold', type=int, default=0,
 # (train.py의 training_data_clusters 줄 주석 참고).
 parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.24245649,1.93286828,2.78558922",
                      help="콤마로 구분된 클러스터 값. 체크포인트 학습에 쓴 값과 일치시킬 것")
+# nhead=2로 학습된 옛날 체크포인트(이 버그 발견 이전 전부)를 평가하려면
+# --nhead 2로 명시해야 함. 기본값은 train.py의 고쳐진 기본값과 맞춰 8.
+parser.add_argument('--nhead', type=int, default=8,
+                     help="체크포인트 학습에 쓴 nhead와 반드시 일치시킬 것 (DilatedTransformerLayer의 8-head 하드코딩 분할 때문에 다르면 Er 파라미터 shape mismatch/의미 불일치 발생)")
+parser.add_argument('--head_type', type=str, default="fcos", choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn'],
+                     help="체크포인트 학습에 쓴 head_type과 반드시 일치시킬 것 (pyramid_levels/Anchors/head 구조가 달라짐)")
 args = parser.parse_args()
 
 # (audio_dir, annot_dir, subset, validation_fold)
@@ -54,6 +63,11 @@ DATASETS = {
     "beatles": ("/disk1/taegum/mnt/labeled_data/beatles/data", "/disk1/taegum/mnt/labeled_data/beatles/label", "val", args.validation_fold),
     "hainsworth": ("/disk1/taegum/mnt/labeled_data/hains/data", "/disk1/taegum/mnt/labeled_data/hains/label", "val", args.validation_fold),
     "rwc_popular": ("/disk1/taegum/mnt/labeled_data/rwc_popular/data", "/disk1/taegum/mnt/labeled_data/rwc_popular/label", "val", args.validation_fold),
+    # carnatic/harmonix: 8-fold CV용 .folds 파일이 없어서 validation_fold 값과
+    # 무관하게 dataloader.py가 80/10/10 fallback split을 자동으로 씀 (train.py와
+    # 동일한 동작 - 학습 때 "val"로 뺐던 곡들과 정확히 같은 곡들이 여기서도 나옴).
+    "carnatic": ("/disk4/taegum/carnatic/data", "/disk4/taegum/carnatic/label", "val", args.validation_fold),
+    "harmonix": ("/disk4/taegum/harmonix_griffinlim/audio", "/disk4/taegum/harmonix_griffinlim/annotations_urinieto", "val", args.validation_fold),
     "gtzan": ("/disk1/taegum/mnt/labeled_data/gtzan/data", "/disk1/taegum/mnt/labeled_data/gtzan/label", "full-val", None),
     "smc": ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio", "/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Annotations", "full-val", None),
 }
@@ -66,8 +80,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 training_data_clusters = torch.tensor([float(x) for x in args.clusters.split(",")])
 model = model_module.create_beatfcos_model(
     num_classes=2, clusters=training_data_clusters, args=None,
-    head_type="fcos",
-    dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
+    head_type=args.head_type,
+    # dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,  # nhead=2는 dilated head가 죽는 버그 - args.nhead로 대체
+    dmodel=128, nhead=args.nhead, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
     downbeat_weight=0.6, audio_downsampling_factor=AUDIO_DOWNSAMPLING_FACTOR,
     centerness=False, postprocessing_type="soft_nms",
     audio_sample_rate=AUDIO_SAMPLE_RATE, backbone_type="wavebeat",
@@ -106,6 +121,7 @@ for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
         score_threshold=args.score_threshold,
         downbeat_score_threshold=args.downbeat_score_threshold,
         downbeat_sigma=args.downbeat_sigma,
+        downbeat_phase_reweight=args.downbeat_phase_reweight,
     )
     # mir_eval.beat.evaluate가 곡마다 돌려주는 dict에서 CMLt(Correct Metric
     # Level Total)/AMLt(Any Metric Level Total)를 뽑아서 곡 평균을 냄 -

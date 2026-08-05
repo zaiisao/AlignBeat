@@ -13,6 +13,13 @@ def clusters_to_interval_length_ranges(clusters: torch.Tensor):
     """
     assert clusters.ndim == 1 and torch.all(clusters[:-1] <= clusters[1:]), "Clusters must be a sorted 1D tensor"
 
+    # head_type="fcos_no_fpn"(FPN 없이 레벨 1개만 쓰는 ablation)처럼 클러스터가
+    # 1개뿐이면, 인접 클러스터 간 중점을 구하는 아래 로직 자체가 성립 안 함
+    # (경계가 최소 2개 있어야 구간을 나눌 수 있음). 레벨이 1개면 애초에 구간을
+    # 나눌 필요가 없으므로 전체 범위를 그대로 반환함.
+    if clusters.numel() == 1:
+        return [[-1.0, 1000.0]]
+
     sizes = []
 
     # Compute midpoints between adjacent clusters
@@ -33,9 +40,18 @@ def clusters_to_interval_length_ranges(clusters: torch.Tensor):
 
     return sizes
 
+# pyramid_levels: anchors_list의 i번째 원소가 실제로 어느 FPN 레벨인지
+# (stride = 2**level). 기본값 None이면 기존처럼 [0,1,...,len(anchors_list)-1]로
+# 간주함(레벨이 항상 0부터 연속이라고 가정하던 기존 동작과 동일). head_type=
+# "fcos_lite"처럼 P1(레벨0)을 빼서 anchors_list가 [레벨1,레벨2]가 되는 경우처럼
+# 레벨이 0부터 연속이 아닐 때는 반드시 명시적으로 넘겨야 함 - 안 그러면
+# enumerate 인덱스를 레벨로 착각해서 stride가 조용히 틀리게 계산됨.
 def get_fcos_positives(jth_annotations, anchors_list, interval_length_ranges,
                        audio_downsampling_factor, audio_sample_rate,
-                       centerness=False, beat_radius=2.5, downbeat_radius=4.5):
+                       centerness=False, beat_radius=2.5, downbeat_radius=4.5,
+                       pyramid_levels=None):
+    if pyramid_levels is None:
+        pyramid_levels = list(range(len(anchors_list)))
     audio_target_rate = audio_sample_rate / audio_downsampling_factor
 
     boolean_indices_to_bboxes_for_positive_anchors = torch.zeros(0, dtype=torch.bool).to(jth_annotations.device)
@@ -55,7 +71,7 @@ def get_fcos_positives(jth_annotations, anchors_list, interval_length_ranges,
         r_annotations_1xm = torch.unsqueeze(jth_annotations[:, 1], dim=0)   # shape = (1,M)
 
         # JA: New radius implementation
-        stride = 2**i
+        stride = 2 ** pyramid_levels[i]
         radius_per_class = (jth_annotations[:, 2] == 0) * downbeat_radius + (jth_annotations[:, 2] == 1) * beat_radius
 
         if centerness:
@@ -416,6 +432,56 @@ class AdjacencyConstraintLoss(nn.Module):
 
         return class_x2_and_x1_loss
 
+    def calculate_overlap_penalty_loss(
+        self,
+        transformed_target_regression_boxes,
+        transformed_pred_regression_boxes,
+        boolean_indices_for_positive_anchors_of_class,
+        loss_divisor
+    ):
+        # [무엇] calculate_x2_and_x1_loss는 target 상 x2==x1로 "정확히 인접해서
+        # 맞닿는" GT 인스턴스 쌍만 다루는데, 그 loss는 이미 거의 0으로 수렴해
+        # 있었음(학습 로그의 ADJ 컬럼 참고)에도 불구하고, soft-NMS를 거친 최종
+        # 출력에서는 여전히 downbeat 박스끼리 겹치는 문제가 관찰됨
+        # (final_boxes.png/visualize_final_boxes.py: 평균 consecutive IoU 0.101
+        # vs beat 0.015). [왜] soft-NMS가 최종적으로 고르는 anchor가, 이 loss가
+        # 맞춰놓은 "평균적으로 잘 맞는" anchor와 다를 수 있어서로 추정됨. 그래서
+        # target이 서로 다른 인접 GT 인스턴스이기만 하면(x2==x1로 정확히 안
+        # 맞아떨어져도) 예측 박스 자체의 겹침을 직접 계산해서 벌점을 준다 -
+        # 같은 GT 인스턴스에 배정된 여러 anchor끼리는 원래 겹치는 게 정상이므로
+        # (같은 박스를 예측하는 것), target box 기준으로 그룹을 나눠서 그 함정을
+        # 피한다.
+        target_boxes = transformed_target_regression_boxes[boolean_indices_for_positive_anchors_of_class]
+        pred_boxes = transformed_pred_regression_boxes[boolean_indices_for_positive_anchors_of_class]
+
+        if target_boxes.shape[0] < 2:
+            return torch.zeros(()).to(pred_boxes.device)
+
+        # 같은 GT 인스턴스(=target box가 동일)에 배정된 anchor들의 예측을 평균내서
+        # 인스턴스당 대표 예측 박스 하나로 축약한다.
+        unique_targets, inverse = torch.unique(target_boxes, dim=0, return_inverse=True)
+        num_instances = unique_targets.shape[0]
+
+        if num_instances < 2:
+            return torch.zeros(()).to(pred_boxes.device)
+
+        sums = torch.zeros(num_instances, 2).to(pred_boxes.device).index_add(0, inverse, pred_boxes)
+        counts = torch.zeros(num_instances).to(pred_boxes.device).index_add(
+            0, inverse, torch.ones_like(inverse, dtype=torch.float)
+        )
+        mean_pred_boxes = sums / counts.clamp(min=1).unsqueeze(1)
+
+        # 시간 순서대로 정렬한 뒤, 바로 인접한 쌍끼리만 겹침을 계산 (멀리 떨어진
+        # 인스턴스끼리는 애초에 안 겹치므로 볼 필요 없음).
+        order = torch.argsort(unique_targets[:, 0])
+        mean_pred_boxes_sorted = mean_pred_boxes[order]
+
+        preceding_right_edges = mean_pred_boxes_sorted[:-1, 1]
+        following_left_edges = mean_pred_boxes_sorted[1:, 0]
+        overlap_amount = torch.clamp(preceding_right_edges - following_left_edges, min=0) / torch.clamp(loss_divisor, min=1.0)
+
+        return overlap_amount.pow(2).mean()
+
     def forward(
         self,
         jth_classification_targets,
@@ -491,6 +557,26 @@ class AdjacencyConstraintLoss(nn.Module):
             beat_x2_and_x1_loss_divisor
         )
 
+        # [무엇] overlap penalty loss는 지금 당장 학습에 적용하지 않고 꺼둔다.
+        # [왜] 박사님이 요청한 "추가 데이터셋으로 재학습"은 phase target만 있는
+        # 지금 설정 기준으로 진행하기로 했음 (overlap penalty는 별개의 진행 중인
+        # 실험이라, 이 학습에 같이 섞이면 두 실험이 뒤섞여서 어느 쪽 효과인지
+        # 구분이 안 됨). calculate_overlap_penalty_loss 메소드 자체는 그대로 두고
+        # 호출부만 꺼서, 나중에 이 실험을 이어갈 때 아래 두 줄만 다시 살리면 됨.
+        # downbeat_overlap_penalty_loss = self.calculate_overlap_penalty_loss(
+        #     transformed_target_regression_boxes,
+        #     transformed_pred_regression_boxes,
+        #     boolean_indices_to_downbeats_for_positive_anchors,
+        #     downbeat_x2_and_x1_loss_divisor
+        # )
+        #
+        # beat_overlap_penalty_loss = self.calculate_overlap_penalty_loss(
+        #     transformed_target_regression_boxes,
+        #     transformed_pred_regression_boxes,
+        #     boolean_indices_to_beats_for_positive_anchors,
+        #     beat_x2_and_x1_loss_divisor
+        # )
+
         all_adjacency_constraint_losses = torch.stack((
             downbeat_and_beat_x1_loss,
             downbeat_x2_and_x1_loss,
@@ -520,7 +606,11 @@ class PhaseLoss(nn.Module):
         return ((pred - target) ** 2).sum(dim=1).mean()
 
 class CombinedLoss(nn.Module):
-    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, centerness=False, downbeat_weight=0.5, beat_radius=2.5, downbeat_radius=4.5, phase_weight=1.0):
+    # pyramid_levels: anchors_list의 각 원소가 실제로 어느 FPN 레벨인지(stride=
+    # 2**level). None이면 기존처럼 [0,1,...]로 간주(3-레벨 fcos 기본 경로와 동일
+    # 동작). head_type="fcos_lite"(P1 제거)처럼 레벨이 0부터 연속이 아닐 때는
+    # 반드시 명시적으로 넘겨야 stride가 안 틀어짐 - get_fcos_positives 주석 참고.
+    def __init__(self, clusters, audio_downsampling_factor, audio_sample_rate, centerness=False, downbeat_weight=0.5, beat_radius=2.5, downbeat_radius=4.5, phase_weight=1.0, pyramid_levels=None):
         super(CombinedLoss, self).__init__()
 
         self.classification_loss = FocalLoss(downbeat_weight=downbeat_weight)
@@ -533,6 +623,7 @@ class CombinedLoss(nn.Module):
         self.audio_downsampling_factor = audio_downsampling_factor
         self.audio_sample_rate = audio_sample_rate
         self.centerness = centerness
+        self.pyramid_levels = pyramid_levels
         # get_fcos_positives(beat_radius=, downbeat_radius=)로 그대로 전달됨
         # (파라미터 자체의 의미는 get_fcos_positives 정의부와 train.py의
         # --beat_radius/--downbeat_radius 주석 참고)
@@ -598,13 +689,15 @@ class CombinedLoss(nn.Module):
                 continue
 
             interval_length_ranges = clusters_to_interval_length_ranges(self.clusters)
+            pyramid_levels = self.pyramid_levels if self.pyramid_levels is not None else list(range(len(anchors_list)))
 
             positive_anchor_indices, assigned_annotations_for_anchors, normalized_annotations_for_anchors, \
             l_star_for_anchors, r_star_for_anchors, normalized_l_star_for_anchors, \
             normalized_r_star_for_anchors, levels_for_anchors = get_fcos_positives(
                 jth_annotations, anchors_list, interval_length_ranges,
                 self.audio_downsampling_factor, self.audio_sample_rate, self.centerness,
-                beat_radius=self.beat_radius, downbeat_radius=self.downbeat_radius
+                beat_radius=self.beat_radius, downbeat_radius=self.downbeat_radius,
+                pyramid_levels=pyramid_levels
             )
 
             all_anchor_points = torch.cat(anchors_list, dim=0)
@@ -641,7 +734,7 @@ class CombinedLoss(nn.Module):
 
             strides_for_all_anchors = torch.zeros(0).to(classifications.device)
             for i, anchors_per_level in enumerate(anchors_list):
-                stride_per_level = torch.tensor(2**i).to(strides_for_all_anchors.device)
+                stride_per_level = torch.tensor(2**pyramid_levels[i]).to(strides_for_all_anchors.device)
                 stride_for_anchors_per_level = stride_per_level[None].expand(anchors_per_level.size(dim=0))
                 strides_for_all_anchors = torch.cat((strides_for_all_anchors, stride_for_anchors_per_level), dim=0)
 

@@ -28,7 +28,8 @@ device = torch.device('cuda')
 clusters = torch.tensor([0.42574675, 0.66719675, 1.93286828])
 model = model_module.create_beatfcos_model(
     num_classes=2, clusters=clusters, args=None, head_type='fcos',
-    dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
+    # dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,  # nhead=2는 dilated head가 죽는 버그
+    dmodel=128, nhead=8, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
     downbeat_weight=0.6, audio_downsampling_factor=512, centerness=False,
     postprocessing_type='soft_nms', audio_sample_rate=22050, backbone_type='wavebeat',
 ).to(device)

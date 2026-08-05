@@ -20,6 +20,9 @@ parser.add_argument('--checkpoint', type=str, default="/disk1/taegum/mnt/BeatFCO
 # (evaluate_all_datasets.py의 --clusters 주석 참고)
 parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.24245649,1.93286828,2.78558922")
 parser.add_argument('--validation_fold', type=int, default=0)
+# 체크포인트 학습에 쓴 nhead와 반드시 일치시킬 것 (nhead=2는 DilatedTransformerLayer의
+# 8-head 하드코딩 분할과 안 맞아 dilated head가 죽는 버그 - train.py의 관련 주석 참고)
+parser.add_argument('--nhead', type=int, default=8)
 args = parser.parse_args()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -28,7 +31,8 @@ training_data_clusters = torch.tensor([float(x) for x in args.clusters.split(","
 model = model_module.create_beatfcos_model(
     num_classes=2, clusters=training_data_clusters, args=None,
     head_type="fcos",
-    dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
+    # dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,  # nhead=2는 dilated head가 죽는 버그
+    dmodel=128, nhead=args.nhead, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
     downbeat_weight=0.6, audio_downsampling_factor=512,
     centerness=False, postprocessing_type="soft_nms",
     audio_sample_rate=22050, backbone_type="wavebeat",

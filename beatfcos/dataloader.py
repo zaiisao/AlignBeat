@@ -124,7 +124,7 @@ class BeatDataset(torch.utils.data.Dataset):
         # if self.dataset in ["rwc_popular"]:
         #     file_ext = "*L+R.wav"
         # elif self.dataset in ["ballroom", "hainsworth", "gtzan", "smc", "beatles", "carnatic"]:
-        if self.dataset in ["ballroom", "hainsworth", "gtzan", "smc", "beatles", "carnatic", "rwc_popular"]:
+        if self.dataset in ["ballroom", "hainsworth", "gtzan", "smc", "beatles", "carnatic", "rwc_popular", "harmonix"]:
             file_ext = "*.wav"
         else:
             raise ValueError(f"Invalid dataset: {self.dataset}")
@@ -249,6 +249,8 @@ class BeatDataset(torch.utils.data.Dataset):
                 self.annot_files.append(annot_file)
             elif self.dataset == "carnatic":
                 self.annot_files.append(os.path.join(self.annot_dir, f"{filename}.beats"))
+            elif self.dataset == "harmonix":
+                self.annot_files.append(os.path.join(self.annot_dir, f"{filename}.txt"))
 
         self.data = [] # when preloading store audio data and metadata
         if self.preload:
@@ -462,6 +464,12 @@ class BeatDataset(torch.utils.data.Dataset):
             elif self.dataset == "carnatic":
                 line = line.strip('\n')
                 time_sec, beat = line.split(',')
+            elif self.dataset == "harmonix":
+                # 형식: "time\tbeat_number\tbar_number" (beat_number가 1일 때
+                # 마디 시작=downbeat, 다른 데이터셋과 동일 컨벤션). bar_number는
+                # 안 씀.
+                line = line.strip('\n')
+                time_sec, beat, _bar = line.split('\t')
 
             # convert beat to one-hot
             beat = int(beat)

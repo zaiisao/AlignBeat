@@ -24,11 +24,13 @@ class BeatTransformerEncoder(nn.Module):
       instr_attention처럼 이름으로 구분해야 할 서브모듈이 있었지만 non-demix에는 없어서 단순화.
       그 인덱스를 아래 tap-out 조건(i==2/5/8)에 그대로 재사용.
 
-    KNOWN ISSUE: nhead 기본값 2는 DilatedTransformerLayer.py의 8-head 하드코딩 분할
-    (k[:,0:4]/k[:,4:5]/k[:,5:6]/k[:,6:7]x2)과 맞지 않아, 4개의 skewed(dilated) head가
-    빈 텐서가 되어 symmetric head만 남는다 — 수정 필요 (nhead=8로 맞추거나 분할 로직 일반화).
+    FIXED ISSUE: nhead 기본값이 2였을 때 DilatedTransformerLayer.py의 8-head
+    하드코딩 분할(k[:,0:4]/k[:,4:5]/k[:,5:6]/k[:,6:7]x2)과 맞지 않아, 4개의
+    skewed(dilated) head가 빈 텐서가 되어 symmetric head만 남는 버그가 있었음.
+    기본값을 8로 고쳐서 dilated head가 실제로 동작하게 함 — 이 분할 로직을 쓰는 한
+    nhead는 반드시 8이어야 함(다른 값으로 호출하는 코드가 있다면 버그).
     """
-    def __init__(self, attn_len=5, dmodel=128, nhead=2, d_hid=512,
+    def __init__(self, attn_len=5, dmodel=128, nhead=8, d_hid=512,
                 nlayers=9, norm_first=True, dropout=0.1):
         
         super().__init__()
