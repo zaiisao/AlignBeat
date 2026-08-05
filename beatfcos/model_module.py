@@ -30,8 +30,14 @@ class PyramidFeatures(nn.Module):
     # >256 => 288 =>  320: C3=256, C=288, C5 = 320
 
     #def __init__(self, C3_size, C4_size, C5_size, feature_size=256):
-    def __init__(self, C1_size, C2_size, C3_size, feature_size=256):
+    def __init__(self, C1_size, C2_size, C3_size, feature_size=256, no_fusion=False):
         super(PyramidFeatures, self).__init__()
+        # no_fusion=True: FPN의 top-down cross-scale fusion(덧셈)을 끄고 각 레벨을
+        # 순수 단일 스케일 feature로만 씀 - head_type="fcos_no_fpn" ablation용
+        # (박사님 제안: "FPN을 아예 제거하고 head를 encoder에 직결"). P1만 있어도
+        # fusion이 켜져 있으면 P2/P3의 정보를 여전히 받으므로, "진짜 FPN 없음"을
+        # 검증하려면 이 덧셈 자체를 꺼야 함.
+        self.no_fusion = no_fusion
         # C3 (coarsest, T/4) → P3
         self.P3_1 = nn.Conv1d(C3_size, feature_size, kernel_size=1, stride=1, padding=0)
         self.P3_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
@@ -56,12 +62,14 @@ class PyramidFeatures(nn.Module):
         P3_x = self.P3_2(P3_x)
 
         P2_x = self.P2_1(C2)
-        P2_x = P3_upsampled_x + P2_x
+        if not self.no_fusion:
+            P2_x = P3_upsampled_x + P2_x
         P2_upsampled_x = self.P2_upsampled(P2_x)
         P2_x = self.P2_2(P2_x)
 
         P1_x = self.P1_1(C1)
-        P1_x = P2_upsampled_x + P1_x
+        if not self.no_fusion:
+            P1_x = P2_upsampled_x + P1_x
         P1_x = self.P1_2(P1_x)
 
         return [P1_x, P2_x, P3_x]
@@ -162,6 +170,65 @@ class ClassificationModel(nn.Module):
 
         return out2.contiguous().view(x.shape[0], -1, self.num_classes)
 
+# head_type="fcos_lite" 전용: classification과 regression을 하나의 head로 통합
+# (안재훈 박사님 제안 FPN ablation 중 하나 - P1 제거와 함께 적용). RegressionModel과
+# 동일한 conv tower를 공유하고, ClassificationModel의 output/output_act에 해당하는
+# class_output/class_output_act 브랜치만 추가로 붙임.
+class MergedRegressionModel(nn.Module):
+    def __init__(self, num_features_in, num_classes=2, feature_size=256):
+        super(MergedRegressionModel, self).__init__()
+
+        self.conv1 = nn.Conv1d(num_features_in, feature_size, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(32, feature_size)
+        self.act1 = nn.ReLU()
+
+        self.conv2 = nn.Conv1d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(32, feature_size)
+        self.act2 = nn.ReLU()
+
+        self.regression = nn.Conv1d(feature_size, 2, kernel_size=3, padding=1)
+        self.leftness = nn.Conv1d(feature_size, 1, kernel_size=3, padding=1)
+        self.leftness_act = nn.Sigmoid()
+
+        self.phase = nn.Conv1d(feature_size, 2, kernel_size=3, padding=1)
+        self.phase_act = nn.Tanh()
+
+        self.class_output = nn.Conv1d(feature_size, num_classes, kernel_size=3, padding=1)
+        self.class_output_act = nn.Sigmoid()
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act1(out)
+
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.act2(out)
+
+        regression = self.regression(out)
+        regression = regression.permute(0, 2, 1)
+        regression = regression.contiguous().view(regression.shape[0], -1, 2)
+
+        leftness = self.leftness(out)
+        leftness = self.leftness_act(leftness)
+        leftness = leftness.permute(0, 2, 1)
+        leftness = leftness.contiguous().view(leftness.shape[0], -1, 1)
+
+        phase = self.phase(out)
+        phase = self.phase_act(phase)
+        phase = phase.permute(0, 2, 1)
+        phase = phase.contiguous().view(phase.shape[0], -1, 2)
+
+        classification = self.class_output(out)
+        classification = self.class_output_act(classification)
+        classification = classification.permute(0, 2, 1)
+        batch_size, length, channels = classification.shape
+        classification = classification.view(batch_size, length, 1, self.num_classes)
+        classification = classification.contiguous().view(x.shape[0], -1, self.num_classes)
+
+        return classification, regression, leftness, phase
+
 #MJ: https://pseudo-lab.github.io/pytorch-guide/docs/ch03-1.html
 class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not defined in our code using tcn
     def __init__(
@@ -211,7 +278,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
         )
 
-        self.fpn = PyramidFeatures(dmodel, dmodel, dmodel)
+        self.fpn = PyramidFeatures(dmodel, dmodel, dmodel, no_fusion=(head_type == "fcos_no_fpn"))
 
         if self.head_type == "hungarian":
             # [무엇] Soft-NMS 후처리를 없애기 위해 추가한 축소판 RT-DETR 경로.
@@ -227,6 +294,28 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 num_queries=num_queries, decoder_layers=decoder_layers
             )
             self.set_criterion = SetCriterion(num_classes, OrderedMatcher())
+        elif self.head_type == "fcos_lite":
+            # P1(레벨 0) 제거 + classification/regression head 통합 (안재훈 박사님
+            # 제안 FPN ablation 중 하나). FPN fusion 자체는 그대로 두고(no_fusion=False),
+            # P2/P3(레벨 [1,2])만 써서 anchor/loss도 그 두 레벨 기준으로 재구성함.
+            self.regressionModel = MergedRegressionModel(256, num_classes=num_classes)
+
+            self.anchors = Anchors(clusters, audio_downsampling_factor, audio_sample_rate, pyramid_levels=[1, 2])
+            self.anchor_point_transform = AnchorPointTransform()
+            self.clipBoxes = ClipBoxes()
+            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness, downbeat_weight=downbeat_weight, beat_radius=beat_radius, downbeat_radius=downbeat_radius, phase_weight=phase_weight, pyramid_levels=[1, 2])
+        elif self.head_type == "fcos_no_fpn":
+            # FPN의 cross-scale fusion 자체를 끄고(PyramidFeatures(no_fusion=True))
+            # P1(레벨 0) 단일 스케일만 사용 - 안재훈 박사님이 제안한 "FPN을 아예
+            # 제거하고 head를 encoder 마지막 레이어에 직결" 버전. head 구조는 표준
+            # 분리형(ClassificationModel/RegressionModel) 그대로 유지.
+            self.classificationModel = ClassificationModel(256, num_classes=num_classes)
+            self.regressionModel = RegressionModel(256)
+
+            self.anchors = Anchors(clusters, audio_downsampling_factor, audio_sample_rate, pyramid_levels=[0])
+            self.anchor_point_transform = AnchorPointTransform()
+            self.clipBoxes = ClipBoxes()
+            self.combined_loss = CombinedLoss(clusters, audio_downsampling_factor, audio_sample_rate, centerness=centerness, downbeat_weight=downbeat_weight, beat_radius=beat_radius, downbeat_radius=downbeat_radius, phase_weight=phase_weight, pyramid_levels=[0])
         else:
             self.classificationModel = ClassificationModel(256, num_classes=num_classes)
             self.regressionModel = RegressionModel(256)
@@ -258,7 +347,23 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 m.bias.data.zero_()
         # End of for m in self.modules()
 
-        if self.head_type != "hungarian":
+        if self.head_type == "fcos_lite":
+            # fcos_lite는 classification이 self.regressionModel.class_output으로
+            # 통합돼서 classificationModel 자체가 없음.
+            prior = 0.01
+
+            self.regressionModel.class_output.weight.data.fill_(0)
+            self.regressionModel.class_output.bias.data.fill_(-math.log((1.0 - prior) / prior))
+
+            self.regressionModel.regression.weight.data.fill_(0)
+            self.regressionModel.regression.bias.data.fill_(0)
+
+            self.regressionModel.leftness.weight.data.fill_(0)
+            self.regressionModel.leftness.bias.data.fill_(0)
+
+            self.regressionModel.phase.weight.data.fill_(0)
+            self.regressionModel.phase.bias.data.fill_(0)
+        elif self.head_type != "hungarian":
             # The reinitialization of the final layer of the classification head
             prior = 0.01
 
@@ -374,21 +479,55 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         if self.head_type == "hungarian":
             return self._forward_hungarian(feature_maps, base_level_image_shape, audio_batch, inputs)
 
-        classification_outputs = torch.cat([self.classificationModel(feature_map) for feature_map in feature_maps], dim=1)
-        regression_outputs = []
-        leftness_outputs = []
-        phase_outputs = []
+        if self.head_type == "fcos_lite":
+            # P1 제거: P2/P3(레벨 [1,2])만 사용, classification+regression 통합 head
+            feature_maps = feature_maps[1:]
+            classification_outputs = []
+            regression_outputs = []
+            leftness_outputs = []
+            phase_outputs = []
+            for feature_map in feature_maps:
+                cls_output, bbx_regression_output, leftness_regression_output, phase_output = self.regressionModel(feature_map)
+                classification_outputs.append(cls_output)
+                regression_outputs.append(bbx_regression_output)
+                leftness_outputs.append(leftness_regression_output)
+                phase_outputs.append(phase_output)
+            classification_outputs = torch.cat(classification_outputs, dim=1)
+            regression_outputs = torch.cat(regression_outputs, dim=1)
+            leftness_outputs = torch.cat(leftness_outputs, dim=1)
+            phase_outputs = torch.cat(phase_outputs, dim=1)
+        elif self.head_type == "fcos_no_fpn":
+            # FPN fusion이 이미 self.fpn.no_fusion=True로 꺼져있으므로, P1(레벨 0)
+            # 단일 스케일만 사용. head는 표준 분리 구조.
+            feature_maps = feature_maps[:1]
+            classification_outputs = torch.cat([self.classificationModel(feature_map) for feature_map in feature_maps], dim=1)
+            regression_outputs = []
+            leftness_outputs = []
+            phase_outputs = []
+            for feature_map in feature_maps:
+                bbx_regression_output, leftness_regression_output, phase_output = self.regressionModel(feature_map)
+                regression_outputs.append(bbx_regression_output)
+                leftness_outputs.append(leftness_regression_output)
+                phase_outputs.append(phase_output)
+            regression_outputs = torch.cat(regression_outputs, dim=1)
+            leftness_outputs = torch.cat(leftness_outputs, dim=1)
+            phase_outputs = torch.cat(phase_outputs, dim=1)
+        else:
+            classification_outputs = torch.cat([self.classificationModel(feature_map) for feature_map in feature_maps], dim=1)
+            regression_outputs = []
+            leftness_outputs = []
+            phase_outputs = []
 
-        for feature_map in feature_maps:
-            bbx_regression_output, leftness_regression_output, phase_output = self.regressionModel(feature_map)
+            for feature_map in feature_maps:
+                bbx_regression_output, leftness_regression_output, phase_output = self.regressionModel(feature_map)
 
-            regression_outputs.append(bbx_regression_output)
-            leftness_outputs.append(leftness_regression_output)
-            phase_outputs.append(phase_output)
+                regression_outputs.append(bbx_regression_output)
+                leftness_outputs.append(leftness_regression_output)
+                phase_outputs.append(phase_output)
 
-        regression_outputs = torch.cat(regression_outputs, dim=1)
-        leftness_outputs = torch.cat(leftness_outputs, dim=1)
-        phase_outputs = torch.cat(phase_outputs, dim=1)
+            regression_outputs = torch.cat(regression_outputs, dim=1)
+            leftness_outputs = torch.cat(leftness_outputs, dim=1)
+            phase_outputs = torch.cat(phase_outputs, dim=1)
 
         anchors_list = self.anchors(base_level_image_shape)
 
@@ -433,7 +572,10 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 strides_for_all_anchors = strides_for_all_anchors.cuda()
 
             for i, anchors_per_level in enumerate(anchors_list):    # i ranges over the level of feature maps.
-                stride_per_level = torch.tensor(2**i).to(strides_for_all_anchors.device) #stride_per_level =2**1, 2**2, 2**3, 2**4,2**5
+                # 2**i는 pyramid_levels가 항상 [0,1,2] 연속일 때만 맞음 - fcos_lite([1,2]),
+                # fcos_no_fpn([0])처럼 레벨이 빠지면 실제 stride와 어긋나므로
+                # self.anchors.pyramid_levels[i]로 실제 레벨을 참조함.
+                stride_per_level = torch.tensor(2**self.anchors.pyramid_levels[i]).to(strides_for_all_anchors.device) #stride_per_level =2**1, 2**2, 2**3, 2**4,2**5
                 stride_per_level_for_anchors = stride_per_level[None].expand(anchors_per_level.size(dim=0)) #MJ:anchors_per_level.size(dim=0)=188
                 strides_for_all_anchors = torch.cat((strides_for_all_anchors, stride_per_level_for_anchors), dim=0)
 
