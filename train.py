@@ -15,7 +15,7 @@ from os.path import join as ospj
 from kmeans_pytorch import kmeans, kmeans_predict
 
 from beatfcos import model_module
-from beatfcos.dataloader import BeatDataset, collater
+from beatfcos.dataloader import BeatDataset, collater, BEAT_ONLY_DATASETS
 from beatfcos.beat_eval import evaluate_beat_f_measure, evaluate_beat_f_measure_subset
 
 class Logger(object):
@@ -440,11 +440,20 @@ def evaluate_macro_joint_f_measure(model, label):
             ds_beat_f, ds_downbeat_f, _ = evaluate_beat_f_measure(
                 loader, model, args.audio_downsampling_factor, args.audio_sample_rate, score_threshold=0.20)
         per_dataset_beat_f.append(ds_beat_f)
-        per_dataset_downbeat_f.append(ds_downbeat_f)
-        print(f"{label} | [{name}] Beat: {ds_beat_f:0.3f} | Downbeat: {ds_downbeat_f:0.3f}")
+        # [beat-only 데이터셋은 downbeat macro에서 제외] SMC에는 downbeat ground
+        # truth가 아예 없어서 downbeat F가 구조적으로 항상 0이다. 이걸 평균에 넣으면
+        # "측정 불가능한 값"이 macro를 1/N만큼 상수로 끌어내리고, 그 macro가 바로
+        # 체크포인트 저장 기준과 ReduceLROnPlateau의 입력이라 모델 성능과 무관한
+        # 상수 페널티로 학습 스케줄이 결정된다(실측 epoch 2: downbeat macro가
+        # 0.417 -> 0.348). beat F는 SMC에서도 의미가 있으므로 그대로 포함한다.
+        if name in BEAT_ONLY_DATASETS:
+            print(f"{label} | [{name}] Beat: {ds_beat_f:0.3f} | Downbeat: n/a (beat-only)")
+        else:
+            per_dataset_downbeat_f.append(ds_downbeat_f)
+            print(f"{label} | [{name}] Beat: {ds_beat_f:0.3f} | Downbeat: {ds_downbeat_f:0.3f}")
 
     beat_mean_f_measure = float(np.mean(per_dataset_beat_f))
-    downbeat_mean_f_measure = float(np.mean(per_dataset_downbeat_f))
+    downbeat_mean_f_measure = float(np.mean(per_dataset_downbeat_f)) if per_dataset_downbeat_f else 0.0
     joint_f_measure = (beat_mean_f_measure + downbeat_mean_f_measure) / 2
     print(f"{label} | Beat score: {beat_mean_f_measure:0.3f} | Downbeat score: {downbeat_mean_f_measure:0.3f} | Joint score: {joint_f_measure:0.3f}")
     return beat_mean_f_measure, downbeat_mean_f_measure, joint_f_measure
