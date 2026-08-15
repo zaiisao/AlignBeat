@@ -822,3 +822,125 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
         # beat_mean_f_measure = left_beat_mean_f_measure#average_beat_mean_f_measure
         # downbeat_mean_f_measure = left_downbeat_mean_f_measure#average_downbeat_mean_f_measure
         return beat_mean_f_measure, downbeat_mean_f_measure, results#dbn_beat_mean_f_measure, dbn_downbeat_mean_f_measure
+
+
+def evaluate_beat_f_measure_subset(dataloader, model, audio_downsampling_factor, audio_sample_rate,
+                                   window_frames=1280, border_frames=8,
+                                   threshold_beat=0.2, threshold_downbeat=0.2,
+                                   label=""):
+    """평가 경로: order-constrained subset selection head (beat_dp_matching-1.pdf).
+
+    FCOS 경로(evaluate_beat_f_measure)와 반환 형식/GT 추출/mir_eval 호출을 똑같이
+    맞춰서 fcos_lite 등과 숫자를 직접 비교할 수 있게 함. 다른 점은 두 가지뿐:
+
+    1) 모델이 고정 길이 window만 받으므로 곡을 window_frames짜리 조각으로 타일링해서
+       디코딩하고 Algorithm 4로 이어붙임 (beatfcos/stitching.py). Soft-NMS 없음 -
+       eq. (1)이 교차를 구조적으로 금지하므로 중복 제거가 필요 없다.
+
+    2) [중요] 이 헤드의 클래스는 {DB, B, none} 배타적(exclusive)이지만, GT와 mir_eval
+       쪽 "beat" 정의는 downbeat을 포함함 (dataloader의 target 채널 0에 downbeat도
+       전부 1로 찍히고, make_intervals가 그걸로 beat interval을 만듦). 따라서
+       predicted beat 목록에는 DB로 분류된 후보도 반드시 합쳐 넣어야 한다. 이걸
+       빠뜨리면 모든 downbeat이 beat miss로 잡혀서 Beat F가 구조적으로 ~1/L만큼
+       깎인다 (4/4면 약 25%).
+    """
+    from beatfcos.stitching import stitch_piece
+    from beatfcos.subset_head import BEAT, DOWNBEAT
+
+    model.eval()
+    inner = getattr(model, 'module', model)
+    to_seconds = audio_downsampling_factor / audio_sample_rate
+
+    results = []
+    with torch.no_grad():
+        for index, data in enumerate(dataloader):
+            audio, target, metadata = data
+            metadata = metadata[0]
+
+            mel = audio[0]  # (T, n_mels) - eval은 batch_size 1 가정 (FCOS 경로와 동일)
+            if torch.cuda.is_available():
+                mel = mel.cuda()
+
+            def forward_fn(fragment):
+                # DataParallel wrapper를 그대로 쓰면 batch 1짜리 조각이 GPU 하나로만
+                # 가므로 굳이 우회하지 않아도 되지만, inner를 쓰면 forward의
+                # len(inputs)==2 관례(배치 크기 2인 텐서를 (audio, target)으로
+                # 오인하는 기존 함정)와 무관하게 항상 안전함.
+                return inner(fragment)
+
+            classes, frames, _scores = stitch_piece(
+                mel, forward_fn, window_frames, border_frames,
+                threshold_beat=threshold_beat, threshold_downbeat=threshold_downbeat)
+
+            classes = classes.cpu()
+            frames = frames.cpu()
+
+            # (2) 위 주석 참고: beat 예측 = B로 분류된 것 + DB로 분류된 것
+            beat_pred_positions = np.sort(frames[(classes == BEAT) | (classes == DOWNBEAT)].numpy() * to_seconds)
+            downbeat_pred_positions = np.sort(frames[classes == DOWNBEAT].numpy() * to_seconds)
+
+            # --- GT: FCOS 경로와 완전히 동일한 방식으로 (M,3) interval에서 복원 ---
+            beat_target_positions, downbeat_target_positions = [], []
+            last_target_beat_index, last_target_downbeat_index = None, None
+            for beat_interval in target[0]:
+                interval_label = int(beat_interval[2])
+                if interval_label < 0:
+                    continue  # collater의 -1 패딩
+                left_position_index = int(beat_interval[0])
+                right_position_index = int(beat_interval[1])
+                if interval_label == 0:
+                    downbeat_target_positions.append(left_position_index * to_seconds)
+                    if last_target_downbeat_index is None or right_position_index > last_target_downbeat_index:
+                        last_target_downbeat_index = right_position_index
+                elif interval_label == 2:
+                    # beat-only 데이터셋(SMC): class_id 2는 "beat인 건 확실하나 B/DB
+                    # 구분은 라벨이 없음"을 뜻함(dataloader.CLASS_BEAT_ONLY). beat GT로는
+                    # 그대로 세고, downbeat GT는 존재하지 않으므로 비워 둔다.
+                    # 이 분기가 없으면 class 2가 어느 쪽에도 안 걸려서 SMC의 GT가
+                    # beat/downbeat 모두 빈 리스트가 되고, mir_eval이 전부 0을 돌려줘서
+                    # macro-average(=체크포인트 저장과 LR 스케줄러의 기준)를 조용히
+                    # 끌어내린다 (실측: v3 epoch 0의 Beat 0.563 -> 0.432).
+                    beat_target_positions.append(left_position_index * to_seconds)
+                    if last_target_beat_index is None or right_position_index > last_target_beat_index:
+                        last_target_beat_index = right_position_index
+                elif interval_label == 1:
+                    beat_target_positions.append(left_position_index * to_seconds)
+                    if last_target_beat_index is None or right_position_index > last_target_beat_index:
+                        last_target_beat_index = right_position_index
+
+            if last_target_beat_index is not None:
+                beat_target_positions.append(last_target_beat_index * to_seconds)
+            if last_target_downbeat_index is not None:
+                downbeat_target_positions.append(last_target_downbeat_index * to_seconds)
+
+            beat_target_positions = np.sort(np.array(beat_target_positions))
+            downbeat_target_positions = np.sort(np.array(downbeat_target_positions))
+
+            beat_scores = mir_eval.beat.evaluate(
+                mir_eval.beat.trim_beats(beat_target_positions),
+                mir_eval.beat.trim_beats(beat_pred_positions))
+            downbeat_scores = mir_eval.beat.evaluate(
+                mir_eval.beat.trim_beats(downbeat_target_positions),
+                mir_eval.beat.trim_beats(downbeat_pred_positions))
+
+            print(f"{index}/{len(dataloader)} {metadata['Filename']}")
+            print(f"BEAT (F-measure): {beat_scores['F-measure']:0.3f} | "
+                  f"DOWNBEAT (F-measure): {downbeat_scores['F-measure']:0.3f} | "
+                  f"pred B/DB: {len(beat_pred_positions)}/{len(downbeat_pred_positions)} | "
+                  f"gt B/DB: {len(beat_target_positions)}/{len(downbeat_target_positions)}")
+
+            results.append({
+                'image_id': metadata["Filename"],
+                'beat_scores': beat_scores,
+                'downbeat_scores': downbeat_scores,
+                # FCOS 경로의 results 스키마와 키를 맞춰둠(평가 스크립트 호환).
+                # subset head에는 leftness/adjacency 개념이 없어 0.
+                'cls_loss': 0.0, 'reg_loss': 0.0, 'lft_loss': 0.0, 'adj_loss': 0.0,
+            })
+
+    beat_mean_f_measure = float(np.mean([r['beat_scores']['F-measure'] for r in results])) if results else 0.0
+    downbeat_mean_f_measure = float(np.mean([r['downbeat_scores']['F-measure'] for r in results])) if results else 0.0
+    print(f"{label}Average beat F-measure: {beat_mean_f_measure:0.3f}")
+    print(f"{label}Average downbeat F-measure: {downbeat_mean_f_measure:0.3f}\n")
+
+    return beat_mean_f_measure, downbeat_mean_f_measure, results

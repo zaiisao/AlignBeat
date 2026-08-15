@@ -16,7 +16,7 @@ from kmeans_pytorch import kmeans, kmeans_predict
 
 from beatfcos import model_module
 from beatfcos.dataloader import BeatDataset, collater
-from beatfcos.beat_eval import evaluate_beat_f_measure
+from beatfcos.beat_eval import evaluate_beat_f_measure, evaluate_beat_f_measure_subset
 
 class Logger(object):
     """Log stdout messages."""
@@ -61,13 +61,22 @@ parser.add_argument('--carnatic_audio_dir', type=str, default=None)
 parser.add_argument('--carnatic_annot_dir', type=str, default=None)
 parser.add_argument('--harmonix_audio_dir', type=str, default=None)
 parser.add_argument('--harmonix_annot_dir', type=str, default=None)
+# SMC: downbeat 라벨이 없는 beat-only 데이터셋. Beat Transformer가 학습에 쓰는
+# 7개 중 하나라 pool을 맞추려면 필요함. dataloader가 beat interval만 class_id=2로
+# 내보내고(make_intervals), FCOS 쪽은 losses.py가 downbeat 채널을 -1 sentinel로
+# 마스킹, subset head는 논문 7.1절(eq. 9 marginal / eq. 10-11 EM)로 처리한다.
+parser.add_argument('--smc_audio_dir', type=str, default=None)
+parser.add_argument('--smc_annot_dir', type=str, default=None)
 parser.add_argument('--preload', default=False, action="store_true")
 parser.add_argument('--audio_sample_rate', type=int, default=22050)
 parser.add_argument('--audio_downsampling_factor', type=int, default=512)  # 128 → 512 (hop_length)
 parser.add_argument('--shuffle', type=bool, default=True)
 parser.add_argument('--train_subset', type=str, default='train')
 parser.add_argument('--val_subset', type=str, default='val')
-parser.add_argument('--train_length', type=int, default=2097152)
+# default=None: head_type에 따라 아래에서 결정됨 (명시하면 그 값이 항상 우선).
+# fcos 계열은 기존과 동일하게 2097152샘플(=4096 mel frame, 95.1초)을 그대로 쓰고,
+# subset head는 논문 규약대로 D=29.72초(=1280 frame = num_candidates*8)를 씀.
+parser.add_argument('--train_length', type=int, default=None)
 parser.add_argument('--train_fraction', type=float, default=1.0)
 parser.add_argument('--eval_length', type=int, default=2097152)
 parser.add_argument('--batch_size', type=int, default=32)
@@ -75,7 +84,12 @@ parser.add_argument('--num_workers', type=int, default=0)
 parser.add_argument('--augment', default=True, action='store_true')
 parser.add_argument('--dry_run', action='store_true')
 parser.add_argument('--epochs', help='Number of epochs', type=int, default=100)
-parser.add_argument('--lr', type=float, default=1e-3)
+# default=None: head별로 아래에서 결정 (명시하면 그 값이 우선). fcos 계열은 기존과
+# 동일하게 1e-3. subset head는 3e-4 - lambda_L1 = 1/b가 200이라 시간 항의 gradient가
+# 크고(실측 grad norm 중앙값 50~160, 최대 7.7e4), 1e-3에서는 단일 fragment
+# overfit조차 발산했음(loss 2.77 -> 2093). 3e-4/1e-4에서는 63/63 이벤트를 ±70ms
+# 안에 맞추며 정상 수렴.
+parser.add_argument('--lr', type=float, default=None)
 parser.add_argument('--patience', type=int, default=3)
 parser.add_argument('--ninputs', type=int, default=1)
 parser.add_argument('--noutputs', type=int, default=2)
@@ -131,9 +145,43 @@ parser.add_argument('--dropout', type=float, default=0.1)
 # Soft-NMS 후처리를 없앤 축소판 RT-DETR 헤드(순서 보존 매칭 기반, 자세한 내용은
 # beatfcos/hungarian_head.py 참고)를 쓰려면 --head_type hungarian으로 지정.
 # 기본값 'fcos'는 기존 anchor+Soft-NMS 파이프라인을 그대로 유지함(비교용).
-parser.add_argument('--head_type', type=str, default='fcos', choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn'])
+parser.add_argument('--head_type', type=str, default='fcos', choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn', 'subset'])
 parser.add_argument('--num_queries', type=int, default=300)
 parser.add_argument('--decoder_layers', type=int, default=3)
+
+# --- order-constrained subset selection head (--head_type subset) ---------------
+# 논문: beat_dp_matching-1.pdf. 구현은 beatfcos/subset_head.py 참고.
+# num_candidates: 논문 eq. N = BPM_max * D_min. 논문 기본값(BPM_max=200 -> N=100)은
+# 이 데이터에 대해 실측상 부족함 - 8개 데이터셋 전체 annotation을 30초 창으로 훑어본
+# 결과 최대 밀도가 150 events/30s(gtzan jazz ~300BPM)였고, 학습셋도 carnatic 147 /
+# harmonix 135 / ballroom 107로 100을 넘는 파일이 124개 있었다. M > N이면 DP가
+# 애초에 불가능(D[M,N]=inf)하고 추론 시에도 recall이 구조적으로 막히므로 여유를 둠.
+parser.add_argument('--num_candidates', type=int, default=160)
+# b_scale: eq. (2) Laplace 관측 모형의 scale. lambda_L1 = 1/b이고, 이건 자유 가중치가
+# 아니라 시간 관측 노이즈의 정밀도임. 시간이 window 전체 기준 (0,1)로 정규화돼 있어서
+# ±70ms 허용오차가 정규화 단위로는 70ms/29.72s ~ 0.0024밖에 안 됨 - b를 그 근처로
+# 잡으면 lambda_L1이 수백이 되어 DP 선택이 사실상 "시간상 최근접"이 되어버린다.
+# 학습 로그의 [subset] 진단 줄(one-slot time cost vs class spread)을 보고 조정할 것.
+parser.add_argument('--b_scale', type=float, default=0.005)
+# learn_b: eq. (5) closed-form MLE(매칭된 쌍의 평균 절대 잔차)로 b를 EMA 갱신.
+# 기본값 off - 먼저 고정 b로 학습이 안정적인지 확인한 뒤 켜는 것을 권장.
+# [주의/실측] 멀티 GPU DataParallel에서는 replica의 buffer 갱신이 버려지기 때문에
+# GPU 0의 half-batch 잔차만 EMA에 반영됨(재현 확인됨). 단일 GPU(--gpu N 하나)에서는
+# 정상 동작. learn_b를 켤 거면 단일 GPU로 돌릴 것.
+parser.add_argument('--learn_b', action='store_true', default=False)
+# gamma: eq. (8)에서 background(미매칭 후보) 항의 가중치. N=160 후보 중 실제 이벤트가
+# 보통 60~70개라 나머지 ~100개가 전부 background 신호를 냄.
+parser.add_argument('--gamma', type=float, default=0.5)
+# omega_db: eq. (8)의 클래스별 가중치. downbeat은 beat보다 약 1/L배로 드물어서
+# (section 9.3) 매칭된 downbeat 분류 오차를 더 세게 반영함. omega_beat = 1.0 고정.
+parser.add_argument('--omega_db', type=float, default=2.0)
+# tau: Algorithm 3의 신뢰도 threshold. 학습 후 val에서 sweep하는 값이고, beat와
+# downbeat의 confidence 분포가 달라 따로 둘 수 있게 함(FCOS 경로에서도 그랬음).
+parser.add_argument('--tau_beat', type=float, default=0.2)
+parser.add_argument('--tau_downbeat', type=float, default=0.2)
+# stitch_beta_frames: Algorithm 4의 border beta(frame 단위). 논문은 값을 정해주지
+# 않고 후보 간격 D/N 정도를 출발점으로 제안함 - D/N = 8 frame(0.186초).
+parser.add_argument('--stitch_beta_frames', type=int, default=8)
 
 # 8-fold CV처럼 여러 run을 병렬/순차로 돌릴 때 서로 log.log나 checkpoints/를
 # 안 덮어쓰게 fold(run)마다 분리할 수 있는 옵션. 기본값은 기존 동작과 동일.
@@ -161,6 +209,34 @@ temp_args, _ = parser.parse_known_args()
 # parse them args
 args = parser.parse_args()
 
+# --train_length를 명시 안 했을 때의 head별 기본값 결정.
+# subset head는 FPN 레벨 길이가 각각 num_candidates * (8, 4, 2)로 정확히 나누어
+# 떨어져야 함 - stride conv는 나머지를 조용히 버리기 때문에(길이 1281도 후보 160개를
+# 멀쩡히 내놓으면서 마지막 frame만 잃음) subset_head가 입력 길이를 직접 검증한다.
+# 또 홀수 길이는 FPN top-down upsample에서 크기 불일치로 아예 죽는다(1281 -> C3 321을
+# 2배 업샘플하면 642 vs C2 641). 그래서 여기서 정확히 맞춰준다.
+SUBSET_FRAMES_PER_CANDIDATE = 8  # P1(가장 fine한 레벨)의 stride
+if args.lr is None:
+    args.lr = 3e-4 if args.head_type == 'subset' else 1e-3
+if args.train_length is None:
+    if args.head_type == 'subset':
+        args.train_length = args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE * args.audio_downsampling_factor
+    else:
+        args.train_length = 2097152
+if args.head_type == 'subset':
+    _frames = args.train_length // args.audio_downsampling_factor
+    if _frames != args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE:
+        raise SystemExit(
+            f"[subset] train_length {args.train_length} gives {_frames} mel frames, but "
+            f"num_candidates {args.num_candidates} * {SUBSET_FRAMES_PER_CANDIDATE} = "
+            f"{args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE} are required. "
+            f"Use --train_length {args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE * args.audio_downsampling_factor}.")
+    print(f"[subset] window = {_frames} mel frames "
+          f"({args.train_length / args.audio_sample_rate:.2f}s at "
+          f"{args.audio_sample_rate / args.audio_downsampling_factor:.2f} fps), "
+          f"N = {args.num_candidates} candidates, spacing "
+          f"{args.train_length / args.audio_sample_rate / args.num_candidates * 1000:.0f}ms")
+
 # resume 여부에 따라 로그 파일을 이어쓸지("a") 새로 쓸지("w") 미리 결정. 원래는
 # 무조건 "w"라서, 크래시 후 재시작할 때마다 그동안의 로그(0~56 에폭 등)가
 # 통째로 날아가서 매번 수동으로 백업해야 했음.
@@ -173,7 +249,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 # 없어서, dataloader.py의 fallback 로직(파일 없으면 80/10/10 split)이 자동으로
 # 적용됨 - validation_fold를 줘도 이 두 데이터셋만은 8-fold CV가 아니라
 # 80/10/10으로 나뉘는 점 유의.
-datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles", "carnatic", "harmonix"]
+datasets = ["ballroom", "hainsworth", "rwc_popular", "beatles", "carnatic", "harmonix", "smc"]
 
 # set the seed
 seed = 42
@@ -236,6 +312,9 @@ for dataset in datasets:
         elif dataset == "harmonix":
             audio_dir = args.harmonix_audio_dir
             annot_dir = args.harmonix_annot_dir
+        elif dataset == "smc":
+            audio_dir = args.smc_audio_dir
+            annot_dir = args.smc_annot_dir
 
     if not audio_dir or not annot_dir:
         continue
@@ -347,8 +426,19 @@ def evaluate_macro_joint_f_measure(model, label):
     체크포인트의 진짜 점수를 다시 재는 데 공통으로 씀(중복 제거)."""
     per_dataset_beat_f, per_dataset_downbeat_f = [], []
     for name, loader in per_dataset_val_dataloaders:
-        ds_beat_f, ds_downbeat_f, _ = evaluate_beat_f_measure(
-            loader, model, args.audio_downsampling_factor, args.audio_sample_rate, score_threshold=0.20)
+        if args.head_type == 'subset':
+            # subset head는 고정 길이 window만 받으므로 곡을 타일링해서 디코딩하고
+            # Algorithm 4로 이어붙여야 함 (beat_eval.evaluate_beat_f_measure_subset).
+            # eval_length는 기존과 같은 2097152(4096 frame)로 두어서, fcos_lite 등과
+            # 정확히 같은 구간을 평가하게 함 - 숫자 비교가 가능해야 하므로.
+            ds_beat_f, ds_downbeat_f, _ = evaluate_beat_f_measure_subset(
+                loader, model, args.audio_downsampling_factor, args.audio_sample_rate,
+                window_frames=args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE,
+                border_frames=args.stitch_beta_frames,
+                threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat)
+        else:
+            ds_beat_f, ds_downbeat_f, _ = evaluate_beat_f_measure(
+                loader, model, args.audio_downsampling_factor, args.audio_sample_rate, score_threshold=0.20)
         per_dataset_beat_f.append(ds_beat_f)
         per_dataset_downbeat_f.append(ds_downbeat_f)
         print(f"{label} | [{name}] Beat: {ds_beat_f:0.3f} | Downbeat: {ds_downbeat_f:0.3f}")
@@ -517,7 +607,7 @@ if __name__ == '__main__':
                 # (hungarian=1.0, fcos=0.1). 0 이하로 주면 원 논문 방식대로
                 # clipping을 아예 안 함 (자세한 이유는 위 argparse 주석 참고).
                 if args.grad_clip is None:
-                    clip_norm = 1.0 if args.head_type == "hungarian" else 0.1
+                    clip_norm = 1.0 if args.head_type in ("hungarian", "subset") else 0.1
                 else:
                     clip_norm = args.grad_clip
 
@@ -533,7 +623,17 @@ if __name__ == '__main__':
                 # 기반 FCOS 전용 개념). REG/LFT 자리는 실제로 bbox L1 / GIoU loss이고
                 # ADJ는 아예 안 쓰이므로(model_module.py의 _forward_hungarian 참고),
                 # 헷갈리지 않게 라벨을 다르게 출력한다.
-                if args.head_type == "hungarian":
+                if args.head_type == "subset":
+                    # subset head는 anchor가 없어 leftness/adjacency/phase 개념이
+                    # 없음. 5-tuple 슬롯의 실제 의미: CLS<-클래스 항, TIME<-시간(L1)
+                    # 항, BG<-background 항 (eq. 8), 나머지 둘은 미사용(0).
+                    print(
+                        'Epoch: {} | Iteration: {} | CLS: {:1.5f} | TIME: {:1.5f} | BG: {:1.5f} | Running loss: {:1.5f}'.format(
+                            epoch_num, iter_num,
+                            float(classification_loss), float(regression_loss),
+                            float(leftness_loss), np.mean(loss_hist))
+                    )
+                elif args.head_type == "hungarian":
                     print(
                         'Epoch: {} | Iteration: {} | CLS: {:1.5f} | BBOX(L1): {:1.5f} | GIOU: {:1.5f} | Running loss: {:1.5f}'.format(
                             epoch_num, iter_num,

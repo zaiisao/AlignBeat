@@ -22,14 +22,20 @@ leakage가 생김). gtzan/smc는 fold 파일 자체가 없고 학습에도 전�
 subset="full-val"로 전체 데이터를 봄.
 """
 import argparse
+import os
 import sys
-sys.path.insert(0, '/disk1/taegum/mnt/BeatFCOS')
+# 이 스크립트가 있는 repo의 beatfcos 패키지를 항상 최우선으로 import.
+# (예전에 여기 하드코딩돼 있던 '/disk1/taegum/mnt/BeatFCOS' 절대경로는 오래된
+# 트리를 가리켜서, 새로 추가된 모듈(subset_head 등)이 없는 옛 코드가 로컬 코드를
+# 가리는(shadow) 문제가 있었음 - 어느 checkout에서 실행하든 자기 자신의 패키지를
+# 쓰도록 스크립트 위치 기준으로 바꿈.)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import torch
 from beatfcos import model_module
 from beatfcos.dataloader import BeatDataset, collater
-from beatfcos.beat_eval import evaluate_beat_f_measure
+from beatfcos.beat_eval import evaluate_beat_f_measure, evaluate_beat_f_measure_subset
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint', type=str, required=True)
@@ -53,8 +59,16 @@ parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.242
 # --nhead 2로 명시해야 함. 기본값은 train.py의 고쳐진 기본값과 맞춰 8.
 parser.add_argument('--nhead', type=int, default=8,
                      help="체크포인트 학습에 쓴 nhead와 반드시 일치시킬 것 (DilatedTransformerLayer의 8-head 하드코딩 분할 때문에 다르면 Er 파라미터 shape mismatch/의미 불일치 발생)")
-parser.add_argument('--head_type', type=str, default="fcos", choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn'],
+parser.add_argument('--head_type', type=str, default="fcos", choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn', 'subset'],
                      help="체크포인트 학습에 쓴 head_type과 반드시 일치시킬 것 (pyramid_levels/Anchors/head 구조가 달라짐)")
+# --- subset head (--head_type subset) 전용 ---
+# 학습 때 쓴 num_candidates와 반드시 일치해야 함 (downsample stride/입력 길이가 여기서 나옴).
+parser.add_argument('--num_candidates', type=int, default=160)
+# Algorithm 3의 threshold. beat/downbeat 분포가 달라 따로 sweep할 수 있게 분리.
+parser.add_argument('--tau_beat', type=float, default=0.2)
+parser.add_argument('--tau_downbeat', type=float, default=0.2)
+# Algorithm 4의 border beta (frame 단위). 기본값은 후보 간격 D/N = 8 frame.
+parser.add_argument('--stitch_beta_frames', type=int, default=8)
 args = parser.parse_args()
 
 # (audio_dir, annot_dir, subset, validation_fold)
@@ -86,6 +100,7 @@ model = model_module.create_beatfcos_model(
     downbeat_weight=0.6, audio_downsampling_factor=AUDIO_DOWNSAMPLING_FACTOR,
     centerness=False, postprocessing_type="soft_nms",
     audio_sample_rate=AUDIO_SAMPLE_RATE, backbone_type="wavebeat",
+    num_candidates=args.num_candidates,
 )
 
 state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -96,7 +111,16 @@ state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 missing, unexpected = model.load_state_dict(state_dict, strict=False)
 if unexpected:
     raise RuntimeError(f"체크포인트에 모델에 없는 키가 있음: {unexpected}")
-if missing and missing != ["regressionModel.phase.weight", "regressionModel.phase.bias"]:
+if args.head_type == "subset":
+    # subset 체크포인트는 현재 train.py가 저장하는 모든 키(subset_criterion.b 버퍼
+    # 포함)를 반드시 갖고 있어야 함 - phase 키 allowlist는 fcos 계열 전용이고,
+    # subset에서 키가 하나라도 빠졌다는 건 랜덤 초기화된 서브모듈로 평가한다는
+    # 뜻이라(그럴듯해 보이는 쓰레기 숫자가 나옴) 무조건 에러로 처리.
+    if missing:
+        raise RuntimeError(
+            f"subset 체크포인트에 키 누락: {missing} - 다른 head_type으로 학습된 "
+            f"체크포인트이거나 손상된 파일임")
+elif missing and missing != ["regressionModel.phase.weight", "regressionModel.phase.bias"]:
     raise RuntimeError(f"예상 못한 키 누락: {missing}")
 model = model.to(device)
 
@@ -116,13 +140,24 @@ for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
         val_dataset, batch_size=1, shuffle=False, collate_fn=collater
     )
 
-    beat_f, downbeat_f, song_results = evaluate_beat_f_measure(
-        val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
-        score_threshold=args.score_threshold,
-        downbeat_score_threshold=args.downbeat_score_threshold,
-        downbeat_sigma=args.downbeat_sigma,
-        downbeat_phase_reweight=args.downbeat_phase_reweight,
-    )
+    if args.head_type == "subset":
+        # subset head는 고정 길이 window만 받으므로 곡을 타일링해 디코딩하고
+        # Algorithm 4로 이어붙임. length=2097152(4096 frame)는 그대로 둬서 fcos
+        # 계열과 정확히 같은 구간을 평가함 - 숫자를 직접 비교해야 하므로.
+        beat_f, downbeat_f, song_results = evaluate_beat_f_measure_subset(
+            val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
+            window_frames=args.num_candidates * 8,
+            border_frames=args.stitch_beta_frames,
+            threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat,
+        )
+    else:
+        beat_f, downbeat_f, song_results = evaluate_beat_f_measure(
+            val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
+            score_threshold=args.score_threshold,
+            downbeat_score_threshold=args.downbeat_score_threshold,
+            downbeat_sigma=args.downbeat_sigma,
+            downbeat_phase_reweight=args.downbeat_phase_reweight,
+        )
     # mir_eval.beat.evaluate가 곡마다 돌려주는 dict에서 CMLt(Correct Metric
     # Level Total)/AMLt(Any Metric Level Total)를 뽑아서 곡 평균을 냄 -
     # evaluate_beat_f_measure 자체는 F-measure만 집계해서 반환하기 때문.

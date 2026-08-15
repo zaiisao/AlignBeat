@@ -294,6 +294,35 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 num_queries=num_queries, decoder_layers=decoder_layers
             )
             self.set_criterion = SetCriterion(num_classes, OrderedMatcher())
+        elif self.head_type == "subset":
+            # [무엇] "Beat Tracking as an Order-Constrained Subset Selection Problem"
+            # (beat_dp_matching-1.pdf) 구현. anchor/cluster/Soft-NMS를 전부 없애고,
+            # 고정 개수 N개의 후보가 각각 (class, 시각)을 점(point)으로 예측한다.
+            # 시각은 cumulative-softplus 재파라미터화(eq. 1)로 항상 증가하도록
+            # 강제되므로, 어떤 후보가 어떤 GT를 담당할지는 "부분집합 선택" 문제로
+            # 환원되고 O(N*M) DP(Alg. 1)로 정확히 풀린다. 자세한 내용은
+            # beatfcos/subset_head.py 상단 docstring 참고.
+            # [왜 hungarian과 다른가] hungarian 경로는 DETR식 learned query +
+            # decoder라 query collapse로 실패했지만, 여기서는 후보가
+            # Downsample(FPN feature)에서 나오고 시각이 구조적으로 정렬돼 있어
+            # collapse할 대상 자체가 없다.
+            from beatfcos.subset_head import SubsetSelectionHead, SubsetCriterion
+            self.num_candidates = kwargs.get('num_candidates', 160)
+            # P1/P2/P3의 길이는 T, T/2, T/4이므로 후보 N개로 맞추려면 stride도
+            # 8/4/2로 서로 달라야 함 (T = N*8 = 1280 기준).
+            level_strides = kwargs.get('subset_level_strides', (8, 4, 2))
+            self.subset_head = SubsetSelectionHead(
+                feature_size=256,
+                num_candidates=self.num_candidates,
+                level_strides=level_strides,
+                hidden_size=kwargs.get('subset_hidden_size', 256),
+            )
+            self.subset_criterion = SubsetCriterion(
+                b_scale=kwargs.get('b_scale', 0.005),
+                gamma=kwargs.get('gamma', 0.5),
+                omega_downbeat=kwargs.get('omega_db', 2.0),
+                learn_b=kwargs.get('learn_b', False),
+            )
         elif self.head_type == "fcos_lite":
             # P1(레벨 0) 제거 + classification/regression head 통합 (안재훈 박사님
             # 제안 FPN ablation 중 하나). FPN fusion 자체는 그대로 두고(no_fusion=False),
@@ -363,7 +392,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
             self.regressionModel.phase.weight.data.fill_(0)
             self.regressionModel.phase.bias.data.fill_(0)
-        elif self.head_type != "hungarian":
+        elif self.head_type not in ("hungarian", "subset"):
             # The reinitialization of the final layer of the classification head
             prior = 0.01
 
@@ -445,6 +474,43 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
             return [finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates, eval_losses]
 
+    def _forward_subset(self, feature_maps, base_level_image_shape, inputs):
+        """Order-constrained subset selection head (beat_dp_matching-1.pdf).
+
+        학습 시에는 train.py의 5-tuple 언패킹을 그대로 재사용하기 위해 같은 모양으로
+        반환한다: CLS <- 클래스 항, REG <- 시간(L1) 항, LFT <- background 항,
+        ADJ/PHA <- 미사용(0). 이 헤드에는 anchor가 없으므로 leftness/adjacency/phase
+        개념 자체가 적용 대상이 아니다 (hungarian 경로와 동일한 관례).
+
+        평가 시에는 후처리를 전혀 하지 않고 (class_logits, t_hat) 원본을 그대로
+        반환한다 - NMS가 필요 없고(eq. 1이 교차를 구조적으로 금지), threshold 적용과
+        조각 이어붙이기는 beatfcos/stitching.py가 담당하기 때문. 이렇게 두면 모델을
+        다시 돌리지 않고도 tau를 바꿔가며 sweep할 수 있다.
+        """
+        from beatfcos.subset_head import intervals_to_events
+
+        class_logits, t_hat = self.subset_head(feature_maps)
+
+        if not self.training:
+            return class_logits, t_hat
+
+        # annotation의 frame 인덱스는 crop 기준이고, C1 길이(=mel frame 수)와 같은
+        # 단위라 여기서 [0,1]로 정규화하면 eq. (1)의 t_hat과 같은 축에 놓인다.
+        num_frames = base_level_image_shape[-1]
+        annotations = inputs[1] if len(inputs) == 2 else None
+        targets = intervals_to_events(annotations, num_frames)
+
+        losses, _stats = self.subset_criterion(class_logits, t_hat, targets)
+
+        zero = torch.zeros((), device=class_logits.device)
+        return (
+            losses['class'].unsqueeze(0),
+            losses['time'].unsqueeze(0),
+            losses['background'].unsqueeze(0),
+            zero.unsqueeze(0),
+            zero.unsqueeze(0),
+        )
+
     # downbeat_score_threshold: 안 주면(None) score_threshold가 beat/downbeat
     # 둘 다에 적용됨(기존 동작과 동일). 값을 주면 downbeat 클래스만 그 threshold로
     # 독립적으로 후처리됨 (아래 soft_nms 부분의 class_score_threshold 참고).
@@ -478,6 +544,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
         if self.head_type == "hungarian":
             return self._forward_hungarian(feature_maps, base_level_image_shape, audio_batch, inputs)
+
+        if self.head_type == "subset":
+            return self._forward_subset(feature_maps, base_level_image_shape, inputs)
 
         if self.head_type == "fcos_lite":
             # P1 제거: P2/P3(레벨 [1,2])만 사용, classification+regression 통합 head
