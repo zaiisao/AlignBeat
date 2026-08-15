@@ -135,7 +135,27 @@ class BeatDataset(torch.utils.data.Dataset):
         # 어느 게 먼저 나올지 보장이 안 됨). validation_fold를 실제 8-fold CV로
         # 쓰려는 것이므로 "8-fold"가 파일명에 들어간 것만 명시적으로 찾음.
         fold_files = glob.glob(os.path.join(self.annot_dir, "*8-fold*.folds"))  #MJ: /mount/beat-tracking/ballroom/label/???.folds etc
-        if self.validation_fold is not None and len(fold_files) > 0 and self.subset in ["train", "val", "test"]:
+        # [치명적 무성(silent) 실패 방지] validation_fold를 줬는데 8-fold 파일이
+        # 없으면, 아래 else(80/10/10) 분기로 내려가서 start/stop을 계산하지만
+        # 정작 슬라이싱은 "if self.validation_fold is None"으로 막혀 있어서
+        # train/val 둘 다 *전체 파일*을 받게 됨 - 즉 held-out이 하나도 없는
+        # 완전한 train/val leakage 상태로 조용히 학습이 돌아감(실제로 발생:
+        # 8-fold 파일이 없는 데이터셋 복사본을 가리켜서 train 685 / val 685개가
+        # 나왔음). fold 파일이 있는 데이터셋들(ballroom/beatles/hainsworth/
+        # rwc_popular)에 대해서는 없으면 즉시 실패시킴.
+        _needs_folds = self.dataset in ["ballroom", "beatles", "hainsworth", "rwc_popular"]
+        if (self.validation_fold is not None and _needs_folds and len(fold_files) == 0
+                and self.subset in ["train", "val", "test"]):
+            raise FileNotFoundError(
+                f"--validation_fold {self.validation_fold}를 줬는데 '{self.dataset}'의 "
+                f"annot_dir에 '*8-fold*.folds' 파일이 없음: {self.annot_dir}\n"
+                f"  (있는 파일: {[os.path.basename(f) for f in glob.glob(os.path.join(self.annot_dir, '*.folds'))]})\n"
+                f"  이대로 두면 train/val이 모두 전체 파일이 되어 held-out이 사라짐. "
+                f"8-fold 파일이 있는 데이터셋 경로를 쓰거나 --validation_fold를 빼고 "
+                f"80/10/10 split을 쓸 것.")
+        used_fold_file = (self.validation_fold is not None and len(fold_files) > 0
+                          and self.subset in ["train", "val", "test"])
+        if used_fold_file:
             fold_file = fold_files[0]  #MJ: len(fold_files) = 1
             self.audio_files = []
 
@@ -207,7 +227,14 @@ class BeatDataset(torch.utils.data.Dataset):
             print(f"Selected 1 file for dry run.")
         else:
             # now pick out subset of audio files
-            if self.validation_fold is None:
+            # 조건이 원래 "validation_fold is None"이었는데, 그러면 fold 파일이
+            # 없는 데이터셋(carnatic/harmonix)에 validation_fold를 준 경우 위 else에서
+            # start/stop을 계산해놓고도 슬라이싱을 건너뛰어서 train/val이 둘 다 전체
+            # 파일이 됨 - 실측 결과 carnatic 176/176, harmonix 912/912가 완전히 겹치는
+            # train/val leakage 상태였음(evaluate_all_datasets.py의 "80/10/10 fallback을
+            # 쓴다"는 주석과도 어긋남). fold 파일 분기를 실제로 탔는지 여부로 판단하도록
+            # 바꿔서, fold 파일이 없으면 의도대로 80/10/10 분할이 적용되게 함.
+            if not used_fold_file:
                 self.audio_files = self.audio_files[start:stop]
                 print(f"Selected {len(self.audio_files)} files for {self.subset} set from {self.dataset} dataset.")
 
