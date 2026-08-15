@@ -566,8 +566,15 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
             
             #wavebeat_format_target[0, min(last_target_beat_index, length - 1)] = 1
             #wavebeat_format_target[1, min(last_target_downbeat_index, length - 1)] = 1
-            beat_target_left_positions.append(last_target_beat_index * audio_downsampling_factor / audio_sample_rate)
-            downbeat_target_left_positions.append(last_target_downbeat_index * audio_downsampling_factor / audio_sample_rate)
+            # beat-only 데이터셋(SMC)에는 downbeat interval이 하나도 없어서
+            # last_target_downbeat_index가 None으로 남는다. 원래는 무조건 곱셈을
+            # 해서 TypeError로 프로세스가 통째로 죽었음 - 실제로 fcos_lite 학습 두
+            # 개가 epoch 0 검증에서 harmonix까지 마치고 SMC에 들어가는 순간 조용히
+            # 사라졌다(로그에 traceback도 안 남음, 이 지점이 try/except 밖이라).
+            if last_target_beat_index is not None:
+                beat_target_left_positions.append(last_target_beat_index * audio_downsampling_factor / audio_sample_rate)
+            if last_target_downbeat_index is not None:
+                downbeat_target_left_positions.append(last_target_downbeat_index * audio_downsampling_factor / audio_sample_rate)
 
             predicted_scores = predicted_scores.cpu()
             predicted_labels = predicted_labels.cpu()
