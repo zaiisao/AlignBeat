@@ -182,6 +182,17 @@ parser.add_argument('--tau_downbeat', type=float, default=0.2)
 # stitch_beta_frames: Algorithm 4의 border beta(frame 단위). 논문은 값을 정해주지
 # 않고 후보 간격 D/N 정도를 출발점으로 제안함 - D/N = 8 frame(0.186초).
 parser.add_argument('--stitch_beta_frames', type=int, default=8)
+# 논문 9.2절: 후보 feature들끼리 self-attention을 한 번 돌려서 classification 분기에만
+# 먹임 (t_hat은 여전히 z_j에서만 계산되므로 eq.1의 단조성 보장은 그대로).
+# [근거] 학습된 체크포인트 실측: downbeat에 매칭된 후보의 p(DB)=0.854, background는
+# 0.029로 멀쩡한데, 진짜 beat에 매칭된 후보가 p(DB)=0.141을 갖는다. beat이 downbeat보다
+# ~3배 많으므로 이 꼬리가 false downbeat 전부의 출처이고, 이것이 downbeat precision
+# 0.430의 원인이다. timing(중앙값 14ms), threshold(9x9 sweep에서 Joint +0.001),
+# DP 배정(6.7%), class weighting(gradient 비 0.81) 모두 측정으로 배제됨 - 남은 것은
+# "이 박이 마디의 몇 번째인가"가 후보 하나의 국소 feature로는 표현되지 않는다는
+# 9.1절의 진단뿐이다. 0이면 비활성(기존과 동일).
+parser.add_argument('--class_attention_layers', type=int, default=0)
+parser.add_argument('--class_attention_heads', type=int, default=4)
 
 # 8-fold CV처럼 여러 run을 병렬/순차로 돌릴 때 서로 log.log나 checkpoints/를
 # 안 덮어쓰게 fold(run)마다 분리할 수 있는 옵션. 기본값은 기존 동작과 동일.

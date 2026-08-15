@@ -316,6 +316,10 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 num_candidates=self.num_candidates,
                 level_strides=level_strides,
                 hidden_size=kwargs.get('subset_hidden_size', 256),
+                # 논문 9.2절: 후보 간 self-attention을 classification 분기에만 적용.
+                # 0이면 완전히 비활성(기존 동작과 동일).
+                class_attention_layers=kwargs.get('class_attention_layers', 0),
+                class_attention_heads=kwargs.get('class_attention_heads', 4),
             )
             self.subset_criterion = SubsetCriterion(
                 b_scale=kwargs.get('b_scale', 0.005),

@@ -76,7 +76,8 @@ class SubsetSelectionHead(nn.Module):
     """
 
     def __init__(self, feature_size=256, num_candidates=160, level_strides=(8, 4, 2),
-                 hidden_size=256, dropout=0.0, class_prior=(0.10, 0.30, 0.60)):
+                 hidden_size=256, dropout=0.0, class_prior=(0.10, 0.30, 0.60),
+                 class_attention_layers=0, class_attention_heads=4):
         super(SubsetSelectionHead, self).__init__()
         self.num_candidates = num_candidates
         self.level_strides = tuple(level_strides)
@@ -112,6 +113,33 @@ class SubsetSelectionHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
         )
+        # Section 9.2: a shallow self-attention pass over the N candidate features,
+        # used by the CLASSIFICATION branch only.
+        #
+        # [why] Measured on a trained checkpoint, the mean predicted p(DB) is 0.854 on
+        # candidates matched to a downbeat, 0.029 on background - both fine - but 0.141
+        # on candidates matched to an ordinary BEAT. With ~3x as many beats as
+        # downbeats, that tail is the entire source of the false downbeats (precision
+        # 0.430). Every other explanation was eliminated by measurement: timing (14 ms
+        # median residual), the decode threshold (a full 9x9 tau sweep moves Joint by
+        # +0.001), the DP assignment (only 6.7% of downbeats go to a beat-preferring
+        # candidate), and the class weighting (the gradient pull:push ratio on the
+        # downbeat logit is 0.81, i.e. balanced). What remains is discriminability:
+        # z_j summarises its own local span, and which beat of the bar this is simply
+        # is not a local property - exactly the argument in section 9.1.
+        #
+        # [why classification only] t_hat is computed from z_j, never from z_tilde, so
+        # equation (1)'s monotonicity guarantee is untouched. Section 9.2 makes the
+        # same split for the same reason: placing a matched time is a local decision,
+        # whereas bar position needs beat-grid-scale context.
+        self.candidate_attention = None
+        if class_attention_layers > 0:
+            layer = nn.TransformerEncoderLayer(
+                d_model=hidden_size, nhead=class_attention_heads,
+                dim_feedforward=hidden_size * 2, dropout=dropout,
+                batch_first=True, norm_first=True)
+            self.candidate_attention = nn.TransformerEncoder(layer, class_attention_layers)
+
         self.class_head = nn.Linear(hidden_size, NUM_CLASSES)
         self.regression_head = nn.Linear(hidden_size, 1)
 
@@ -179,9 +207,13 @@ class SubsetSelectionHead(nn.Module):
         z = pooled.transpose(1, 2)  # (B, N, C)
         z = self.trunk(self.input_norm(z))
 
-        class_logits = self.class_head(z)               # (B, N, 3)
+        # Regression reads z directly and is therefore unaffected by section 9.2's
+        # attention pass; only the classifier sees the contextualised features.
         r = self.regression_head(z).squeeze(dim=2)      # (B, N)
         t_hat = monotonic_times(r)
+
+        z_class = z if self.candidate_attention is None else self.candidate_attention(z)
+        class_logits = self.class_head(z_class)         # (B, N, 3)
         return class_logits, t_hat
 
 
