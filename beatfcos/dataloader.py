@@ -12,6 +12,12 @@ import sox
 
 torchaudio.set_audio_backend("sox_io")
 
+# downbeat 라벨이 없는(beat만 주어지는) 데이터셋. make_intervals가 이 목록의
+# 데이터셋에 대해서는 class_id=CLASS_BEAT_ONLY만 내보낸다 (아래 make_intervals 참고).
+BEAT_ONLY_DATASETS = {"smc"}
+CLASS_BEAT_ONLY = 2
+
+
 def collater(data):
     # data = one batch of [audio, annot(, metadata)]
     audios = [s[0] for s in data]  #MJ: s[0]:  shape = (1, 3000, 81), a single channel 2D tensor for spectrogram input
@@ -569,6 +575,17 @@ class BeatDataset(torch.utils.data.Dataset):
                 intervals = torch.cat((intervals, interval), axis=0)
 
             return intervals  #MJ: shape =(M,3)
+
+        # [beat-only 데이터셋] SMC처럼 downbeat 라벨이 아예 없는 데이터셋은
+        # load_annot이 모든 줄을 beat=1로 파싱하기 때문에(line 487) downbeat
+        # 채널에도 전부 1이 찍혀서, 그냥 두면 "모든 beat가 downbeat"인 완전히
+        # 틀린 supervision이 된다. 이런 데이터셋은 downbeat interval을 만들지
+        # 않고, beat interval만 class_id=2("beat인 것은 확실하나 B/DB 구분은
+        # 관측되지 않음")로 표시한다. subset head는 이 표시를 보고 논문 7.1절의
+        # marginal likelihood(eq. 9)/EM pseudo-label(eq. 10-11) 경로를 쓴다.
+        # class_id 2는 FCOS 경로에는 등장하지 않으므로 기존 동작에 영향 없음.
+        if self.dataset in BEAT_ONLY_DATASETS:
+            return make_interval_subset(beat_locations, CLASS_BEAT_ONLY)
 
         annotations = torch.cat((
             annotations,

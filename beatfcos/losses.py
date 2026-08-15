@@ -207,6 +207,11 @@ def get_phase_targets(jth_annotations, anchor_points):
 
     return mask, targets
 
+# dataloader.CLASS_BEAT_ONLY와 같은 값. downbeat 라벨이 없는 데이터셋(SMC)의
+# beat interval을 표시하는 class id (dataloader.make_intervals 참고).
+BEAT_ONLY_CLASS_ID = 2
+
+
 class FocalLoss(nn.Module):
     def __init__(self, downbeat_weight=0.5):
         super(FocalLoss, self).__init__()
@@ -501,6 +506,13 @@ class AdjacencyConstraintLoss(nn.Module):
         downbeat_lengths = jth_annotations[jth_annotations[:, 2] == 0, 1] - jth_annotations[jth_annotations[:, 2] == 0, 0]
         beat_lengths = jth_annotations[jth_annotations[:, 2] == 1, 1] - jth_annotations[jth_annotations[:, 2] == 1, 0]
 
+        # beat-only 데이터셋(SMC)에는 downbeat annotation이 하나도 없다. 이 loss는
+        # downbeat 구간과 beat 구간 사이의 정합성을 재는 것이라 downbeat이 없으면
+        # 정의 자체가 안 되므로 0을 돌려준다 (빈 텐서에 torch.max를 부르면
+        # "max(): Expected reduction dim ... numel() == 0"으로 죽음).
+        if downbeat_lengths.numel() == 0 or beat_lengths.numel() == 0:
+            return torch.zeros((), device=jth_annotations.device)
+
         max_downbeat_length = torch.max(downbeat_lengths)
         max_beat_length = torch.max(beat_lengths)
 
@@ -641,7 +653,8 @@ class CombinedLoss(nn.Module):
         normalized_annotations,
         l_star, r_star,
         normalized_l_star,
-        normalized_r_star
+        normalized_r_star,
+        beat_only=False
     ):
         jth_classification_targets = torch.zeros(jth_classification_pred.shape).to(jth_classification_pred.device)
         jth_regression_targets = torch.zeros(jth_regression_pred.shape).to(jth_regression_pred.device)
@@ -651,6 +664,12 @@ class CombinedLoss(nn.Module):
 
         jth_classification_targets[positive_anchor_indices, :] = 0
         jth_classification_targets[positive_anchor_indices, class_ids_of_positive_anchors] = 1
+
+        # beat-only 샘플: downbeat 채널(column 0)을 전부 -1로 두면 FocalLoss가
+        # 이미 갖고 있는 sentinel 처리(torch.where(ne(targets, -1), ...))가 그
+        # 채널을 loss에서 통째로 빼준다. beat 채널(column 1)은 정상 학습됨.
+        if beat_only:
+            jth_classification_targets[:, 0] = -1.0
 
         jth_regression_targets = torch.stack((normalized_l_star, normalized_r_star), dim=1)
 
@@ -683,10 +702,29 @@ class CombinedLoss(nn.Module):
             # The dummy gt boxes that are labeled as -1 are added to each batch by the collater function of DataSet to make all the annotations have the same shape,
             # To really process them,  those gt boxes should be removed. MJ: jth_annotations: shape=(57,3); annotations:shape=(127,3)
             jth_annotations = jth_padded_annotations[jth_padded_annotations[:, 2] != -1]
-            
+
             # If there are no targets for the current audio in the batch, skip the audio
             if jth_annotations.size(dim=0) == 0:
                 continue
+
+            # [beat-only 데이터셋 지원] SMC처럼 downbeat 라벨이 없는 데이터셋은
+            # dataloader가 beat interval만 class_id=2(CLASS_BEAT_ONLY)로 표시해서
+            # 내보낸다. class 2를 그대로 두면 get_fcos_positives가 downbeat 클래스
+            # 관련 텐서를 비운 채로 max()를 호출해서 죽는다(실측: "max(): Expected
+            # reduction dim to be specified for input.numel() == 0").
+            #
+            # 처리 방식: class 2를 beat(1)로 되돌려서 anchor 할당은 정상적으로
+            # 돌리되, 이 샘플의 downbeat 채널은 loss에서 통째로 제외한다. 제외에는
+            # FocalLoss가 이미 갖고 있는 -1 sentinel을 그대로 쓴다(아래
+            # get_jth_targets 참고). 이렇게 안 하면 "downbeat이 아니다"라는 틀린
+            # 라벨을 모든 위치에 학습시키게 됨 - SMC에는 downbeat 정보가 아예
+            # 없으므로 그건 관측되지 않은 것을 관측했다고 주장하는 셈이다.
+            # beat-only 샘플이 하나도 없으면 이 블록은 완전한 no-op이라, 기존
+            # 데이터셋만 쓰는 학습은 비트 단위로 동일하게 동작한다.
+            jth_beat_only = bool((jth_annotations[:, 2] == BEAT_ONLY_CLASS_ID).any())
+            if jth_beat_only:
+                jth_annotations = jth_annotations.clone()
+                jth_annotations[jth_annotations[:, 2] == BEAT_ONLY_CLASS_ID, 2] = 1.0
 
             interval_length_ranges = clusters_to_interval_length_ranges(self.clusters)
             pyramid_levels = self.pyramid_levels if self.pyramid_levels is not None else list(range(len(anchors_list)))
@@ -707,7 +745,8 @@ class CombinedLoss(nn.Module):
                 jth_classification_pred, jth_regression_pred, jth_leftness_pred,
                 positive_anchor_indices, normalized_annotations_for_anchors,
                 l_star_for_anchors, r_star_for_anchors,
-                normalized_l_star_for_anchors, normalized_r_star_for_anchors
+                normalized_l_star_for_anchors, normalized_r_star_for_anchors,
+                beat_only=jth_beat_only
             )
 
             jth_classification_loss = self.classification_loss(

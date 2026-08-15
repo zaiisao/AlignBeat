@@ -550,14 +550,17 @@ def evaluate_beat_f_measure(dataloader, model, audio_downsampling_factor, audio_
                 right_position_index = int(beat_interval[1])
 
                 # wavebeat_format_target[row, min(left_position_index, length - 1)] = 1
+                # label 2 = beat-only 데이터셋(SMC, dataloader.CLASS_BEAT_ONLY):
+                # beat GT로만 세고 downbeat GT는 비워 둔다. 이 분기가 없으면 SMC의
+                # GT가 통째로 비어 mir_eval이 0을 돌려준다.
                 if label == 0:
                     downbeat_target_left_positions.append(left_position_index * audio_downsampling_factor / audio_sample_rate)
-                elif label == 1:
+                elif label in (1, 2):
                     beat_target_left_positions.append(left_position_index * audio_downsampling_factor / audio_sample_rate)
 
                 if label == 0 and (last_target_downbeat_index is None or right_position_index > last_target_downbeat_index):
                     last_target_downbeat_index = right_position_index
-                elif label == 1 and (last_target_beat_index is None or right_position_index > last_target_beat_index):
+                elif label in (1, 2) and (last_target_beat_index is None or right_position_index > last_target_beat_index):
                     last_target_beat_index = right_position_index
             #End for beat_interval in target[0]:
             
