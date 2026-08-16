@@ -424,6 +424,28 @@ def test_criterion_skips_non_finite_fragment_without_raising():
     print("ok: a non-finite fragment is skipped and counted, batch survives")
 
 
+
+def test_all_fragments_non_finite_still_backprops():
+    """If EVERY fragment in a batch is skipped, the loss must still carry a grad_fn.
+
+    The first version of this guard appended the background term inside the
+    torch.no_grad() block, so the term was detached; with every fragment skipped the
+    total had no grad_fn and backward() raised "element 0 of tensors does not require
+    grad". That killed a run within 195 iterations."""
+    crit = SubsetCriterion(b_scale=0.005, diagnostic_every=0)
+    logits = torch.randn(2, 32, 3, requires_grad=True)
+    t_hat = monotonic_times(torch.randn(2, 32)).clone()
+    t_hat[:, 5] = float('nan')                      # every fragment non-finite
+    targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
+                'times': torch.tensor([0.3, 0.7])}] * 2
+    losses, stats = crit(logits, t_hat, targets)
+    assert stats['non_finite'] == 2, stats
+    assert losses['total'].grad_fn is not None, "loss must remain differentiable"
+    losses['total'].backward()
+    assert torch.isfinite(logits.grad).all()
+    print("ok: an all-skipped batch stays differentiable instead of raising")
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

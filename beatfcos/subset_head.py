@@ -531,11 +531,7 @@ class SubsetCriterion(nn.Module):
                 # stops while the epoch loop keeps spinning and validation keeps
                 # reporting a frozen model. Skip just this fragment instead, and surface
                 # it in the stats so a run that starts degrading is visible.
-                if not torch.isfinite(corrected).all():
-                    non_finite += 1
-                    background_terms.append(background.sum() / max(float(M), 1.0))
-                    contributing_fragments += 1
-                    continue
+                cost_is_finite = bool(torch.isfinite(corrected).all())
                 cost_class_sum += float(class_cost.sum())
                 cost_cells += class_cost.numel()
                 # Spread of the class term between neighbouring candidates: the amount
@@ -544,7 +540,19 @@ class SubsetCriterion(nn.Module):
                 class_spread_count += 1
                 # Selection is a non-differentiable combinatorial step evaluated at the
                 # current parameters; sigma enters the loss as data (Alg. 2 line 17).
-                sigma_np = subset_select_dp(corrected.detach().cpu().numpy())
+                sigma_np = subset_select_dp(corrected.detach().cpu().numpy()) if cost_is_finite else None
+
+            # Must be OUTSIDE the no_grad block above: a term appended inside it is
+            # detached, and if every fragment in the batch took that path the total
+            # would carry no grad_fn at all and backward() would raise
+            # "element 0 of tensors does not require grad" -- which is exactly how the
+            # first version of this guard killed a run.
+            if not cost_is_finite:
+                non_finite += 1
+                background_terms.append(background.sum() / max(float(M), 1.0))
+                contributing_fragments += 1
+                continue
+
             sigma = torch.from_numpy(sigma_np).to(class_logits.device)
 
             # --- loss (8), matched terms -------------------------------------
