@@ -253,6 +253,16 @@ def monotonic_times(r, epsilon=1e-4):
     to the end of the window. If it goes unmatched it simply takes the background
     loss, so this costs a candidate slot rather than correctness.
     """
+    # Bound r before softplus. softplus(r) ~ r for large r, so one extreme value makes
+    # the cumulative sum overflow to inf and the normalisation return inf/inf = NaN.
+    # That NaN reaches the DP cost through the lambda_L1 * |t - t_hat| term, which
+    # LOG_PROB_FLOOR does not cover, and the batch is lost. Observed live: subset
+    # training silently stopped at epoch ~74 after 9,749 consecutive 'backtracking
+    # failed' skips, with the saved weights themselves still perfectly finite.
+    # +-30 is far outside any healthy range (softplus(30) = 30, so the cumulative sum
+    # stays under 160*30); a model sitting at r = 30 is already broken, so the
+    # saturated gradient there costs nothing.
+    r = r.clamp(-30.0, 30.0)
     increments = F.softplus(r)
     relative_floor = epsilon * increments.mean(dim=-1, keepdim=True)
     increments = increments + relative_floor + 1e-30
@@ -477,6 +487,7 @@ class SubsetCriterion(nn.Module):
         cost_class_sum, cost_cells = 0.0, 0
         class_spread_sum, class_spread_count = 0.0, 0
         infeasible = 0
+        non_finite = 0
         unlabelled_events = 0
 
         for b in range(batch_size):
@@ -514,6 +525,17 @@ class SubsetCriterion(nn.Module):
             with torch.no_grad():
                 corrected, class_cost, time_cost = self.build_cost(
                     log_probabilities_b, t_hat[b], event_classes, event_times)
+                # A non-finite cost makes the running-minimum DP unable to backtrack and
+                # subset_select_dp raises. That exception propagates to train.py, which
+                # skips the whole BATCH -- and once it happens on every batch, training
+                # stops while the epoch loop keeps spinning and validation keeps
+                # reporting a frozen model. Skip just this fragment instead, and surface
+                # it in the stats so a run that starts degrading is visible.
+                if not torch.isfinite(corrected).all():
+                    non_finite += 1
+                    background_terms.append(background.sum() / max(float(M), 1.0))
+                    contributing_fragments += 1
+                    continue
                 cost_class_sum += float(class_cost.sum())
                 cost_cells += class_cost.numel()
                 # Spread of the class term between neighbouring candidates: the amount
@@ -585,6 +607,7 @@ class SubsetCriterion(nn.Module):
             'total': float(losses['total']),
             'num_events': total_events,
             'infeasible': infeasible,
+            'non_finite': non_finite,
             'unlabelled_events': unlabelled_events,
             'b': float(self.b),
             'lambda_l1': self.lambda_l1,

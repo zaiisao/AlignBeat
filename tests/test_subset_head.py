@@ -389,6 +389,41 @@ def test_log_prob_floor_keeps_dp_cost_finite():
     print("ok: extreme logits no longer produce a non-finite DP cost")
 
 
+
+def test_monotonic_times_survives_overflow_scale_r():
+    """softplus(r) ~ r, so an unbounded r overflows the cumulative sum to inf and the
+    normalisation returns inf/inf = NaN. That NaN reaches the DP cost through the time
+    term (which LOG_PROB_FLOOR does not cover) and killed a real run: training stopped
+    at epoch ~74 after 9,749 consecutive skipped batches."""
+    for v in (1e30, -1e30, 1e38):
+        t = monotonic_times(torch.full((1, 160), v))
+        assert torch.isfinite(t).all(), f"non-finite t_hat at r={v}"
+        assert torch.all(t[:, 1:] > t[:, :-1]), f"ordering lost at r={v}"
+    mixed = torch.zeros(1, 160); mixed[0, 0] = 1e38
+    t = monotonic_times(mixed)
+    assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
+    print("ok: equation (1) stays finite and ordered at overflow-scale r")
+
+
+def test_criterion_skips_non_finite_fragment_without_raising():
+    """One bad fragment must not take the whole batch down. subset_select_dp raises on a
+    non-finite cost, that propagated to train.py which skipped the entire batch, and once
+    it happened every batch the run froze while still reporting scores."""
+    N = 32
+    torch.manual_seed(0)
+    logits = torch.randn(2, N, 3, requires_grad=True)
+    t_hat = monotonic_times(torch.randn(2, N)).clone()
+    t_hat[0, 5] = float('nan')
+    targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
+                'times': torch.tensor([0.3, 0.7])}] * 2
+    losses, stats = SubsetCriterion(b_scale=0.005, diagnostic_every=0)(logits, t_hat, targets)
+    losses['total'].backward()
+    assert stats['non_finite'] == 1, stats
+    assert torch.isfinite(losses['total'])
+    assert torch.isfinite(logits.grad).all()
+    print("ok: a non-finite fragment is skipped and counted, batch survives")
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(list(globals().items())):

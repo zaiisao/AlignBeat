@@ -689,6 +689,20 @@ if __name__ == '__main__':
         # End of: for iter_num, data in enumerate(train_dataloader)
 
         # Evaluate the evaluation dataset in each epoch
+        # [무성 정지 방지] 학습 iteration이 예외로 전부 건너뛰어지면 optimizer가 한 번도
+        # 안 돌아가는데도 epoch 루프와 검증은 계속 돌아서, 얼어붙은 모델의 동일한 점수가
+        # 100 epoch까지 찍힌다(실측: subset run이 epoch 74에서 조용히 멈춘 뒤 9,749번
+        # 연속 실패, 로그만 보면 정상 종료처럼 보였음). 한 epoch이 통째로 실패하면 즉시
+        # 세운다 - 몇 시간을 허비하는 것보다 낫다.
+        if len(epoch_loss) == 0:
+            raise RuntimeError(
+                f"epoch {epoch_num}: every training iteration was skipped (0 optimizer "
+                f"steps). Training has stopped; aborting instead of validating a frozen "
+                f"model for the remaining epochs.")
+        if len(epoch_loss) < 0.5 * len(train_dataloader):
+            print(f"[warn] epoch {epoch_num}: only {len(epoch_loss)}/{len(train_dataloader)} "
+                  f"iterations succeeded - training is degrading", flush=True)
+
         print(f'[MEM] before eval: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
         print('Evaluating dataset')
         beat_mean_f_measure, downbeat_mean_f_measure, joint_f_measure = evaluate_macro_joint_f_measure(
