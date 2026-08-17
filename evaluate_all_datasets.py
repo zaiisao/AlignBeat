@@ -57,6 +57,8 @@ parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.242
                      help="콤마로 구분된 클러스터 값. 체크포인트 학습에 쓴 값과 일치시킬 것")
 # nhead=2로 학습된 옛날 체크포인트(이 버그 발견 이전 전부)를 평가하려면
 # --nhead 2로 명시해야 함. 기본값은 train.py의 고쳐진 기본값과 맞춰 8.
+parser.add_argument('--dmodel', type=int, default=128)
+parser.add_argument('--d_hid', type=int, default=512)
 parser.add_argument('--nhead', type=int, default=8,
                      help="체크포인트 학습에 쓴 nhead와 반드시 일치시킬 것 (DilatedTransformerLayer의 8-head 하드코딩 분할 때문에 다르면 Er 파라미터 shape mismatch/의미 불일치 발생)")
 parser.add_argument('--head_type', type=str, default="fcos", choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn', 'subset'],
@@ -72,18 +74,26 @@ parser.add_argument('--stitch_beta_frames', type=int, default=8)
 args = parser.parse_args()
 
 # (audio_dir, annot_dir, subset, validation_fold)
+# 학습(train.py)이 쓴 annot_dir과 동일한 dataset_folds/*/label을 가리킴.
+# 예전에는 /disk1/taegum/mnt/labeled_data/*/label을 봤는데, 그쪽에는
+# *_8-fold_cv_dancestyle.folds / *_genre.folds가 있고 학습 쪽에는
+# *_8-fold_cv_beat_transformer.folds가 있어서, 같은 --validation_fold 0이어도
+# 서로 다른 분할이 됨 -> eval val set에 학습에 쓰인 곡이 섞여 들어가는 leakage.
+FOLD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_folds")
+
 DATASETS = {
-    "ballroom": ("/disk1/taegum/mnt/labeled_data/ballroom/data", "/disk1/taegum/mnt/labeled_data/ballroom/label", "val", args.validation_fold),
+    "ballroom": ("/disk1/taegum/mnt/labeled_data/ballroom/data", f"{FOLD_ROOT}/ballroom/label", "val", args.validation_fold),
+    "hainsworth": ("/disk1/taegum/mnt/labeled_data/hains/data", f"{FOLD_ROOT}/hainsworth/label", "val", args.validation_fold),
+    "rwc_popular": ("/disk1/taegum/mnt/labeled_data/rwc_popular/data", f"{FOLD_ROOT}/rwc_popular/label", "val", args.validation_fold),
+    "carnatic": ("/disk4/taegum/carnatic/data", f"{FOLD_ROOT}/carnatic/label", "val", args.validation_fold),
+    "harmonix": ("/disk4/taegum/harmonix_griffinlim/audio", f"{FOLD_ROOT}/harmonix/label", "val", args.validation_fold),
+    # 아래 3개는 train.py에 CLI 인자가 없거나(gtzan/beatles) 이번 arm에서 안 넘겼으므로
+    # 체크포인트가 한 번도 본 적 없는 데이터셋 - zero-shot 측정용.
     "beatles": ("/disk1/taegum/mnt/labeled_data/beatles/data", "/disk1/taegum/mnt/labeled_data/beatles/label", "val", args.validation_fold),
-    "hainsworth": ("/disk1/taegum/mnt/labeled_data/hains/data", "/disk1/taegum/mnt/labeled_data/hains/label", "val", args.validation_fold),
-    "rwc_popular": ("/disk1/taegum/mnt/labeled_data/rwc_popular/data", "/disk1/taegum/mnt/labeled_data/rwc_popular/label", "val", args.validation_fold),
-    # carnatic/harmonix: 8-fold CV용 .folds 파일이 없어서 validation_fold 값과
-    # 무관하게 dataloader.py가 80/10/10 fallback split을 자동으로 씀 (train.py와
-    # 동일한 동작 - 학습 때 "val"로 뺐던 곡들과 정확히 같은 곡들이 여기서도 나옴).
-    "carnatic": ("/disk4/taegum/carnatic/data", "/disk4/taegum/carnatic/label", "val", args.validation_fold),
-    "harmonix": ("/disk4/taegum/harmonix_griffinlim/audio", "/disk4/taegum/harmonix_griffinlim/annotations_urinieto", "val", args.validation_fold),
     "gtzan": ("/disk1/taegum/mnt/labeled_data/gtzan/data", "/disk1/taegum/mnt/labeled_data/gtzan/label", "full-val", None),
-    "smc": ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio", "/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Annotations", "full-val", None),
+    # SMC_MIREX_Annotations 디렉토리는 비어 있음(실제 주석은 _05_08_2014 쪽).
+    # 학습이 쓰는 dataset_folds/smc/label과 같은 걸 씀.
+    "smc": ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio", f"{FOLD_ROOT}/smc/label", "full-val", None),
 }
 
 AUDIO_SAMPLE_RATE = 22050
@@ -96,7 +106,7 @@ model = model_module.create_beatfcos_model(
     num_classes=2, clusters=training_data_clusters, args=None,
     head_type=args.head_type,
     # dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,  # nhead=2는 dilated head가 죽는 버그 - args.nhead로 대체
-    dmodel=128, nhead=args.nhead, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,
+    dmodel=args.dmodel, nhead=args.nhead, d_hid=args.d_hid, nlayers=9, attn_len=5, dropout=0.1,
     downbeat_weight=0.6, audio_downsampling_factor=AUDIO_DOWNSAMPLING_FACTOR,
     centerness=False, postprocessing_type="soft_nms",
     audio_sample_rate=AUDIO_SAMPLE_RATE, backbone_type="wavebeat",

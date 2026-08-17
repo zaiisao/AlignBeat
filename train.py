@@ -91,6 +91,16 @@ parser.add_argument('--epochs', help='Number of epochs', type=int, default=100)
 # 안에 맞추며 정상 수렴.
 parser.add_argument('--lr', type=float, default=None)
 parser.add_argument('--patience', type=int, default=3)
+# Beat Transformer 학습 레시피(논문 4.2절): RAdam + Lookahead, lr 1e-3, validation이
+# 2 epoch 정체하면 1/5로 감쇠, 하한 1e-7. 지금 돌던 설정(plain Adam, 고정 3e-4,
+# patience=10이라 스케줄러가 한 번도 발동 안 함)은 FCOS 계열에서 물려받은 것이라
+# 지금 쓰는 encoder에도 subset head에도 맞춰진 적이 없음. 기본값은 기존 그대로.
+parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'radam_lookahead'])
+parser.add_argument('--lookahead_k', type=int, default=5)
+parser.add_argument('--lookahead_alpha', type=float, default=0.5)
+parser.add_argument('--lr_factor', type=float, default=0.1)   # torch 기본값
+parser.add_argument('--lr_patience', type=int, default=None)  # None이면 --patience를 씀
+parser.add_argument('--min_lr', type=float, default=0.0)
 parser.add_argument('--ninputs', type=int, default=1)
 parser.add_argument('--noutputs', type=int, default=2)
 parser.add_argument('--nblocks', type=int, default=8)
@@ -172,9 +182,19 @@ parser.add_argument('--learn_b', action='store_true', default=False)
 # gamma: eq. (8)에서 background(미매칭 후보) 항의 가중치. N=160 후보 중 실제 이벤트가
 # 보통 60~70개라 나머지 ~100개가 전부 background 신호를 냄.
 parser.add_argument('--gamma', type=float, default=0.5)
+# --no_event_norm: eq.(8)을 논문 그대로(한 fragment에 대한 정규화 없는 단순 합)로 계산.
+# 현재 기본값은 /M + fragment 평균인데, 이건 문서화된 의도적 deviation이고 부작용이
+# 하나 있음: 완전히 2배속으로 뽑힌 트랙의 background 비용이 (M-1)/M * gamma*log2 로
+# M과 무관하게 ~0.347에 saturate함. 논문의 단순 합이면 (M-1)*gamma*log2 로 M에 비례해
+# 커진다. 즉 doubling penalty가 부족하다면 그건 논문 설계가 아니라 우리 정규화 탓.
+parser.add_argument('--no_event_norm', action='store_true', default=False)
 # omega_db: eq. (8)의 클래스별 가중치. downbeat은 beat보다 약 1/L배로 드물어서
 # (section 9.3) 매칭된 downbeat 분류 오차를 더 세게 반영함. omega_beat = 1.0 고정.
 parser.add_argument('--omega_db', type=float, default=2.0)
+# cont_weight: 서브윈도별 기대 이벤트 수의 log 분산. 전역 2배속에는 불변이라
+# (log 2n = log n + const) octave error가 아니라 tempo 불안정성을 겨냥함. 미검증.
+parser.add_argument('--cont_weight', type=float, default=0.0)
+parser.add_argument('--cont_windows', type=int, default=8)
 # tau: Algorithm 3의 신뢰도 threshold. 학습 후 val에서 sweep하는 값이고, beat와
 # downbeat의 confidence 분포가 달라 따로 둘 수 있게 함(FCOS 경로에서도 그랬음).
 parser.add_argument('--tau_beat', type=float, default=0.2)
@@ -543,8 +563,18 @@ if __name__ == '__main__':
     beatfcos.training = True
     print(f'[MEM] after model init: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
 
-    optimizer = torch.optim.Adam(beatfcos.parameters(), lr=args.lr, weight_decay=1e-4) # Default weight decay is 0
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=args.patience, verbose=True)
+    if args.optimizer == 'radam_lookahead':
+        from beatfcos.optim import Lookahead
+        base_optimizer = torch.optim.RAdam(beatfcos.parameters(), lr=args.lr, weight_decay=1e-4)
+        optimizer = Lookahead(base_optimizer, k=args.lookahead_k, alpha=args.lookahead_alpha)
+        print(f"[optim] RAdam + Lookahead(k={args.lookahead_k}, alpha={args.lookahead_alpha}) lr={args.lr}")
+    else:
+        optimizer = torch.optim.Adam(beatfcos.parameters(), lr=args.lr, weight_decay=1e-4) # Default weight decay is 0
+    lr_patience = args.patience if args.lr_patience is None else args.lr_patience
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=lr_patience, factor=args.lr_factor,
+        min_lr=args.min_lr, verbose=True)
+    print(f"[optim] scheduler: patience={lr_patience} factor={args.lr_factor} min_lr={args.min_lr}")
 
     # checkpoint_path와 짝이 되는 optim_{epoch}.pt가 있으면 optimizer/scheduler
     # state도 이어서 복원함 - 없으면(옛날 체크포인트 등) 그냥 새 optimizer로
@@ -607,7 +637,15 @@ if __name__ == '__main__':
                 classification_loss = classification_loss.mean()
                 regression_loss = regression_loss.mean()
                 leftness_loss = leftness_loss.mean()
-                adjacency_constraint_loss = torch.zeros(1).to(adjacency_constraint_loss.device) if args.no_adj else adjacency_constraint_loss.mean()
+                # --no_adj는 anchor 기반 head의 adjacency 항을 끄는 플래그인데, subset
+                # head는 그 슬롯을 continuity 항 전달에 쓰고 있음(model_module.py 참고).
+                # 여기서 무조건 0으로 덮으면 --cont_weight가 조용히 no-op이 됨
+                # (criterion 안에서는 total에 더해져 로그에는 켜진 것처럼 보이는데
+                # optimizer까지는 못 감). subset head에서는 덮지 않는다.
+                if args.no_adj and args.head_type != 'subset':
+                    adjacency_constraint_loss = torch.zeros(1).to(adjacency_constraint_loss.device)
+                else:
+                    adjacency_constraint_loss = adjacency_constraint_loss.mean()
                 phase_loss = phase_loss.mean()
 
                 cls_losses.append(classification_loss.item())
@@ -621,6 +659,19 @@ if __name__ == '__main__':
                 if bool(loss == 0):
                     continue
 
+                # Belt and braces for every head type. A single non-finite loss
+                # backpropagates NaN into every weight and the run is dead, but the
+                # epoch loop keeps spinning and validation keeps reporting a frozen
+                # model -- so it costs hours before anyone notices. Observed live on
+                # subset_nosmc (epoch 0 iteration 194: "BG: nan", then seven epochs of
+                # 0.00000 losses and 0.000 scores). The head-level guard in
+                # SubsetCriterion catches the known source; this catches the rest.
+                if not torch.isfinite(loss):
+                    print(f"[train] WARNING: non-finite loss at epoch {epoch_num} "
+                          f"iteration {iter_num}; skipping optimizer step", flush=True)
+                    optimizer.zero_grad()
+                    continue
+
                 loss.backward()
 
                 # --grad_clip을 명시적으로 안 주면 기존처럼 자동 선택
@@ -631,8 +682,27 @@ if __name__ == '__main__':
                 else:
                     clip_norm = args.grad_clip
 
+                # Check the GRADIENTS, not just the loss. A finite loss is not enough:
+                # log_softmax is computed over the whole batch at once, so a fragment
+                # whose logits are NaN stays in the graph even when its loss terms are
+                # dropped, and grad_weight = grad_out^T @ activation turns 0 x NaN into
+                # NaN. clip_grad_norm_ then spreads that single NaN across EVERY
+                # parameter (total_norm becomes NaN, so every grad is scaled by NaN).
+                # clip_grad_norm_ conveniently returns the pre-clip total norm, so this
+                # costs one extra scalar read on the path that already computes it.
                 if clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
+                    total_norm = torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
+                    grads_finite = bool(torch.isfinite(total_norm))
+                else:
+                    grads_finite = all(
+                        bool(torch.isfinite(p.grad).all())
+                        for p in beatfcos.parameters() if p.grad is not None)
+
+                if not grads_finite:
+                    print(f"[train] WARNING: non-finite gradients at epoch {epoch_num} "
+                          f"iteration {iter_num}; skipping optimizer step", flush=True)
+                    optimizer.zero_grad()
+                    continue
 
                 optimizer.step()
 

@@ -380,9 +380,17 @@ class SubsetCriterion(nn.Module):
 
     def __init__(self, b_scale=0.005, gamma=0.5, omega_downbeat=2.0, omega_beat=1.0,
                  learn_b=False, b_momentum=0.9, b_min=1e-4, normalize_by_events=True,
-                 diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7):
+                 diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7,
+                 cont_weight=0.0, cont_windows=8):
         super(SubsetCriterion, self).__init__()
         self.gamma = gamma
+        # cont_weight > 0: penalise the variance of the log expected event count across
+        # sub-windows of the fragment. Non-separable over candidates, so unlike the
+        # per-candidate background term it can charge for structure rather than count.
+        # NOTE: invariant to a GLOBAL doubling (log 2n = log n + const), so it targets
+        # tempo INSTABILITY, not octave errors. Never trained yet.
+        self.cont_weight = cont_weight
+        self.cont_windows = cont_windows
         # Printed from inside the criterion rather than returned to train.py because
         # under DataParallel the forward runs on a replica, so an attribute set here
         # never reaches the parent module.
@@ -406,6 +414,23 @@ class SubsetCriterion(nn.Module):
     @property
     def lambda_l1(self):
         return 1.0 / float(self.b.clamp(min=self.b_min))
+
+    def _continuity_term(self, log_probabilities_b, t_hat_b):
+        """Var_w( log sum_{j in w} q_j ), q_j = 1 - p_j(background).
+
+        Under a constant tempo the expected number of emitted events per sub-window is
+        constant, so the variance is a tempo-consistency penalty that needs no tempo
+        label. It is not separable over candidates, which is exactly what lets it charge
+        for a coherent doubled pulse train."""
+        q = 1.0 - log_probabilities_b[:, BACKGROUND].exp()
+        span_end = float(t_hat_b.detach().max())
+        if not (span_end > 0.0):
+            return q.sum() * 0.0
+        W = int(self.cont_windows)
+        index = (t_hat_b.detach() / span_end * W).long().clamp(0, W - 1)
+        counts = torch.zeros(W, device=q.device, dtype=q.dtype).index_add_(0, index, q)
+        log_counts = torch.log(counts + 1e-3)
+        return ((log_counts - log_counts.mean()) ** 2).mean()
 
     def build_cost(self, log_probabilities, t_hat, event_classes, event_times):
         """Per-pair cost (3) plus the section 7.2 background correction.
@@ -481,6 +506,7 @@ class SubsetCriterion(nn.Module):
         # each fragment is scaled by its own denominator and the batch is averaged, so
         # a fragment's effective weight never depends on what it is batched with.
         class_terms, time_terms, background_terms = [], [], []
+        continuity_terms = []
         matched_residuals = []
         total_events = 0
         contributing_fragments = 0
@@ -488,6 +514,7 @@ class SubsetCriterion(nn.Module):
         class_spread_sum, class_spread_count = 0.0, 0
         infeasible = 0
         non_finite = 0
+        non_finite_logits = 0
         unlabelled_events = 0
 
         for b in range(batch_size):
@@ -548,9 +575,31 @@ class SubsetCriterion(nn.Module):
             # "element 0 of tensors does not require grad" -- which is exactly how the
             # first version of this guard killed a run.
             if not cost_is_finite:
+                # The cost can be non-finite for two very different reasons and they
+                # need opposite handling.
+                #
+                #   (a) the cost blew up but the probabilities are still finite -- the
+                #       DP cannot backtrack, but a background term is safe and keeps
+                #       the fragment contributing something sane.
+                #
+                #   (b) the LOGITS themselves are NaN, so `background` is NaN too.
+                #       Appending it puts NaN straight into the total; backward() then
+                #       writes NaN into every weight and the run is dead while the
+                #       epoch loop keeps spinning on a frozen model. Observed live:
+                #       subset_nosmc, epoch 0 iteration 194 -- "BG: nan" with CLS still
+                #       finite (that fragment's NaN, its batchmates' CLS fine), then
+                #       every subsequent iteration 0.00000/nan for seven epochs.
+                #
+                # So drop the fragment entirely in case (b).
                 non_finite += 1
-                background_terms.append(background.sum() / max(float(M), 1.0))
-                contributing_fragments += 1
+                if bool(torch.isfinite(background).all()):
+                    background_terms.append(background.sum() / max(float(M), 1.0))
+                    contributing_fragments += 1
+                else:
+                    non_finite_logits += 1
+                    print(f"[subset] WARNING: NaN/Inf class logits in fragment {b} "
+                          f"(M={M}); fragment dropped to keep NaN out of backward",
+                          flush=True)
                 continue
 
             sigma = torch.from_numpy(sigma_np).to(class_logits.device)
@@ -583,11 +632,22 @@ class SubsetCriterion(nn.Module):
             unmatched[sigma] = False
             background_terms.append(background[unmatched].sum() / denominator)
 
+            if self.cont_weight > 0.0:
+                continuity_terms.append(self._continuity_term(
+                    log_probabilities_b, t_hat[b]))
+
             total_events += M
             contributing_fragments += 1
 
         device = class_logits.device
-        zero = torch.zeros((), device=device)
+        # NOT torch.zeros(): if every fragment in the batch was dropped, a constant
+        # zero total carries no grad_fn and backward() raises "element 0 of tensors
+        # does not require grad", turning a skippable batch into a dead run. Zeroing a
+        # sum of the logits keeps the graph attached and contributes exactly zero
+        # gradient.
+        # nan_to_num first: a plain class_logits.sum() is NaN when the batch is the
+        # very thing this guards against, and NaN * 0.0 is still NaN.
+        zero = torch.nan_to_num(class_logits).sum() * 0.0
         loss_class = torch.stack(class_terms).sum() if class_terms else zero
         loss_time = torch.stack(time_terms).sum() if time_terms else zero
         loss_background = torch.stack(background_terms).sum() if background_terms else zero
@@ -603,7 +663,13 @@ class SubsetCriterion(nn.Module):
             'time': loss_time / batch_denominator,
             'background': self.gamma * loss_background / batch_denominator,
         }
-        losses['total'] = losses['class'] + losses['time'] + losses['background']
+        if continuity_terms:
+            losses['continuity'] = (self.cont_weight * torch.stack(continuity_terms).sum()
+                                    / batch_denominator)
+        else:
+            losses['continuity'] = zero
+        losses['total'] = (losses['class'] + losses['time'] + losses['background']
+                           + losses['continuity'])
 
         if self.learn_b and matched_residuals:
             self._update_b(torch.cat(matched_residuals))
@@ -616,6 +682,7 @@ class SubsetCriterion(nn.Module):
             'num_events': total_events,
             'infeasible': infeasible,
             'non_finite': non_finite,
+            'non_finite_logits': non_finite_logits,
             'unlabelled_events': unlabelled_events,
             'b': float(self.b),
             'lambda_l1': self.lambda_l1,

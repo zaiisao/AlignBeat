@@ -326,6 +326,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 gamma=kwargs.get('gamma', 0.5),
                 omega_downbeat=kwargs.get('omega_db', 2.0),
                 learn_b=kwargs.get('learn_b', False),
+                cont_weight=kwargs.get('cont_weight', 0.0),
+                cont_windows=kwargs.get('cont_windows', 8),
+                normalize_by_events=not kwargs.get('no_event_norm', False),
             )
         elif self.head_type == "fcos_lite":
             # P1(레벨 0) 제거 + classification/regression head 통합 (안재훈 박사님
@@ -506,12 +509,16 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
         losses, _stats = self.subset_criterion(class_logits, t_hat, targets)
 
+        # train.py는 5-tuple을 받아 전부 더해서 backward함. tempo 실험 항들을
+        # 여기서 돌려주지 않으면 loss에는 잡히지만 optimizer까지 가지 못함 -
+        # 4/5번 슬롯(원래 leftness/adjacency 자리, subset에서는 미사용)에 실어
+        # 보내고 train.py의 ADJ/PHA 칼럼으로 그대로 로깅되게 한다.
         zero = torch.zeros((), device=class_logits.device)
         return (
             losses['class'].unsqueeze(0),
             losses['time'].unsqueeze(0),
             losses['background'].unsqueeze(0),
-            zero.unsqueeze(0),
+            losses['continuity'].unsqueeze(0),
             zero.unsqueeze(0),
         )
 
