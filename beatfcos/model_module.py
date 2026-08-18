@@ -327,6 +327,9 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 omega_downbeat=kwargs.get('omega_db', 2.0),
                 learn_b=kwargs.get('learn_b', False),
                 cont_weight=kwargs.get('cont_weight', 0.0),
+                lambda_r=kwargs.get('lambda_r', 0.0),
+                meter_length=kwargs.get('meter_length', 0),
+                marginal=kwargs.get('marginal', False),
                 cont_windows=kwargs.get('cont_windows', 8),
                 normalize_by_events=not kwargs.get('no_event_norm', False),
             )
@@ -519,7 +522,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             losses['time'].unsqueeze(0),
             losses['background'].unsqueeze(0),
             losses['continuity'].unsqueeze(0),
-            zero.unsqueeze(0),
+            losses['periodicity'].unsqueeze(0),
         )
 
     # downbeat_score_threshold: 안 주면(None) score_threshold가 beat/downbeat

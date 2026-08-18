@@ -195,6 +195,20 @@ parser.add_argument('--omega_db', type=float, default=2.0)
 # (log 2n = log n + const) octave error가 아니라 tempo 불안정성을 겨냥함. 미검증.
 parser.add_argument('--cont_weight', type=float, default=0.0)
 parser.add_argument('--cont_windows', type=int, default=8)
+# lambda_r: 논문 9.4절 eq.(17) periodicity regularizer. 연속한 예측 downbeat 간격이
+# L * (모델 자신의 평균 매칭 간격)에서 벗어나는 정도를 벌점화함. 0이면 off.
+# meter_L=0이면 fragment마다 GT에서 L(마디당 박 수)을 직접 구함 - 실측 결과
+# ballroom 3.98 / harmonix 4.03 / carnatic 6.01이라 데이터셋 메타데이터가 필요 없음.
+# (bar-level 진단: 우리 모델은 carnatic에서 마디당 4.82박을 예측 - 6박 tala에 4박
+# 마디를 씌우고 있음. 이 항이 정확히 그걸 겨냥함.)
+parser.add_argument('--lambda_r', type=float, default=0.0)
+parser.add_argument('--meter_L', type=int, default=0)
+# --marginal: 논문 7.2절. hard DP로 sigma 하나를 고르는 대신 모든 order-preserving
+# injection에 대해 주변화한 -log Z(eq. 14)로 학습. stop-gradient가 필요 없음.
+# 근거(실측, temp_wide): sigma posterior가 ballroom에서는 사실상 point mass(유효
+# 대안 ~1.2개)지만 carnatic에서는 ~18개로 퍼져 있고 결정적인 곡이 하나도 없음.
+# 즉 hard EM이 가장 약한 데이터셋에서 임의의 배정 하나에 확신을 갖고 학습 중.
+parser.add_argument('--marginal', action='store_true', default=False)
 # tau: Algorithm 3의 신뢰도 threshold. 학습 후 val에서 sweep하는 값이고, beat와
 # downbeat의 confidence 분포가 달라 따로 둘 수 있게 함(FCOS 경로에서도 그랬음).
 parser.add_argument('--tau_beat', type=float, default=0.2)
@@ -547,6 +561,7 @@ if __name__ == '__main__':
     else:
         training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.93286828])
 
+    dict_args['meter_length'] = args.meter_L
     beatfcos = model_module.create_beatfcos_model(num_classes=2, clusters=training_data_clusters, args=args, **dict_args)
 
     if torch.cuda.is_available():

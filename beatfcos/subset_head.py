@@ -146,7 +146,18 @@ class SubsetSelectionHead(nn.Module):
         self._initialize_weights(class_prior)
 
     def _initialize_weights(self, class_prior):
+        # candidate_attention (section 9.2) is skipped: nn.TransformerEncoder ships its
+        # own Xavier init, and sweeping every nn.Linear here overwrote out_proj/linear1/
+        # linear2 with Kaiming-relu while in_proj_weight escaped (it is a raw Parameter,
+        # not a Linear). Measured: weight std 0.088 vs the stock 0.036, and the block
+        # multiplied the activation scale by 2.24 instead of preserving it - so the two
+        # halves of the same attention block were initialised inconsistently.
+        attention_modules = set()
+        if self.candidate_attention is not None:
+            attention_modules = {id(m) for m in self.candidate_attention.modules()}
         for m in self.modules():
+            if id(m) in attention_modules:
+                continue
             if isinstance(m, (nn.Conv1d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
@@ -381,7 +392,8 @@ class SubsetCriterion(nn.Module):
     def __init__(self, b_scale=0.005, gamma=0.5, omega_downbeat=2.0, omega_beat=1.0,
                  learn_b=False, b_momentum=0.9, b_min=1e-4, normalize_by_events=True,
                  diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7,
-                 cont_weight=0.0, cont_windows=8):
+                 cont_weight=0.0, cont_windows=8, lambda_r=0.0, meter_length=0,
+                 marginal=False):
         super(SubsetCriterion, self).__init__()
         self.gamma = gamma
         # cont_weight > 0: penalise the variance of the log expected event count across
@@ -391,6 +403,33 @@ class SubsetCriterion(nn.Module):
         # tempo INSTABILITY, not octave errors. Never trained yet.
         self.cont_weight = cont_weight
         self.cont_windows = cont_windows
+        # Section 9.4, equation (17). Penalises deviation of consecutive predicted
+        # DOWNBEAT spacing from L beat periods, where the beat period is estimated
+        # differentiably from the model's own matched candidates:
+        #     Delta_bar = mean_i ( t_sigma(i+1) - t_sigma(i) )  over all M matched
+        #     R = sum_k ( t_sigma(i_{k+1}) - t_sigma(i_k) - L * Delta_bar )^2
+        # Added after sigma_hat is fixed (it depends on the whole matched downbeat
+        # sequence, so it cannot be a per-pair term in L_match). lambda_r = 0 is off.
+        # meter_length = 0 derives L per fragment from the ground truth as the median
+        # number of events between consecutive downbeats - the paper assumes L known
+        # at dataset/track level, and the annotations already carry it (measured:
+        # ballroom 3.98, harmonix 4.03, carnatic 6.01 beats per bar).
+        self.lambda_r = lambda_r
+        self.meter_length = meter_length
+        # Section 7.2: train on the marginal likelihood over EVERY order-preserving
+        # injection instead of one hard-selected sigma. Writing g_j = -log p_j(empty),
+        # the full loss of section 7 is
+        #     sum_i L_match(i, sigma(i)) + gamma * sum_{j not in im(sigma)} g_j
+        #   = sum_i [ L_match(i, sigma(i)) - gamma * g_sigma(i) ] + gamma * sum_j g_j
+        # and the bracketed quantity is exactly build_cost's `corrected`. So the
+        # marginal loss (14) is -log Z over that corrected cost, plus the same
+        # sigma-independent gamma * sum_j g_j. No stop-gradient: unlike the hard path,
+        # every quantity here is differentiable.
+        # Measured motivation (temp_wide, val): the posterior over sigma is a near
+        # point mass on ballroom (~1.2 effective assignments) but broad on carnatic
+        # (~18, no song deterministic), so hard EM commits arbitrarily on exactly the
+        # dataset where we are weakest.
+        self.marginal = marginal
         # Printed from inside the criterion rather than returned to train.py because
         # under DataParallel the forward runs on a replica, so an attribute set here
         # never reaches the parent module.
@@ -414,6 +453,25 @@ class SubsetCriterion(nn.Module):
     @property
     def lambda_l1(self):
         return 1.0 / float(self.b.clamp(min=self.b_min))
+
+    def _periodicity_term(self, matched_times, event_classes):
+        """Equation (17). matched_times = t_hat[sigma] in event order, (M,)."""
+        if matched_times.numel() < 3:
+            return None
+        downbeat_positions = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
+        if downbeat_positions.numel() < 2:
+            return None                                  # no consecutive downbeat pair
+        delta_bar = (matched_times[1:] - matched_times[:-1]).mean()
+        if self.meter_length > 0:
+            L = float(self.meter_length)
+        else:
+            gaps = (downbeat_positions[1:] - downbeat_positions[:-1]).float()
+            L = float(gaps.median())                     # beats per bar, from the GT
+            if not (L >= 1.0):
+                return None
+        predicted = matched_times[downbeat_positions]
+        residual = (predicted[1:] - predicted[:-1]) - L * delta_bar
+        return (residual ** 2).sum()
 
     def _continuity_term(self, log_probabilities_b, t_hat_b):
         """Var_w( log sum_{j in w} q_j ), q_j = 1 - p_j(background).
@@ -506,7 +564,7 @@ class SubsetCriterion(nn.Module):
         # each fragment is scaled by its own denominator and the batch is averaged, so
         # a fragment's effective weight never depends on what it is batched with.
         class_terms, time_terms, background_terms = [], [], []
-        continuity_terms = []
+        continuity_terms, periodicity_terms = [], []
         matched_residuals = []
         total_events = 0
         contributing_fragments = 0
@@ -602,6 +660,17 @@ class SubsetCriterion(nn.Module):
                           flush=True)
                 continue
 
+            if self.marginal:
+                denominator = float(M) if self.normalize_by_events else 1.0
+                # (14): -log Z over the corrected cost, plus gamma * sum_j g_j.
+                # `corrected` is built above for the hard DP and reused verbatim.
+                log_z = subset_select_logsumexp(corrected)
+                class_terms.append(-log_z / denominator)
+                background_terms.append(background.sum() / denominator)
+                total_events += M
+                contributing_fragments += 1
+                continue
+
             sigma = torch.from_numpy(sigma_np).to(class_logits.device)
 
             # --- loss (8), matched terms -------------------------------------
@@ -631,6 +700,11 @@ class SubsetCriterion(nn.Module):
             unmatched = torch.ones(num_candidates, dtype=torch.bool, device=class_logits.device)
             unmatched[sigma] = False
             background_terms.append(background[unmatched].sum() / denominator)
+
+            if self.lambda_r > 0.0:
+                r_term = self._periodicity_term(t_hat[b][sigma], event_classes)
+                if r_term is not None:
+                    periodicity_terms.append(r_term / denominator)
 
             if self.cont_weight > 0.0:
                 continuity_terms.append(self._continuity_term(
@@ -668,8 +742,10 @@ class SubsetCriterion(nn.Module):
                                     / batch_denominator)
         else:
             losses['continuity'] = zero
+        losses['periodicity'] = ((self.lambda_r * torch.stack(periodicity_terms).sum()
+                                  / batch_denominator) if periodicity_terms else zero)
         losses['total'] = (losses['class'] + losses['time'] + losses['background']
-                           + losses['continuity'])
+                           + losses['continuity'] + losses['periodicity'])
 
         if self.learn_b and matched_residuals:
             self._update_b(torch.cat(matched_residuals))
