@@ -632,14 +632,9 @@ if __name__ == '__main__':
         # Lookahead's model is the slow sequence; training runs on fast weights and an
         # epoch boundary almost never coincides with a sync (313 iters, k=5), so evaluate
         # and checkpoint the slow weights and restore the fast ones afterwards.
-        _la_cache = optimizer.sync_to_slow() if hasattr(optimizer, 'sync_to_slow') else None
         beatfcos.eval()
         _, _, highest_joint_f_measure = evaluate_macro_joint_f_measure(beatfcos, label="Resume check")
         print(f"resume 기준점(highest_joint_f_measure) = {highest_joint_f_measure:0.3f}")
-        if _la_cache is not None:
-            optimizer.restore_fast(_la_cache)
-            _la_cache = None
-
     for epoch_num in range(start_epoch, args.epochs):
         beatfcos.train()
 
@@ -807,12 +802,16 @@ if __name__ == '__main__':
 
         print(f'[MEM] before eval: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
         print('Evaluating dataset')
-        # Lookahead reports the SLOW sequence. Training runs on fast weights and an epoch
-        # boundary essentially never coincides with a sync (313 iterations, k=5), so both
-        # the score and the checkpoint below would otherwise be the fast model - i.e. not
-        # the optimizer we claim to be using. Swap in the slow weights for eval+save and
-        # restore the fast ones before the next epoch.
-        _la_cache = optimizer.sync_to_slow() if hasattr(optimizer, 'sync_to_slow') else None
+        # NOTE [Lookahead]: this evaluates the FAST weights. Lookahead's reported model is
+        # the slow sequence, and with 313 iterations per epoch and k=5 an epoch boundary
+        # essentially never lands on a sync, so the reported score is not the Lookahead
+        # average. Swapping the slow weights in for eval+save was tried and REVERTED: it
+        # made every resumed run score 0.000 at the next epoch while the training loss
+        # stayed healthy, and the cause was not identified (it is not the model/optimizer
+        # weight mismatch - saving fast weights for resume did not fix it). Reverting is
+        # the conservative choice: fast-weight evaluation is at least self-consistent and
+        # matches every number produced so far. optim.py still carries sync_to_slow() /
+        # restore_fast() for offline use on a checkpoint.
         beat_mean_f_measure, downbeat_mean_f_measure, joint_f_measure = evaluate_macro_joint_f_measure(
             beatfcos, label=f"Epoch = {epoch_num}")
 
@@ -841,10 +840,6 @@ if __name__ == '__main__':
             # 20 에폭 넘게 이전 best를 못 넘는 정체가 있었음).
             new_optim_path = os.path.join(args.checkpoint_dir, 'optim_{}.pt'.format(epoch_num))
             torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict()}, new_optim_path)
-
-        if _la_cache is not None:
-            optimizer.restore_fast(_la_cache)
-            _la_cache = None
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
