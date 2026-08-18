@@ -36,9 +36,32 @@ p.add_argument('--validation_fold', type=int, default=0)
 p.add_argument('--threshold', type=float, default=0.5)
 p.add_argument('--checkpoint_dir', type=str, default='./checkpoints_bt_baseline')
 p.add_argument('--log_file', type=str, default='./bt_baseline.log')
+# Beat This spectrogram corpus. Lets this same BCE baseline be trained on THEIR corpus
+# as well as ours, which is what makes Beat Transformer and Beat This comparable at all:
+# today they differ in architecture AND in training data, so neither comparison isolates
+# either factor. 50 fps (hop 441) instead of our 43.07, so the frame<->second constants
+# below switch with it.
+# --with_smc adds SMC to the AUDIO pipeline's dataset list. Point of the flag: our
+# subset head loses 0.085 macro joint when SMC is added (0.775 -> 0.690) while the two
+# FCOS heads lose only ~0.033 (0.620 -> 0.586, 0.633 -> 0.601). The composition penalty
+# (SMC entering the average at ~0.45, and contributing nothing to the downbeat mean) is
+# identical for every head, so the ~0.05 excess looks specific to the subset head - most
+# likely its beat-only path (CLASS_BEAT_ONLY -> section 7.1 marginal + EM pseudo-label),
+# which the FCOS heads do not have. This BCE head IS Beat Transformer's non-demix head,
+# so running it with and without SMC says whether the excess is ours or the data's.
+p.add_argument('--with_smc', action='store_true', default=False)
+p.add_argument('--spect_root', type=str, default=None)
+p.add_argument('--spect_annot_root', type=str,
+               default='/home/sogang/jaehoon/Analyze-SMC/beat_this_annotations')
+p.add_argument('--spect_datasets', type=str,
+               default='ballroom,hainsworth,rwc,harmonix,simac,smc,asap,beatles,'
+                       'candombe,filosax,groove_midi,guitarset,hjdb,jaah,tapcorrect,gtzan')
+p.add_argument('--spect_tempo_aug', type=str, default='')
+p.add_argument('--spect_pitch_aug', type=str, default='')
 args = p.parse_args()
 
-SR, DSF = 22050, 512
+SR = 22050
+DSF = 441 if args.spect_root else 512      # 50 fps for their corpus, 43.07 for ours
 TO_SEC = DSF / SR
 WINDOW = 160 * 8 * DSF          # 29.7 s: the window the subset arms TRAIN on
 # Evaluation must use the same excerpt length the subset head is evaluated with
@@ -65,8 +88,38 @@ DATA = {
     "carnatic":    ("/disk4/taegum/carnatic/data", "./dataset_folds/carnatic/label"),
     "harmonix":    ("/disk4/taegum/harmonix_griffinlim/audio", "./dataset_folds/harmonix/label"),
 }
+if args.with_smc:
+    DATA["smc"] = ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio",
+                   "./dataset_folds/smc/label")
+
+DATASET_NAMES = list(DATA.keys())   # replaced by build() when --spect_root is used
+
 
 def build(subset):
+    global DATASET_NAMES
+    if args.spect_root:
+        from beatfcos.bt_dataset import BeatThisSpectDataset
+        frames = (WINDOW if subset in ("train", "full-train") else EVAL_LENGTH) // DSF
+        names = [d.strip() for d in args.spect_datasets.split(',') if d.strip()]
+        tempo = tuple(int(v) for v in args.spect_tempo_aug.split(',') if v.strip())
+        pitch = tuple(int(v) for v in args.spect_pitch_aug.split(',') if v.strip())
+        out, kept = [], []
+        for n in names:
+            try:
+                out.append(BeatThisSpectDataset(
+                    args.spect_root, args.spect_annot_root, [n],
+                    subset=("train" if subset in ("train", "full-train") else "val"),
+                    validation_fold=args.validation_fold, target_length=frames,
+                    tempo_aug=(tempo if subset.startswith("train") else ()),
+                    pitch_aug=(pitch if subset.startswith("train") else ())))
+                kept.append(n)
+            except RuntimeError:
+                continue          # e.g. gtzan has no train split: test-only by design
+        # The eval loop zips these against dataset names; with the corpus loader the set
+        # differs from DATA.keys() (more datasets, and gtzan drops out of train), so the
+        # per-dataset rows would otherwise carry the wrong labels.
+        DATASET_NAMES = kept
+        return out
     sets = []
     for name, (adir, ldir) in DATA.items():
         sets.append(BeatDataset(adir, ldir, dataset=name, audio_sample_rate=SR,
@@ -80,6 +133,16 @@ def intervals_to_frames(annot, T):
     """(M,3) intervals -> (2,T) soft targets, widened to +-2 frames with 0.5/0.25
     weights exactly as Bock/Beat Transformer do."""
     y = torch.zeros(2, T)
+    # Beat-only datasets (SMC) carry CLASS_BEAT_ONLY and have NO downbeat annotation.
+    # Leaving the downbeat channel at 0 trains "not a downbeat" on every SMC beat -
+    # about one in four of which really is one - i.e. thousands of false negatives.
+    # Beat Transformer does not do this: spectrogram_dataset.py sets the downbeat target
+    # to MASK_VALUE = -1 for smc/musicnet and train.py:170-172 builds a weight that
+    # zeroes the loss wherever gt == -1. Mirror that, or this baseline measures a bug of
+    # ours rather than their method.
+    labs = [int(iv[2]) for iv in annot if int(iv[2]) >= 0]
+    if labs and all(l == 2 for l in labs):
+        y[1, :] = -1.0
     for iv in annot:
         lab = int(iv[2])
         if lab < 0: continue
@@ -88,6 +151,8 @@ def intervals_to_frames(annot, T):
         y[0, f] = 1.0                      # channel 0: beat (downbeats included)
         if lab == 0: y[1, f] = 1.0         # channel 1: downbeat
     for ch in range(2):
+        if float(y[ch].min()) < 0:      # masked channel: nothing to widen
+            continue
         base = y[ch].clone()
         for d, w in ((1, 0.5), (2, 0.25)):
             y[ch, d:] = torch.maximum(y[ch, d:], base[:-d] * w)
@@ -128,6 +193,7 @@ print(f"[bt-baseline] params {sum(p.numel() for p in model.parameters())/1e6:.2f
 opt = Lookahead(torch.optim.RAdam(model.parameters(), lr=args.lr, weight_decay=1e-4), k=5, alpha=0.5)
 sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', patience=5, factor=0.5, min_lr=1e-6)
 bce = nn.BCEWithLogitsLoss()
+bce_none = nn.BCEWithLogitsLoss(reduction='none')
 
 train_sets, val_sets = build("train"), build("val")
 train_loader = torch.utils.data.DataLoader(torch.utils.data.ConcatDataset(train_sets),
@@ -148,7 +214,11 @@ for epoch in range(start_epoch, args.epochs):
         T = mel.shape[1]
         y = torch.stack([intervals_to_frames(a, T) for a in annots]).cuda()   # (B,2,T)
         logits = model(mel)                                                   # (B,T,2)
-        loss = bce(logits[..., 0], y[:, 0]) + bce(logits[..., 1], y[:, 1])
+        # Masked BCE on the downbeat channel: -1 marks "no annotation" and must not
+        # contribute, exactly as Beat Transformer's weighted loss does.
+        db_mask = (y[:, 1] >= 0).float()
+        db_terms = bce_none(logits[..., 1], torch.clamp(y[:, 1], min=0.0)) * db_mask
+        loss = bce(logits[..., 0], y[:, 0]) + db_terms.sum() / db_mask.sum().clamp(min=1.0)
         # train.py가 subset head에 대해 갖고 있는 것과 같은 가드. 이게 없어서 첫 시도가
         # epoch 31에서 NaN에 빠진 뒤 6 에폭 동안 loss=nan / score=0으로 조용히 돌았음.
         if not torch.isfinite(loss):
@@ -162,7 +232,7 @@ for epoch in range(start_epoch, args.epochs):
         opt.step(); losses.append(float(loss))
     model.eval(); per = {}
     with torch.no_grad():
-        for name, ds in zip(DATA.keys(), val_sets):
+        for name, ds in zip(DATASET_NAMES, val_sets):
             bs, ds_ = [], []
             for i in range(len(ds)):
                 audio, annot, _meta = ds[i]
