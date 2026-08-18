@@ -108,3 +108,8 @@ ENV/
 # derived .folds definitions are worth versioning.
 dataset_folds/*/label/*
 !dataset_folds/*/label/*.folds
+
+# run artifacts
+*.log.nanrun
+beat_histogram_*.png
+downbeat_histogram_*.png
