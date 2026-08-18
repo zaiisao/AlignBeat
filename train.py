@@ -209,6 +209,24 @@ parser.add_argument('--meter_L', type=int, default=0)
 # mu=1000이면 벌점이 1000*(1/160)^2 = 0.039로 한 칸의 3%에 불과함 - 실제로 선택을
 # 바꾸려면 mu ~ 1e5 이상이 필요하다(1e3에서 52/60, 1e5에서 58/60 변경 확인).
 parser.add_argument('--mu_meter', type=float, default=0.0)
+# --- Beat This spectrogram corpus (Zenodo 13922116) ------------------------------
+# 16개 데이터셋 5554곡. 우리 5개 2112곡 대비 느린 템포 커버리지가 결정적으로 다름:
+# 64 BPM 미만이 375곡(우리는 15곡), 55 BPM 미만이 161곡(우리는 0곡). SMC가 64 BPM
+# 미만 37%라 이 격차가 SMC 점수의 유력한 설명임.
+# 이 코퍼스는 50 fps(hop 441)이므로 반드시 --audio_downsampling_factor 441과 같이 쓸 것.
+# (우리 기존 파이프라인은 43.07 fps. 두 프레임레이트를 한 학습에 섞으면 템포 개념이
+#  뭉개진다.) 그들의 ±20% time-stretch / -5..+6 semitone 사본이 함께 들어있다.
+parser.add_argument('--spect_root', type=str, default=None,
+                    help='dir of {dataset}.npz from the Beat This corpus; enables that loader')
+parser.add_argument('--spect_annot_root', type=str,
+                    default='/home/sogang/jaehoon/Analyze-SMC/beat_this_annotations')
+parser.add_argument('--spect_datasets', type=str,
+                    default='ballroom,hainsworth,rwc,harmonix,simac,smc,asap',
+                    help='comma separated; gtzan is test-only and never enters train')
+parser.add_argument('--spect_tempo_aug', type=str, default='',
+                    help='e.g. -20,-16,-12,-8,8,12,16,20 (percent); empty disables')
+parser.add_argument('--spect_pitch_aug', type=str, default='',
+                    help='e.g. -5,-4,-3,-2,-1,1,2,3,4,5,6 (semitones); empty disables')
 # --marginal: 논문 7.2절. hard DP로 sigma 하나를 고르는 대신 모든 order-preserving
 # injection에 대해 주변화한 -log Z(eq. 14)로 학습. stop-gradient가 필요 없음.
 # 근거(실측, temp_wide): sigma posterior가 ballroom에서는 사실상 point mass(유효
@@ -342,9 +360,37 @@ else:
 # setup the dataloaders
 train_datasets = []
 val_datasets = []
+
+if args.spect_root:
+    # Beat This corpus path: skip the audio-loading BeatDataset entirely. Their
+    # spectrograms are 50 fps (hop 441), so audio_downsampling_factor MUST be 441 for
+    # every frame<->second conversion downstream (target_sample_rate, train_length,
+    # stitching) to stay consistent.
+    from beatfcos.bt_dataset import BeatThisSpectDataset
+    if args.audio_downsampling_factor != 441:
+        raise SystemExit(
+            f"--spect_root implies 50 fps: pass --audio_downsampling_factor 441 "
+            f"(got {args.audio_downsampling_factor})")
+    _names = [d.strip() for d in args.spect_datasets.split(',') if d.strip()]
+    _tempo = tuple(int(v) for v in args.spect_tempo_aug.split(',') if v.strip())
+    _pitch = tuple(int(v) for v in args.spect_pitch_aug.split(',') if v.strip())
+    _train_frames = args.train_length // args.audio_downsampling_factor
+    _eval_frames = args.eval_length // args.audio_downsampling_factor
+    for _name in _names:
+        train_datasets.append(BeatThisSpectDataset(
+            args.spect_root, args.spect_annot_root, [_name], subset="train",
+            validation_fold=args.validation_fold, target_length=_train_frames,
+            tempo_aug=_tempo, pitch_aug=_pitch))
+        val_datasets.append(BeatThisSpectDataset(
+            args.spect_root, args.spect_annot_root, [_name], subset="val",
+            validation_fold=args.validation_fold, target_length=_eval_frames))
+    val_dataset_names = list(_names)
+    print(f"[spect] {len(_names)} datasets | train {sum(len(d) for d in train_datasets)} "
+          f"val {sum(len(d) for d in val_datasets)} | {_train_frames} frames "
+          f"({_train_frames/50.0:.1f}s at 50 fps) | tempo_aug={_tempo} pitch_aug={_pitch}")
 val_dataset_names = []  # val_datasets와 같은 순서로 데이터셋 이름 추적 (아래 macro-average 평가용)
 
-for dataset in datasets:
+for dataset in ([] if args.spect_root else datasets):
     if args.dataset_dir is not None:
         audio_dir = os.path.join(args.dataset_dir, dataset, "data")
         annot_dir = os.path.join(args.dataset_dir, dataset, "label")
