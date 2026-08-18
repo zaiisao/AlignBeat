@@ -456,6 +456,49 @@ def subset_select_logsumexp(cost):
     return previous[N]
 
 
+def subset_posterior_marginals(cost):
+    """Equation (21): the exact posterior P(sigma(i) = j | y, theta, x).
+
+    Algorithm 6 (--marginal) never needs this - it differentiates -log Z directly - but
+    the explicit E-step/M-step form of Algorithm 7 does, and it is the only way to SEE
+    the soft correspondence rather than infer it. Needs a backward pass mirroring the
+    forward recursion (19):
+
+        E~[i, j] = logsumexp( E~[i, j+1], E~[i+1, j+1] - L'match(y_{i+1}, y^_{j+1}) )
+        E~[M, j] = 0,   E~[i, N] = -inf for i < M
+
+    filled by decreasing i and j, same O(N M) cost. Combining forward, edge and backward:
+
+        w_ij = exp( D~[i-1, j-1] - L'match(y_i, y^_j) + E~[i, j] - D~[M, N] )
+
+    cost: (M, N) corrected cost. Returns (M, N) posterior; rows sum to 1.
+    """
+    M, N = cost.shape
+    device, dtype = cost.device, cost.dtype
+    neg_inf = torch.finfo(dtype).min
+
+    # forward: D[i, j] over 0..M, 0..N  (D[0, j] = 0, D[i, 0] = -inf for i >= 1)
+    D = torch.full((M + 1, N + 1), neg_inf, device=device, dtype=dtype)
+    D[0, :] = 0.0
+    for i in range(1, M + 1):
+        prev = D[i - 1, 0:N] - cost[i - 1]              # take candidate j (1-indexed j)
+        D[i, 1:] = torch.logcumsumexp(prev, dim=0)
+
+    # backward: E[i, j] = mass of assigning events i+1..M to candidates j+1..N
+    E = torch.full((M + 1, N + 1), neg_inf, device=device, dtype=dtype)
+    E[M, :] = 0.0
+    for i in range(M - 1, -1, -1):
+        for j in range(N - 1, -1, -1):
+            take = E[i + 1, j + 1] - cost[i, j]         # y_{i+1} -> y^_{j+1}, 0-indexed
+            E[i, j] = torch.logaddexp(E[i, j + 1], take)
+
+    log_z = D[M, N]
+    w = torch.empty((M, N), device=device, dtype=dtype)
+    for i in range(1, M + 1):
+        w[i - 1] = D[i - 1, 0:N] - cost[i - 1] + E[i, 1:] - log_z
+    return w.exp()
+
+
 # ---------------------------------------------------------------------------
 # Training loss (sections 4, 7)
 # ---------------------------------------------------------------------------
@@ -480,7 +523,7 @@ class SubsetCriterion(nn.Module):
                  diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7,
                  cont_weight=0.0, cont_windows=8, lambda_r=0.0, meter_length=0,
                  marginal=False, marginal_background=True, fragment_seconds=29.7215,
-                 mu_meter=0.0):
+                 mu_meter=0.0, phase_marginal=False):
         super(SubsetCriterion, self).__init__()
         self.gamma = gamma
         # cont_weight > 0: penalise the variance of the log expected event count across
@@ -530,6 +573,16 @@ class SubsetCriterion(nn.Module):
         self.fragment_seconds = fragment_seconds
         # Section 4.2: weight of equation (6) inside the SELECTION. 0 = plain Algorithm 1.
         self.mu_meter = mu_meter
+        # Equation (22): for beat-only data with a KNOWN meter L, the downbeat positions
+        # in a matched run are not independent - exactly one in every L is a downbeat,
+        # with a single unknown phase offset phi in {0..L-1} shared by the whole run.
+        # Marginalising phi gives labels mutually consistent across the run instead of
+        # equation (12)'s independent per-candidate guesses, which is the mechanism most
+        # likely behind our extra SMC penalty (-0.085 vs ~-0.03 for heads that do not
+        # take this path). Requires meter_length > 0; the spec flags that the premise
+        # breaks if the DP misassigns anywhere in the run, since one error shifts the
+        # phase for everything after it.
+        self.phase_marginal = phase_marginal
         # Printed from inside the criterion rather than returned to train.py because
         # under DataParallel the forward runs on a replica, so an attribute set here
         # never reaches the parent module.
@@ -549,6 +602,18 @@ class SubsetCriterion(nn.Module):
         self.normalize_by_events = normalize_by_events
         # buffer so it round-trips through checkpoints with the model
         self.register_buffer('b', torch.tensor(float(b_scale)))
+
+        # Print the settings that actually reached this object. Four separate flags have
+        # silently failed to arrive here (cont_weight via a zeroed loss slot, 9.2's
+        # attention default, lambda_r at an inert scale, mu_meter never plumbed through
+        # model_module), each time producing a full training run that read as a clean
+        # negative result. Cheap insurance; placed last so every field exists.
+        print(f"[subset-criterion] gamma={self.gamma} omega_db={self.omega_downbeat} "
+              f"b={float(self.b):.5f} learn_b={self.learn_b} marginal={self.marginal} "
+              f"marginal_bg={self.marginal_background} lambda_r={self.lambda_r} "
+              f"cont_weight={self.cont_weight} mu_meter={self.mu_meter} "
+              f"normalize_by_events={self.normalize_by_events}", flush=True)
+
 
     @property
     def lambda_l1(self):
@@ -955,6 +1020,8 @@ class SubsetCriterion(nn.Module):
         not yet decided (max q below the threshold), fall back to (9) rather than
         force-fitting an unreliable pseudo-label.
         """
+        if self.phase_marginal and self.meter_length > 0 and matched_log.shape[0] >= self.meter_length:
+            return self._phase_marginal_term(matched_log)
         active = torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)     # log(1-p(empty))
         marginal = -active
         if self._call_count < self.beat_only_warmup:
@@ -968,6 +1035,32 @@ class SubsetCriterion(nn.Module):
         return torch.where(confident, pseudo + marginal, marginal)
 
     @torch.no_grad()
+    def _phase_marginal_term(self, matched_log):
+        """Equation (22): marginalise the bar phase over a run of beat-only events.
+
+            P(c | x; theta, phi) = prod_i p_sigma(i)( c_i(phi) ),
+            c_i(phi) = DB if i = phi (mod L) else B,
+            P(c | x; theta) = (1/L) sum_phi P(c | x; theta, phi)
+
+        so the loss is -log P(c | x; theta) = -logsumexp_phi [ sum_i log p_i(c_i(phi)) ]
+        + log L. Unlike (12), which picks a label per candidate independently, this
+        couples the whole run through one shared latent phase: the model can be unsure
+        WHICH beat is the downbeat while still being forced to place them L apart.
+
+        Returned per event (the scalar split evenly) so the caller's per-event weighting
+        and normalisation are unchanged.
+        """
+        M = matched_log.shape[0]
+        L = int(self.meter_length)
+        index = torch.arange(M, device=matched_log.device)
+        totals = []
+        for phi in range(L):
+            is_db = (index % L) == phi
+            picked = torch.where(is_db, matched_log[:, DOWNBEAT], matched_log[:, BEAT])
+            totals.append(picked.sum())
+        log_mix = torch.logsumexp(torch.stack(totals), dim=0) - float(np.log(L))
+        return (-log_mix / M).expand(M)
+
     def _update_b(self, residuals):
         """Equation (5): b_hat = mean absolute residual over matched pairs, the
         maximum-likelihood Laplace scale. Kept as an EMA across minibatches for

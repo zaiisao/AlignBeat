@@ -209,6 +209,11 @@ parser.add_argument('--meter_L', type=int, default=0)
 # mu=1000이면 벌점이 1000*(1/160)^2 = 0.039로 한 칸의 3%에 불과함 - 실제로 선택을
 # 바꾸려면 mu ~ 1e5 이상이 필요하다(1e3에서 52/60, 1e5에서 58/60 변경 확인).
 parser.add_argument('--mu_meter', type=float, default=0.0)
+# --phase_marginal: 개정판 eq.(22). beat-only 데이터에서 meter L을 안다고 가정하고,
+# 매칭된 run 전체에 공유되는 bar phase phi를 주변화함. eq.(12)의 후보별 독립 pseudo-label
+# 대신 run 전체가 하나의 phi로 묶이므로 "어느 박이 downbeat인지 모르지만 L 간격으로는
+# 놓아야 한다"는 제약이 걸린다. --meter_L 필요.
+parser.add_argument('--phase_marginal', action='store_true', default=False)
 # --- Beat This spectrogram corpus (Zenodo 13922116) ------------------------------
 # 16개 데이터셋 5554곡. 우리 5개 2112곡 대비 느린 템포 커버리지가 결정적으로 다름:
 # 64 BPM 미만이 375곡(우리는 15곡), 55 BPM 미만이 161곡(우리는 0곡). SMC가 64 BPM
