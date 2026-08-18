@@ -428,7 +428,7 @@ def subset_select_dp_meter(cost, downbeat_positions, t_hat, meter_length, mu):
     return sigma
 
 
-def subset_select_logsumexp(cost):
+def subset_select_logsumexp(cost, lengths=None):
     """Equation (13) - the marginalised counterpart of the DP, log Z(theta, x).
 
     Same recursion with min replaced by logsumexp on the negated cost, giving the
@@ -437,23 +437,32 @@ def subset_select_logsumexp(cost):
     for the section 7.2 training mode; not used by the default hard path. Operates
     on torch tensors because, unlike Algorithm 1, this one is differentiated through.
     """
-    M, N = cost.shape
+    batched = cost.dim() == 3
+    if not batched:
+        cost = cost.unsqueeze(0)
+    B, M, N = cost.shape
     device, dtype = cost.device, cost.dtype
     if M == 0:
-        return torch.zeros((), device=device, dtype=dtype)
+        out = torch.zeros(B, device=device, dtype=dtype)
+        return out if batched else out[0]
     if M > N:
         raise ValueError(f"infeasible: M={M} > N={N}")
 
     neg_inf = torch.finfo(dtype).min
-    previous = torch.zeros(N + 1, device=device, dtype=dtype)
+    previous = torch.zeros(B, N + 1, device=device, dtype=dtype)
     for i in range(1, M + 1):
-        a = previous[0:N] - cost[i - 1]
-        # running logsumexp along j, i.e. logcumsumexp
-        accumulated = torch.logcumsumexp(a, dim=0)
-        current = torch.full((N + 1,), neg_inf, device=device, dtype=dtype)
-        current[1:] = accumulated
+        a = previous[:, 0:N] - cost[:, i - 1]
+        accumulated = torch.logcumsumexp(a, dim=1)     # running logsumexp along j
+        current = torch.full((B, N + 1), neg_inf, device=device, dtype=dtype)
+        current[:, 1:] = accumulated
+        if lengths is not None:
+            # padded steps are exact no-ops: a fragment that has consumed all M_b of its
+            # events simply stops advancing, landing on the same table entry the
+            # unpadded recursion would.
+            current = torch.where((lengths >= i).unsqueeze(1), current, previous)
         previous = current
-    return previous[N]
+    out = previous[:, N]
+    return out if batched else out[0]
 
 
 def subset_posterior_marginals(cost):
@@ -845,7 +854,15 @@ class SubsetCriterion(nn.Module):
             if self.marginal:
                 denominator = float(M) if self.normalize_by_events else 1.0
                 # (14): -log Z over the corrected cost, plus gamma * sum_j g_j.
-                # `corrected` is built above for the hard DP and reused verbatim.
+                # REBUILD the cost here: the `corrected` computed above lives inside a
+                # `with torch.no_grad()` block that exists for the hard path, whose DP
+                # only needs a detached matrix. The marginal path differentiates THROUGH
+                # the cost, so reusing it yields a class term with requires_grad=False -
+                # the loss still falls via the background term while the class logits
+                # never learn, and every candidate stays at its initialisation prior and
+                # decodes nothing. That is exactly what killed three marginal arms.
+                corrected = self.build_cost(
+                    log_probabilities_b, t_hat[b], event_classes, event_times)[0]
                 log_z = subset_select_logsumexp(corrected)
                 class_terms.append(-log_z / denominator)
                 if self.marginal_background:
