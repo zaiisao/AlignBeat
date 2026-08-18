@@ -203,12 +203,22 @@ parser.add_argument('--cont_windows', type=int, default=8)
 # 마디를 씌우고 있음. 이 항이 정확히 그걸 겨냥함.)
 parser.add_argument('--lambda_r', type=float, default=0.0)
 parser.add_argument('--meter_L', type=int, default=0)
+# mu_meter: 논문 4.2절 eq.(6). 선택(selection) 단계에 known-meter 간격 제약을 넣음.
+# subset_select_dp_meter가 O(N^2 M / L)이라 fragment당 ~47ms (plain DP는 0.34ms).
+# [스케일 주의] t_hat이 (0,1] 정규화라 후보 한 칸의 시간 비용은 lambda/N = 1.25인데
+# mu=1000이면 벌점이 1000*(1/160)^2 = 0.039로 한 칸의 3%에 불과함 - 실제로 선택을
+# 바꾸려면 mu ~ 1e5 이상이 필요하다(1e3에서 52/60, 1e5에서 58/60 변경 확인).
+parser.add_argument('--mu_meter', type=float, default=0.0)
 # --marginal: 논문 7.2절. hard DP로 sigma 하나를 고르는 대신 모든 order-preserving
 # injection에 대해 주변화한 -log Z(eq. 14)로 학습. stop-gradient가 필요 없음.
 # 근거(실측, temp_wide): sigma posterior가 ballroom에서는 사실상 point mass(유효
 # 대안 ~1.2개)지만 carnatic에서는 ~18개로 퍼져 있고 결정적인 곡이 하나도 없음.
 # 즉 hard EM이 가장 약한 데이터셋에서 임의의 배정 하나에 확신을 갖고 학습 중.
 parser.add_argument('--marginal', action='store_true', default=False)
+# eq.(14)는 -log Z 하나뿐. (8) 전체를 정확히 주변화하면 gamma*sum_j g_j가 더 붙는데,
+# 그러면 N개 후보 전부에 background 압력이 걸리고 -log Z' 쪽 반대 압력은 여러 배정에
+# 퍼져 약해져서 전부 background로 붕괴함(실측: 4에폭 연속 0.000, loss는 계속 하강).
+parser.add_argument('--marginal_background', action='store_true', default=False)
 # tau: Algorithm 3의 신뢰도 threshold. 학습 후 val에서 sweep하는 값이고, beat와
 # downbeat의 confidence 분포가 달라 따로 둘 수 있게 함(FCOS 경로에서도 그랬음).
 parser.add_argument('--tau_beat', type=float, default=0.2)
@@ -619,9 +629,16 @@ if __name__ == '__main__':
         # 체크포인트의 진짜 점수(예: 56 에폭 Joint 0.864)보다 한참 낮은 점수도
         # "새 기록"으로 착각해서 계속 저장하게 됨 - 불러온 체크포인트를 한 번
         # 재평가해서 진짜 기준점을 세워둠.
+        # Lookahead's model is the slow sequence; training runs on fast weights and an
+        # epoch boundary almost never coincides with a sync (313 iters, k=5), so evaluate
+        # and checkpoint the slow weights and restore the fast ones afterwards.
+        _la_cache = optimizer.sync_to_slow() if hasattr(optimizer, 'sync_to_slow') else None
         beatfcos.eval()
         _, _, highest_joint_f_measure = evaluate_macro_joint_f_measure(beatfcos, label="Resume check")
         print(f"resume 기준점(highest_joint_f_measure) = {highest_joint_f_measure:0.3f}")
+        if _la_cache is not None:
+            optimizer.restore_fast(_la_cache)
+            _la_cache = None
 
     for epoch_num in range(start_epoch, args.epochs):
         beatfcos.train()
@@ -790,6 +807,12 @@ if __name__ == '__main__':
 
         print(f'[MEM] before eval: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
         print('Evaluating dataset')
+        # Lookahead reports the SLOW sequence. Training runs on fast weights and an epoch
+        # boundary essentially never coincides with a sync (313 iterations, k=5), so both
+        # the score and the checkpoint below would otherwise be the fast model - i.e. not
+        # the optimizer we claim to be using. Swap in the slow weights for eval+save and
+        # restore the fast ones before the next epoch.
+        _la_cache = optimizer.sync_to_slow() if hasattr(optimizer, 'sync_to_slow') else None
         beat_mean_f_measure, downbeat_mean_f_measure, joint_f_measure = evaluate_macro_joint_f_measure(
             beatfcos, label=f"Epoch = {epoch_num}")
 
@@ -818,6 +841,10 @@ if __name__ == '__main__':
             # 20 에폭 넘게 이전 best를 못 넘는 정체가 있었음).
             new_optim_path = os.path.join(args.checkpoint_dir, 'optim_{}.pt'.format(epoch_num))
             torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict()}, new_optim_path)
+
+        if _la_cache is not None:
+            optimizer.restore_fast(_la_cache)
+            _la_cache = None
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

@@ -57,6 +57,8 @@ parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.242
                      help="콤마로 구분된 클러스터 값. 체크포인트 학습에 쓴 값과 일치시킬 것")
 # nhead=2로 학습된 옛날 체크포인트(이 버그 발견 이전 전부)를 평가하려면
 # --nhead 2로 명시해야 함. 기본값은 train.py의 고쳐진 기본값과 맞춰 8.
+parser.add_argument('--smc_subset', type=str, default='full-val', choices=['full-val', 'val'],
+                    help="use 'val' when the checkpoint was trained with --smc_* (else 75%% leakage)")
 parser.add_argument('--dmodel', type=int, default=128)
 parser.add_argument('--d_hid', type=int, default=512)
 parser.add_argument('--nhead', type=int, default=8,
@@ -93,7 +95,11 @@ DATASETS = {
     "gtzan": ("/disk1/taegum/mnt/labeled_data/gtzan/data", "/disk1/taegum/mnt/labeled_data/gtzan/label", "full-val", None),
     # SMC_MIREX_Annotations 디렉토리는 비어 있음(실제 주석은 _05_08_2014 쪽).
     # 학습이 쓰는 dataset_folds/smc/label과 같은 걸 씀.
-    "smc": ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio", f"{FOLD_ROOT}/smc/label", "full-val", None),
+    # SMC as "full-val"/fold=None is only zero-shot for arms trained WITHOUT --smc_*.
+    # For an SMC-trained arm 163/217 of these files are in its fold-0 train split, so
+    # the number is 75% contaminated. Use --smc_subset val (with --validation_fold) then.
+    "smc": ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio", f"{FOLD_ROOT}/smc/label",
+            args.smc_subset, (args.validation_fold if args.smc_subset == "val" else None)),
 }
 
 AUDIO_SAMPLE_RATE = 22050

@@ -342,6 +342,92 @@ def subset_select_dp(cost):
     return sigma
 
 
+def subset_select_dp_meter(cost, downbeat_positions, t_hat, meter_length, mu):
+    """Section 4.2, equation (6): known-meter spacing folded into the SELECTION.
+
+    (6) penalises the gap between consecutive matched downbeats against L * Delta_bar.
+    It depends on TWO matched positions jointly, breaking recursion (7)'s first-order
+    structure, so the most recent downbeat's matched candidate is carried as extra
+    state: D[i, j_star, j], O(N^2 M / L) instead of O(N M). j_star = N means "no
+    downbeat matched yet". mu = 0 reduces exactly to subset_select_dp.
+
+    This is the only mechanism in the paper that can change WHICH candidates are
+    selected; 9.4's regulariser and 7.1's imputation act after sigma_hat is fixed.
+    """
+    M, N = cost.shape
+    if mu <= 0.0 or len(downbeat_positions) < 2:
+        return subset_select_dp(cost)
+    if M > N:
+        raise ValueError(f"infeasible: M={M} > N={N}")
+
+    NONE = N
+    inf = np.inf
+    is_db = np.zeros(M, dtype=bool)
+    is_db[np.asarray(downbeat_positions, dtype=np.int64)] = True
+    # Equation (17) defines Delta_bar over MATCHED candidates, which are unknown before
+    # sigma is chosen. Take one EM step: solve the plain DP, measure Delta_bar on its
+    # matched set, then run the augmented DP against that target. Using the span of all
+    # N candidates instead biased the target high by 2.8% (ballroom) to 10% (harmonix),
+    # which pushed spacing the WRONG way wherever the constraint bit.
+    sigma0 = subset_select_dp(cost)
+    delta_bar = float(np.mean(np.diff(t_hat[sigma0]))) if M > 1 else 0.0
+    target = meter_length * delta_bar
+
+    D = np.full((N + 1, N), inf)
+    prev_j = np.full((M, N + 1, N), -1, dtype=np.int32)
+    prev_s = np.full((M, N + 1, N), -1, dtype=np.int32)
+    if is_db[0]:
+        for j in range(N):
+            D[j, j] = cost[0, j]
+    else:
+        D[NONE, :] = cost[0, :]
+
+    for i in range(1, M):
+        run = np.full((N + 1, N), inf)
+        run_arg = np.full((N + 1, N), -1, dtype=np.int32)
+        best = np.full(N + 1, inf)
+        best_arg = np.full(N + 1, -1, dtype=np.int32)
+        for j in range(N):
+            if j > 0:
+                better = D[:, j - 1] < best
+                best = np.where(better, D[:, j - 1], best)
+                best_arg = np.where(better, j - 1, best_arg)
+            run[:, j] = best
+            run_arg[:, j] = best_arg
+
+        newD = np.full((N + 1, N), inf)
+        if not is_db[i]:
+            newD = run + cost[i][None, :]
+            prev_j[i] = run_arg
+            prev_s[i] = np.arange(N + 1, dtype=np.int32)[:, None]
+        else:
+            gap = t_hat[None, :] - np.concatenate([t_hat, [0.0]])[:, None]
+            penalty = mu * (gap - target) ** 2
+            penalty[NONE, :] = 0.0
+            cand = run + cost[i][None, :] + penalty
+            chosen = np.argmin(cand, axis=0).astype(np.int32)
+            vals = cand[chosen, np.arange(N)]
+            for j in range(N):
+                newD[j, j] = vals[j]
+                prev_j[i, j, j] = run_arg[chosen[j], j]
+                prev_s[i, j, j] = chosen[j]
+        D = newD
+
+    flat = int(np.argmin(D))
+    js, j = np.unravel_index(flat, D.shape)
+    if not np.isfinite(D[js, j]):
+        return subset_select_dp(cost)
+    sigma = np.empty(M, dtype=np.int64)
+    for i in range(M - 1, 0, -1):
+        sigma[i] = j
+        pj, ps = int(prev_j[i, js, j]), int(prev_s[i, js, j])
+        if pj < 0:
+            return subset_select_dp(cost)
+        j, js = pj, ps
+    sigma[0] = j
+    return sigma
+
+
 def subset_select_logsumexp(cost):
     """Equation (13) - the marginalised counterpart of the DP, log Z(theta, x).
 
@@ -393,7 +479,8 @@ class SubsetCriterion(nn.Module):
                  learn_b=False, b_momentum=0.9, b_min=1e-4, normalize_by_events=True,
                  diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7,
                  cont_weight=0.0, cont_windows=8, lambda_r=0.0, meter_length=0,
-                 marginal=False):
+                 marginal=False, marginal_background=True, fragment_seconds=29.7215,
+                 mu_meter=0.0):
         super(SubsetCriterion, self).__init__()
         self.gamma = gamma
         # cont_weight > 0: penalise the variance of the log expected event count across
@@ -430,6 +517,19 @@ class SubsetCriterion(nn.Module):
         # (~18, no song deterministic), so hard EM commits arbitrarily on exactly the
         # dataset where we are weakest.
         self.marginal = marginal
+        # Marginalising the FULL loss (8) gives gamma*sum_j g_j - log Z', because
+        # sum_{j not in im(sigma)} g_j = sum_j g_j - sum_i g_sigma(i) and the second half
+        # is already folded into build_cost's `corrected`. The paper's equation (14) is
+        # -log Z alone; with the term omitted, build_cost still subtracts gamma*g_j and
+        # nothing compensates, so dL/dg_j <= 0 for every j and the objective is unbounded
+        # below. Default to the exact marginalisation; set False for (14) literally.
+        self.marginal_background = marginal_background
+        # t_hat is normalised to (0, 1] within the fragment: a residual is a FRACTION of
+        # the fragment, not milliseconds. residual*1000 printed 0.0008 as "1ms" when it
+        # is 0.0008 * 29.72 s = 24 ms - the figure compared against mir_eval's +-70 ms.
+        self.fragment_seconds = fragment_seconds
+        # Section 4.2: weight of equation (6) inside the SELECTION. 0 = plain Algorithm 1.
+        self.mu_meter = mu_meter
         # Printed from inside the criterion rather than returned to train.py because
         # under DataParallel the forward runs on a replica, so an attribute set here
         # never reaches the parent module.
@@ -466,11 +566,16 @@ class SubsetCriterion(nn.Module):
             L = float(self.meter_length)
         else:
             gaps = (downbeat_positions[1:] - downbeat_positions[:-1]).float()
-            L = float(gaps.median())                     # beats per bar, from the GT
-            if not (L >= 1.0):
+            if not bool((gaps >= 1.0).all()):
                 return None
+            # Per-pair, not one median for the fragment: a fragment can span a metre
+            # change or start mid-bar, and a single median then charges every pair
+            # against the wrong target (measured on harmonix, 4.1x of the residual at
+            # the GROUND-TRUTH times was this artifact).
+            L = gaps
         predicted = matched_times[downbeat_positions]
-        residual = (predicted[1:] - predicted[:-1]) - L * delta_bar
+        L_vec = L if torch.is_tensor(L) else torch.full_like(predicted[1:], float(L))
+        residual = (predicted[1:] - predicted[:-1]) - L_vec * delta_bar
         return (residual ** 2).sum()
 
     def _continuity_term(self, log_probabilities_b, t_hat_b):
@@ -625,7 +730,19 @@ class SubsetCriterion(nn.Module):
                 class_spread_count += 1
                 # Selection is a non-differentiable combinatorial step evaluated at the
                 # current parameters; sigma enters the loss as data (Alg. 2 line 17).
-                sigma_np = subset_select_dp(corrected.detach().cpu().numpy()) if cost_is_finite else None
+                if not cost_is_finite:
+                    sigma_np = None
+                elif self.mu_meter > 0.0:
+                    _dbp = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten().cpu().numpy()
+                    _L = (float(self.meter_length) if self.meter_length > 0
+                          else (float(np.median(np.diff(_dbp))) if len(_dbp) >= 2 else 0.0))
+                    sigma_np = (subset_select_dp_meter(
+                                    corrected.detach().cpu().numpy(), _dbp,
+                                    t_hat[b].detach().cpu().numpy(), _L, self.mu_meter)
+                                if _L >= 1.0 else
+                                subset_select_dp(corrected.detach().cpu().numpy()))
+                else:
+                    sigma_np = subset_select_dp(corrected.detach().cpu().numpy())
 
             # Must be OUTSIDE the no_grad block above: a term appended inside it is
             # detached, and if every fragment in the batch took that path the total
@@ -651,7 +768,7 @@ class SubsetCriterion(nn.Module):
                 # So drop the fragment entirely in case (b).
                 non_finite += 1
                 if bool(torch.isfinite(background).all()):
-                    background_terms.append(background.sum() / max(float(M), 1.0))
+                    background_terms.append(background.sum() / (float(M) if self.normalize_by_events else 1.0))
                     contributing_fragments += 1
                 else:
                     non_finite_logits += 1
@@ -666,9 +783,26 @@ class SubsetCriterion(nn.Module):
                 # `corrected` is built above for the hard DP and reused verbatim.
                 log_z = subset_select_logsumexp(corrected)
                 class_terms.append(-log_z / denominator)
-                background_terms.append(background.sum() / denominator)
+                if self.marginal_background:
+                    background_terms.append(background.sum() / denominator)
+                if self.lambda_r > 0.0 and sigma_np is not None:
+                    # -log Z marginalises sigma away, but the periodicity term needs a
+                    # concrete assignment; use the hard DP's, which is already computed
+                    # above for diagnostics. Cheap and consistent with how 9.4 is defined
+                    # (it is applied after an assignment is fixed).
+                    sigma_hard = torch.from_numpy(sigma_np).to(class_logits.device)
+                    r_term = self._periodicity_term(t_hat[b][sigma_hard], event_classes)
+                    if r_term is not None:
+                        periodicity_terms.append(r_term / denominator)
+                if self.cont_weight > 0.0:
+                    continuity_terms.append(self._continuity_term(
+                        log_probabilities_b, t_hat[b]))
                 total_events += M
                 contributing_fragments += 1
+                # -log Z already covers the matched class and time terms, so those are
+                # skipped below - but the shared blocks above must NOT be, or
+                # --lambda_r / --cont_weight become silent no-ops under --marginal while
+                # still printing 0.000 in the loss table.
                 continue
 
             sigma = torch.from_numpy(sigma_np).to(class_logits.device)
@@ -794,7 +928,7 @@ class SubsetCriterion(nn.Module):
                   f"one-slot time cost={slot_cost:.3f} vs class spread={stats['class_spread']:.3f} "
                   f"({'TIME DOMINATES' if slot_cost > 4 * stats['class_spread'] else 'balanced'}) | "
                   f"residual={stats.get('residual_mean', float('nan')):.5f} "
-                  f"({stats.get('residual_mean', 0.0) * 1000:.0f}ms/window) "
+                  f"({stats.get('residual_mean', 0.0) * self.fragment_seconds * 1000:.0f}ms) "
                   f"min_gap={stats['min_gap']:.2e} events={stats['num_events']} "
                   f"infeasible={stats['infeasible']}", flush=True)
         return losses, stats

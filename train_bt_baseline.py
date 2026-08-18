@@ -21,6 +21,7 @@ import numpy as np, torch, torch.nn as nn, mir_eval
 from beatfcos.beat_transformer_encoder import BeatTransformerEncoder
 from beatfcos.dataloader import BeatDataset, collater
 from beatfcos.optim import Lookahead
+from beatfcos.gt_utils import intervals_to_times
 
 p = argparse.ArgumentParser()
 p.add_argument('--dmodel', type=int, default=256)
@@ -39,7 +40,13 @@ args = p.parse_args()
 
 SR, DSF = 22050, 512
 TO_SEC = DSF / SR
-WINDOW = 160 * 8 * DSF          # same 29.7 s window the subset arms train on
+WINDOW = 160 * 8 * DSF          # 29.7 s: the window the subset arms TRAIN on
+# Evaluation must use the same excerpt length the subset head is evaluated with
+# (evaluate_all_datasets.py passes 2097152 = 4096 frames = 95.1 s). dataloader.py's
+# spectral branch truncates val items to target_len with no guard, so passing WINDOW
+# here silently scored this baseline on 29.7 s of each song while our head saw 95 s -
+# which is where the entire reported advantage of the subset head came from.
+EVAL_LENGTH = 2097152
 FRAMES = WINDOW // DSF
 
 class Tee:
@@ -64,7 +71,8 @@ def build(subset):
     for name, (adir, ldir) in DATA.items():
         sets.append(BeatDataset(adir, ldir, dataset=name, audio_sample_rate=SR,
             audio_downsampling_factor=DSF, subset=subset, augment=False, half=True,
-            preload=True, length=WINDOW, dry_run=False, spectral=True,
+            preload=True, length=(WINDOW if subset in ("train", "full-train") else EVAL_LENGTH),
+            dry_run=False, spectral=True,
             validation_fold=args.validation_fold))
     return sets
 
@@ -102,13 +110,13 @@ def peak_pick(a, thr):
     return np.array(keep) * TO_SEC
 
 def gt_times(annot):
-    b, d = [], []
-    for iv in annot:
-        lab = int(iv[2])
-        if lab < 0: continue
-        b.append(int(iv[0]) * TO_SEC)
-        if lab == 0: d.append(int(iv[0]) * TO_SEC)
-    return np.sort(np.array(b)), np.sort(np.array(d))
+    # Delegates to the shared reconstruction. The inline version here appended every
+    # label to the beat list, which double-counted downbeats (make_intervals emits a
+    # downbeat chain AND a beat chain and downbeats appear in both): 20.9% duplicate
+    # references on ballroom val, unmatchable by mir_eval, so this baseline was scored
+    # against a corrupted reference while beat_eval.py scored the subset head against a
+    # correct one - and the two were then compared.
+    return intervals_to_times(annot, TO_SEC)
 
 def fscore(ref, est):
     if len(ref) < 3 or len(est) < 3: return None

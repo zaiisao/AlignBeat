@@ -330,6 +330,7 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
                 lambda_r=kwargs.get('lambda_r', 0.0),
                 meter_length=kwargs.get('meter_length', 0),
                 marginal=kwargs.get('marginal', False),
+                marginal_background=kwargs.get('marginal_background', False),
                 cont_windows=kwargs.get('cont_windows', 8),
                 normalize_by_events=not kwargs.get('no_event_norm', False),
             )
