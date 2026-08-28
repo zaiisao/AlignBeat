@@ -264,21 +264,62 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
 
         self.backbone_type = backbone_type
         self.head_type = head_type
+        """
+        The existing code always hard-codes feature_size=256,
+        level_stride=(8, 4, 2) (FPN 3-level) when building SubsetSelectionHead.
+        A branch is added here that builds it differently only when
+        backbone_type == "beat_this": since there's no FPN, the list becomes
+        length 1 and the channel count is passed through as 512 (the
+        encoder's transformer_dim); num_candidates is also no longer set by
+        the user but pulled from self.downsample.N (=188, the value derived
+        via eq.1). In short, the "with-FPN" and "beat_this" paths are split
+        with an if/else, adding the new path.
+        """
 
-        dmodel = kwargs.get('dmodel', 128)
-        encoder_keys = ['dmodel', 'nhead', 'd_hid', 'nlayers', 'attn_len', 'dropout', 'norm_first']
-        encoder_kwargs = {k: kwargs[k] for k in encoder_keys if k in kwargs}
-        self.encoder = BeatTransformerEncoder(**encoder_kwargs)
+        if self.backbone_type == "beat_this":
+            # [what] Ports the entire Beat This (Foscarin et al. 2024) encoder
+            # (Stem + FrontendBlock x3 + Concat+Linear + 6-layer transformer,
+            # excluding task_heads). Uses standard, non-dilated self-attention
+            # (RoPE) instead of dilated DSA.
+            # [no FPN] In a subset-selection design with no notion of anchors,
+            # there's no reason to place per-scale anchors, so the FPN itself
+            # becomes unnecessary -- instead, the encoder's final-layer output
+            # is shrunk via progressive downsample (T->N, eq.1-3) and fed
+            # directly into SubsetSelectionHead. Neither rho1/2/3 nor
+            # self.fpn exist here.
+            from beatfcos.beat_this_encoder import BeatThisEncoder
+            from beatfcos.progressive_downsample import ProgressiveDownsample
+
+            encoder_keys = ['spect_dim', 'transformer_dim', 'ff_mult', 'n_layers',
+                             'head_dim', 'stem_dim', 'dropout', 'partial_transformers']
+            encoder_kwargs = {k: kwargs[k] for k in encoder_keys if k in kwargs}
+            self.encoder = BeatThisEncoder(**encoder_kwargs)
+            transformer_dim = encoder_kwargs.get('transformer_dim', 512)
+
+            # T (the encoder's output frame count) is fixed by the training
+            # window length, so it must be known here to precompute the
+            # downsample schedule (eq.1) when building the module.
+            encoder_input_frames = kwargs['encoder_input_frames']
+            self.downsample = ProgressiveDownsample(
+                d_model=transformer_dim,
+                T=encoder_input_frames,
+                N_min=kwargs.get('n_min', 100),
+            )
+        else:
+            dmodel = kwargs.get('dmodel', 128)
+            encoder_keys = ['dmodel', 'nhead', 'd_hid', 'nlayers', 'attn_len', 'dropout', 'norm_first']
+            encoder_kwargs = {k: kwargs[k] for k in encoder_keys if k in kwargs}
+            self.encoder = BeatTransformerEncoder(**encoder_kwargs)
 
 
-        self.rho1 = nn.Identity()
-        self.rho2 = nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
-        self.rho3 = nn.Sequential(
-            nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1),
-            nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
-        )
+            self.rho1 = nn.Identity()
+            self.rho2 = nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
+            self.rho3 = nn.Sequential(
+                nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1),
+                nn.Conv1d(dmodel, dmodel, kernel_size=3, stride=2, padding=1)
+            )
 
-        self.fpn = PyramidFeatures(dmodel, dmodel, dmodel, no_fusion=(head_type == "fcos_no_fpn"))
+            self.fpn = PyramidFeatures(dmodel, dmodel, dmodel, no_fusion=(head_type == "fcos_no_fpn"))
 
         if self.head_type == "hungarian":
             # [무엇] Soft-NMS 후처리를 없애기 위해 추가한 축소판 RT-DETR 경로.
@@ -307,12 +348,25 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
             # Downsample(FPN feature)에서 나오고 시각이 구조적으로 정렬돼 있어
             # collapse할 대상 자체가 없다.
             from beatfcos.subset_head import SubsetSelectionHead, SubsetCriterion
-            self.num_candidates = kwargs.get('num_candidates', 160)
-            # P1/P2/P3의 길이는 T, T/2, T/4이므로 후보 N개로 맞추려면 stride도
-            # 8/4/2로 서로 달라야 함 (T = N*8 = 1280 기준).
-            level_strides = kwargs.get('subset_level_strides', (8, 4, 2))
+            if self.backbone_type == "beat_this":
+                # No FPN, so instead of a 3-level list, a single tensor is
+                # used (the progressive-downsample output already shrunk to
+                # N) -- the "pass one feature map instead of three" path
+                # documented in subset_head.py's docstring. level_strides=(1,)
+                # so the head's internal downsample conv is a kernel=1
+                # projection that doesn't change the length.
+                self.num_candidates = self.downsample.N
+                level_strides = (1,)
+                subset_feature_size = transformer_dim
+            else:
+                self.num_candidates = kwargs.get('num_candidates', 160)
+                # P1/P2/P3 have lengths T, T/2, T/4, so to line them up to N
+                # candidates the strides must differ too -- 8/4/2 (assuming
+                # T = N*8 = 1280).
+                level_strides = kwargs.get('subset_level_strides', (8, 4, 2))
+                subset_feature_size = 256
             self.subset_head = SubsetSelectionHead(
-                feature_size=256,
+                feature_size=subset_feature_size,
                 num_candidates=self.num_candidates,
                 level_strides=level_strides,
                 hidden_size=kwargs.get('subset_hidden_size', 256),
@@ -544,20 +598,40 @@ class BeatFCOS(nn.Module): #MJ: blcok, layers = Bottleneck, [3, 4, 6, 3]: not de
         else:
             audio_batch = inputs
 
+        """
+        forward likewise gets a backbone_type branch added on top of the
+        existing one: in the new path self.encoder returns a single
+        (B,T,512) tensor, which is passed through self.downsample
+        (progressive downsample) to shrink it to (B, N, 512), then wrapped
+        into the "list" shape SubsetSelectionHead expects to build
+        feature_maps. base_level_image_shape also stands in for the frame
+        count previously used to normalize annotations in the existing path.
+        """
+        if self.backbone_type == "beat_this":
+            encoder_out = self.encoder(audio_batch)  # (B, T, transformer_dim)
+            # Stands in for C1.shape -- [-1] is the T used to normalize
+            # annotation frames (see num_frames = base_level_image_shape[-1]
+            # in _forward_subset).
+            base_level_image_shape = encoder_out.transpose(1, 2).shape
+            z = self.downsample(encoder_out)  # (B, N, transformer_dim), eq.1-3
+            # SubsetSelectionHead expects a list of (B,C,T_l) channel-first
+            # tensors (list length 1 here since there's no FPN, just a single
+            # level).
+            feature_maps = [z.transpose(1, 2)]
+        else:
+            C1, C2, C3 = self.encoder(audio_batch)
 
-        C1, C2, C3 = self.encoder(audio_batch)
+            C1 = C1.transpose(1, 2)
+            C2 = C2.transpose(1, 2)
+            C3 = C3.transpose(1, 2)
 
-        C1 = C1.transpose(1, 2)
-        C2 = C2.transpose(1, 2)
-        C3 = C3.transpose(1, 2)
+            C1 = self.rho1(C1)
+            C2 = self.rho2(C2)
+            C3 = self.rho3(C3)
 
-        C1 = self.rho1(C1)
-        C2 = self.rho2(C2)
-        C3 = self.rho3(C3)
+            base_level_image_shape = C1.shape
 
-        base_level_image_shape = C1.shape
-
-        feature_maps = self.fpn([C1, C2, C3])
+            feature_maps = self.fpn([C1, C2, C3])
 
         if self.head_type == "hungarian":
             return self._forward_hungarian(feature_maps, base_level_image_shape, audio_batch, inputs)

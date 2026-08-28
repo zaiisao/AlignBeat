@@ -35,6 +35,41 @@ class Logger(object):
 def configure_log(log_file_name, mode="w"):
     Logger(log_file_name, mode)
 
+
+class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Cosine annealing over `max_iters` steps with `warmup` linear warmup steps.
+
+    Copied from CPJKU/beat_this (beat_this/model/pl_module.py) so that
+    --backbone_type beat_this can be trained with the encoder's own original
+    schedule (--lr_schedule cosine_warmup) instead of the FCOS pipeline's
+    ReduceLROnPlateau, when the comparison is meant to isolate the head
+    (subset selection vs. beat_this's own peak-picking) rather than also
+    confound it with a different optimizer schedule on the shared encoder.
+    Steps once per training iteration (not per epoch) -- see the
+    `--optimizer adamw --lr_schedule cosine_warmup` call site below.
+    """
+
+    def __init__(self, optimizer, warmup, max_iters, raise_last=0, raise_to=0.5):
+        self.warmup = warmup
+        self.max_num_iters = int((1 - raise_last) * max_iters)
+        self.raise_to = raise_to
+        super().__init__(optimizer)
+
+    def get_lr(self):
+        lr_factor = self.get_lr_factor(step=self.last_epoch)
+        return [base_lr * lr_factor for base_lr in self.base_lrs]
+
+    def get_lr_factor(self, step):
+        if step < self.max_num_iters:
+            progress = step / self.max_num_iters
+            lr_factor = 0.5 * (1 + np.cos(np.pi * progress))
+            if step <= self.warmup:
+                lr_factor *= step / self.warmup
+        else:
+            progress = (step - self.max_num_iters) / self.warmup
+            lr_factor = self.raise_to * min(progress, 1)
+        return lr_factor
+
 # 원래는 log.log/GPU/checkpoints 경로가 전부 하드코딩이라, 8-fold CV처럼 여러 run을
 # 동시에/순차적으로 돌리면 서로 같은 log.log와 checkpoints/ 폴더를 덮어써버림.
 # --log_file, --gpu, --checkpoint_dir로 fold별로 분리할 수 있게 argparse 이후로
@@ -95,12 +130,24 @@ parser.add_argument('--patience', type=int, default=3)
 # 2 epoch 정체하면 1/5로 감쇠, 하한 1e-7. 지금 돌던 설정(plain Adam, 고정 3e-4,
 # patience=10이라 스케줄러가 한 번도 발동 안 함)은 FCOS 계열에서 물려받은 것이라
 # 지금 쓰는 encoder에도 subset head에도 맞춰진 적이 없음. 기본값은 기존 그대로.
-parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'radam_lookahead'])
+parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'radam_lookahead', 'adamw'])
 parser.add_argument('--lookahead_k', type=int, default=5)
 parser.add_argument('--lookahead_alpha', type=float, default=0.5)
 parser.add_argument('--lr_factor', type=float, default=0.1)   # torch 기본값
 parser.add_argument('--lr_patience', type=int, default=None)  # None이면 --patience를 씀
 parser.add_argument('--min_lr', type=float, default=0.0)
+# --optimizer adamw: beat_this 원 저장소(beat_this/model/pl_module.py)의 옵티마이저를
+# 그대로 재현. weight_decay는 2차원 이상 텐서(행렬)에만 적용하고 bias/norm(1차원
+# 이하)에는 0을 줌 - Karpathy의 nanoGPT에서 가져온 관행이라고 원 코드 주석에 적혀있음.
+parser.add_argument('--adamw_weight_decay', type=float, default=0.01)
+# --lr_schedule cosine_warmup: beat_this 원 저장소의 CosineWarmupScheduler를 그대로
+# 재현(위 CosineWarmupScheduler 클래스 참고). 기본값 'plateau'는 기존 FCOS 파이프라인의
+# ReduceLROnPlateau를 그대로 유지 - 다른 backbone_type의 기존 동작을 안 건드리기 위함.
+# beat_this 인코더를 원 논문 레시피와 동일하게 학습시켜서, "beat_this+peak_picking"과
+# "beat_this+subset_selection" 비교가 헤드 차이만 반영하게 하려면 이 옵션을 켤 것
+# (--optimizer adamw --lr_schedule cosine_warmup --lr 0.0008 조합이 원 레시피와 동일).
+parser.add_argument('--lr_schedule', type=str, default='plateau', choices=['plateau', 'cosine_warmup'])
+parser.add_argument('--warmup_steps', type=int, default=1000)
 parser.add_argument('--ninputs', type=int, default=1)
 parser.add_argument('--noutputs', type=int, default=2)
 parser.add_argument('--nblocks', type=int, default=8)
@@ -152,6 +199,31 @@ parser.add_argument('--d_hid', type=int, default=512)
 parser.add_argument('--nlayers', type=int, default=9)
 parser.add_argument('--attn_len', type=int, default=5)
 parser.add_argument('--dropout', type=float, default=0.1)
+# --backbone_type beat_this: arguments for BeatThisEncoder (beatfcos/beat_this_encoder.py).
+# The rest (dmodel/nhead/d_hid/nlayers/attn_len) are DSA-only and unused here.
+
+"""
+Registers the values needed to build BeatThisEncoder (beat_this_encoder.py)
+and ProgressiveDownsample (progressive_downsample.py) as CLI options.
+
+train.py turns all argparse arguments into a dict via dict_args=vars(args) at
+line 630, then passes the whole thing through **dict_args into the model-
+creation function at line 677 -- so as long as the names match exactly,
+model_module.py's kwargs.get('transformer_dim',...) picks up the values
+automatically, with no extra wiring needed.
+"""
+parser.add_argument('--transformer_dim', type=int, default=512)
+parser.add_argument('--ff_mult', type=int, default=4)
+parser.add_argument('--n_layers', type=int, default=6)
+parser.add_argument('--head_dim', type=int, default=32)
+parser.add_argument('--stem_dim', type=int, default=32)
+parser.add_argument('--beat_this_frontend_dropout', type=float, default=0.1)
+parser.add_argument('--beat_this_transformer_dropout', type=float, default=0.2)
+parser.add_argument('--partial_transformers', type=lambda x: x.lower() != 'false', default=True)
+# n_min: N_min from progressive_downsample.py's eq.(1). Derived from
+# BPM_max * D_min, but taken directly as an integer here (BPM_max=200,
+# D=30s gives 100).
+parser.add_argument('--n_min', type=int, default=100)
 # Soft-NMS 후처리를 없앤 축소판 RT-DETR 헤드(순서 보존 매칭 기반, 자세한 내용은
 # beatfcos/hungarian_head.py 참고)를 쓰려면 --head_type hungarian으로 지정.
 # 기본값 'fcos'는 기존 anchor+Soft-NMS 파이프라인을 그대로 유지함(비교용).
@@ -232,6 +304,12 @@ parser.add_argument('--spect_tempo_aug', type=str, default='',
                     help='e.g. -20,-16,-12,-8,8,12,16,20 (percent); empty disables')
 parser.add_argument('--spect_pitch_aug', type=str, default='',
                     help='e.g. -5,-4,-3,-2,-1,1,2,3,4,5,6 (semitones); empty disables')
+parser.add_argument('--spect_mask_aug', action='store_true',
+                    help='beat_this-style online mask augmentation (permute, 1-6 masks/crop, 0.1-2s each)')
+parser.add_argument('--eval_gtzan_ckpt', type=str, default=None,
+                    help='if set: skip training entirely, load this checkpoint, evaluate on the GTZAN '
+                         'test split (never seen in training - beat_this\'s own held-out test set), '
+                         'print Beat/Downbeat/Joint F-measure, and exit.')
 # --marginal: 논문 7.2절. hard DP로 sigma 하나를 고르는 대신 모든 order-preserving
 # injection에 대해 주변화한 -log Z(eq. 14)로 학습. stop-gradient가 필요 없음.
 # 근거(실측, temp_wide): sigma posterior가 ballroom에서는 사실상 point mass(유효
@@ -273,6 +351,13 @@ parser.add_argument('--log_file', type=str, default='./log.log')
 # (hungarian=1.0, fcos=0.1) - 이미 검증된 hungarian 쪽은 그대로 두기 위함.
 # 0 이하 값을 주면 clipping을 아예 안 함(논문 방식, fcos용).
 parser.add_argument('--grad_clip', type=float, default=None)
+# --accumulate_grad_batches: beat_this 원 저장소가 "gradient accumulation over 8
+# batches of size 8"(=effective batch 64)로 학습한다고 명시함 - 기본값 1(=기존 동작,
+# 매 iteration마다 optimizer.step())로 두고, beat_this 레시피를 그대로 맞출 때만
+# --batch_size 8 --accumulate_grad_batches 8 로 명시적으로 켬. N iteration마다 한 번만
+# optimizer.step()/scheduler.step()을 호출하고, 그 N개 iteration 동안 쌓인 loss를
+# N으로 나눠서 backward()하여 평균 gradient가 되게 함(아래 학습 루프 참고).
+parser.add_argument('--accumulate_grad_batches', type=int, default=1)
 
 # 원 논문 Section 3: "we also made each dataset represent 1000 music excerpts
 # per epoch... in order to prevent one dataset from dominating another in
@@ -293,15 +378,30 @@ args = parser.parse_args()
 # 멀쩡히 내놓으면서 마지막 frame만 잃음) subset_head가 입력 길이를 직접 검증한다.
 # 또 홀수 길이는 FPN top-down upsample에서 크기 불일치로 아예 죽는다(1281 -> C3 321을
 # 2배 업샘플하면 642 vs C2 641). 그래서 여기서 정확히 맞춰준다.
+
+"""
+The existing FPN approach fixes num_candidates (N) first and derives
+train_length (=T) from it. Here it's the reverse: T is fixed first and N is
+derived via eq.1. So leaving the old logic untouched would make the two
+approaches collide -- a condition is added so the old logic never runs on
+the beat_this path. Instead, the default train_length is set to exactly the
+T=1500 (50fps) frame count from the paper's own example.
+"""
 SUBSET_FRAMES_PER_CANDIDATE = 8  # P1(가장 fine한 레벨)의 stride
 if args.lr is None:
     args.lr = 3e-4 if args.head_type == 'subset' else 1e-3
 if args.train_length is None:
-    if args.head_type == 'subset':
+    if args.head_type == 'subset' and args.backbone_type != "beat_this":
         args.train_length = args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE * args.audio_downsampling_factor
+    elif args.backbone_type == "beat_this":
+        # On the beat_this path the user doesn't set num_candidates -- N is
+        # derived from T (=train_length/audio_downsampling_factor) via
+        # progressive_downsample's eq.(1) (see model_module.py). Defaults to
+        # T=1500 (50fps, 30s), exactly the paper's own example.
+        args.train_length = 1500 * args.audio_downsampling_factor
     else:
         args.train_length = 2097152
-if args.head_type == 'subset':
+if args.head_type == 'subset' and args.backbone_type != "beat_this":
     _frames = args.train_length // args.audio_downsampling_factor
     if _frames != args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE:
         raise SystemExit(
@@ -318,7 +418,7 @@ if args.head_type == 'subset':
 # resume 여부에 따라 로그 파일을 이어쓸지("a") 새로 쓸지("w") 미리 결정. 원래는
 # 무조건 "w"라서, 크래시 후 재시작할 때마다 그동안의 로그(0~56 에폭 등)가
 # 통째로 날아가서 매번 수동으로 백업해야 했음.
-_is_resuming = len(glob.glob(os.path.join(args.checkpoint_dir, 'retinanet_*.pt'))) > 0
+_is_resuming = len(glob.glob(os.path.join(args.checkpoint_dir, 'retinanet_[0-9]*.pt'))) > 0
 configure_log(args.log_file, mode="a" if _is_resuming else "w")
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
@@ -344,7 +444,7 @@ torch.backends.cudnn.benchmark = False
 args.default_root_dir = os.path.join("lightning_logs", "full")
 print(args.default_root_dir)
 
-state_dicts = glob.glob(os.path.join(args.checkpoint_dir, 'retinanet_*.pt'))
+state_dicts = glob.glob(os.path.join(args.checkpoint_dir, 'retinanet_[0-9]*.pt'))
 start_epoch = 0
 checkpoint_path = None
 
@@ -365,6 +465,7 @@ else:
 # setup the dataloaders
 train_datasets = []
 val_datasets = []
+val_dataset_names = []  # val_datasets와 같은 순서로 데이터셋 이름 추적 (아래 macro-average 평가용)
 
 if args.spect_root:
     # Beat This corpus path: skip the audio-loading BeatDataset entirely. Their
@@ -385,7 +486,7 @@ if args.spect_root:
         train_datasets.append(BeatThisSpectDataset(
             args.spect_root, args.spect_annot_root, [_name], subset="train",
             validation_fold=args.validation_fold, target_length=_train_frames,
-            tempo_aug=_tempo, pitch_aug=_pitch))
+            tempo_aug=_tempo, pitch_aug=_pitch, mask_aug=args.spect_mask_aug))
         val_datasets.append(BeatThisSpectDataset(
             args.spect_root, args.spect_annot_root, [_name], subset="val",
             validation_fold=args.validation_fold, target_length=_eval_frames))
@@ -393,7 +494,6 @@ if args.spect_root:
     print(f"[spect] {len(_names)} datasets | train {sum(len(d) for d in train_datasets)} "
           f"val {sum(len(d) for d in val_datasets)} | {_train_frames} frames "
           f"({_train_frames/50.0:.1f}s at 50 fps) | tempo_aug={_tempo} pitch_aug={_pitch}")
-val_dataset_names = []  # val_datasets와 같은 순서로 데이터셋 이름 추적 (아래 macro-average 평가용)
 
 for dataset in ([] if args.spect_root else datasets):
     if args.dataset_dir is not None:
@@ -537,9 +637,20 @@ def evaluate_macro_joint_f_measure(model, label):
             # Algorithm 4로 이어붙여야 함 (beat_eval.evaluate_beat_f_measure_subset).
             # eval_length는 기존과 같은 2097152(4096 frame)로 두어서, fcos_lite 등과
             # 정확히 같은 구간을 평가하게 함 - 숫자 비교가 가능해야 하므로.
+            #
+            # window_frames는 args.num_candidates(CLI 기본값 160)가 아니라 실제로 만들어진
+            # subset_head가 기대하는 candidate 개수(model.module.num_candidates)로 계산해야
+            # 함. backbone_type="beat_this" 경로에서는 num_candidates가 CLI 인자가 아니라
+            # progressive_downsample의 eq.(1)에서 유도된 값(N, 예: T=1500이면 188)이라
+            # args.num_candidates(160)와 다름 - 이 둘을 섞어 쓰면 학습 때 만들어진 subset_head
+            # 는 188개를 기대하는데 검증 시 타일 크기는 160*8=1280 frame으로 잘라서 넣어버려서
+            # (1280 -> 640 -> 320 -> 160, eq.1 그대로 절반씩 줄어든 결과) "expected 188, got
+            # 160" ValueError로 매 에폭 끝 검증이 죽는다 (실측: epoch 0 종료 시점에 발생).
+            real_num_candidates = getattr(
+                getattr(model, "module", model), "num_candidates", args.num_candidates)
             ds_beat_f, ds_downbeat_f, _ = evaluate_beat_f_measure_subset(
                 loader, model, args.audio_downsampling_factor, args.audio_sample_rate,
-                window_frames=args.num_candidates * SUBSET_FRAMES_PER_CANDIDATE,
+                window_frames=real_num_candidates * SUBSET_FRAMES_PER_CANDIDATE,
                 border_frames=args.stitch_beta_frames,
                 threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat)
         else:
@@ -607,6 +718,16 @@ if __name__ == '__main__':
     # 두고 downbeat 3개를 대표값 1개로 합쳐 클러스터 개수(3개)를 실제 레벨 개수와
     # 맞춤 - clusters_to_interval_length_ranges가 마지막 구간을 항상 무한대로
     # 열어두므로, 이렇게 하면 모든 downbeat 길이가 반드시 어떤 레벨에는 걸리게 됨.
+
+    """
+    The dict_args argparse builds automatically has 2 problems:
+    1. dropout is just a single float (the --dropout default), but
+       BeatThisEncoder wants a dict.
+    2. encoder_input_frames has no argparse option at all (it's a derived
+       value).
+    Both are patched into dict_args right before the model is actually
+    built, only when backbone_type == "beat_this".
+    """
     if args.head_type == "fcos_lite":
         # fcos_lite는 P1(레벨0)을 빼고 레벨[1,2] 2개만 쓰므로 클러스터도 2개여야
         # 함 - 기존 3개 중 가장 작은 값(원래 레벨0/1 경계였던 0.42574675)을 빼서
@@ -623,6 +744,17 @@ if __name__ == '__main__':
         training_data_clusters = torch.tensor([0.42574675, 0.66719675, 1.93286828])
 
     dict_args['meter_length'] = args.meter_L
+    if args.backbone_type == "beat_this":
+        # BeatThisEncoder expects dropout as a {"frontend":..,"transformer":..}
+        # dict (not a single --dropout float) -- overwritten and passed here.
+        dict_args['dropout'] = {
+            "frontend": args.beat_this_frontend_dropout,
+            "transformer": args.beat_this_transformer_dropout,
+        }
+        # T (encoder input frame count) = train_length / audio_downsampling_factor.
+        # Needed for progressive_downsample.py's eq.(1) schedule computation
+        # (see model_module.py).
+        dict_args['encoder_input_frames'] = args.train_length // args.audio_downsampling_factor
     beatfcos = model_module.create_beatfcos_model(num_classes=2, clusters=training_data_clusters, args=args, **dict_args)
 
     if torch.cuda.is_available():
@@ -636,21 +768,77 @@ if __name__ == '__main__':
     if checkpoint_path:
         beatfcos.load_state_dict(torch.load(checkpoint_path, device))
 
+    if args.eval_gtzan_ckpt:
+        # Standalone eval mode: score one checkpoint on GTZAN (beat_this's own held-out
+        # test set, never in --spect_datasets for any of our runs) using OUR OWN
+        # postprocessing (evaluate_beat_f_measure_subset) - the subset head has no
+        # framewise output for beat_this's minimal/DBN postprocessing to apply to, so
+        # this is the correct comparison, not a compromise. Only the test-set identity
+        # (GTZAN) is being matched to beat_this's protocol here, not the postprocessing.
+        beatfcos.load_state_dict(torch.load(args.eval_gtzan_ckpt, device))
+        beatfcos.eval()
+        gtzan_test_dataset = BeatThisSpectDataset(
+            args.spect_root, args.spect_annot_root, ["gtzan"], subset="test",
+            validation_fold=args.validation_fold, target_length=_eval_frames)
+        gtzan_loader = torch.utils.data.DataLoader(
+            gtzan_test_dataset, shuffle=False, batch_size=1,
+            num_workers=args.num_workers, pin_memory=False, collate_fn=collater)
+        real_num_candidates = getattr(getattr(beatfcos, "module", beatfcos), "num_candidates", args.num_candidates)
+        gtzan_beat_f, gtzan_downbeat_f, _ = evaluate_beat_f_measure_subset(
+            gtzan_loader, beatfcos, args.audio_downsampling_factor, args.audio_sample_rate,
+            window_frames=real_num_candidates * SUBSET_FRAMES_PER_CANDIDATE,
+            border_frames=args.stitch_beta_frames,
+            threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat,
+            label="[GTZAN test] ")
+        gtzan_joint = (gtzan_beat_f + gtzan_downbeat_f) / 2
+        print(f"=== GTZAN TEST (checkpoint={args.eval_gtzan_ckpt}) ===")
+        print(f"Beat: {gtzan_beat_f:.3f} | Downbeat: {gtzan_downbeat_f:.3f} | Joint: {gtzan_joint:.3f}")
+        sys.exit(0)
+
     beatfcos.training = True
     print(f'[MEM] after model init: alloc={torch.cuda.memory_allocated()/1e9:.3f}GB, reserved={torch.cuda.memory_reserved()/1e9:.3f}GB')
+
+    accum = max(1, args.accumulate_grad_batches)
 
     if args.optimizer == 'radam_lookahead':
         from beatfcos.optim import Lookahead
         base_optimizer = torch.optim.RAdam(beatfcos.parameters(), lr=args.lr, weight_decay=1e-4)
         optimizer = Lookahead(base_optimizer, k=args.lookahead_k, alpha=args.lookahead_alpha)
         print(f"[optim] RAdam + Lookahead(k={args.lookahead_k}, alpha={args.lookahead_alpha}) lr={args.lr}")
+    elif args.optimizer == 'adamw':
+        # beat_this 원 저장소와 동일하게, weight_decay를 2차원 이상 파라미터(행렬)에만
+        # 적용하고 bias/norm(1차원 이하)에는 0을 줌.
+        decay_params = [p for p in beatfcos.parameters() if p.requires_grad and p.ndim >= 2]
+        no_decay_params = [p for p in beatfcos.parameters() if p.requires_grad and p.ndim <= 1]
+        param_groups = [
+            {"params": decay_params, "weight_decay": args.adamw_weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+        print(f"[optim] AdamW lr={args.lr} weight_decay={args.adamw_weight_decay} "
+              f"(decay params={len(decay_params)}, no-decay params={len(no_decay_params)})")
     else:
         optimizer = torch.optim.Adam(beatfcos.parameters(), lr=args.lr, weight_decay=1e-4) # Default weight decay is 0
-    lr_patience = args.patience if args.lr_patience is None else args.lr_patience
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=lr_patience, factor=args.lr_factor,
-        min_lr=args.min_lr, verbose=True)
-    print(f"[optim] scheduler: patience={lr_patience} factor={args.lr_factor} min_lr={args.min_lr}")
+
+    if args.lr_schedule == 'cosine_warmup':
+        # beat_this 원 저장소의 CosineWarmupScheduler(interval="step")를 그대로 재현.
+        # step()은 accumulation window가 끝날 때(=실제 optimizer.step()마다) 호출됨
+        # (아래 optimizer.step() 직후 호출부 참고) - 그래서 total_steps도 raw iteration
+        # 수가 아니라 "실제 optimizer step 수"(=accum으로 나눈 값, PyTorch Lightning의
+        # estimated_stepping_batches와 같은 개념)로 계산해야 warmup_steps=1000이 beat_this
+        # 원 레시피와 동일하게 "1000번째 optimizer step"에서 끝남.
+        steps_per_epoch = math.ceil(len(train_dataloader) / accum)
+        total_steps = steps_per_epoch * args.epochs
+        scheduler = CosineWarmupScheduler(optimizer, warmup=args.warmup_steps, max_iters=total_steps)
+        print(f"[optim] scheduler: cosine_warmup warmup_steps={args.warmup_steps} "
+              f"total_steps={total_steps} ({steps_per_epoch} optimizer steps/epoch "
+              f"[{len(train_dataloader)} iters / accum={accum}] x {args.epochs} epochs)")
+    else:
+        lr_patience = args.patience if args.lr_patience is None else args.lr_patience
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', patience=lr_patience, factor=args.lr_factor,
+            min_lr=args.min_lr, verbose=True)
+        print(f"[optim] scheduler: patience={lr_patience} factor={args.lr_factor} min_lr={args.min_lr}")
 
     # checkpoint_path와 짝이 되는 optim_{epoch}.pt가 있으면 optimizer/scheduler
     # state도 이어서 복원함 - 없으면(옛날 체크포인트 등) 그냥 새 optimizer로
@@ -686,6 +874,9 @@ if __name__ == '__main__':
         beatfcos.eval()
         _, _, highest_joint_f_measure = evaluate_macro_joint_f_measure(beatfcos, label="Resume check")
         print(f"resume 기준점(highest_joint_f_measure) = {highest_joint_f_measure:0.3f}")
+
+    breakpoint()  # <- 메인 학습 루프 시작 직전, 여기서 터미널이 멈추고 (Pdb) 뜸
+
     for epoch_num in range(start_epoch, args.epochs):
         beatfcos.train()
 
@@ -704,8 +895,18 @@ if __name__ == '__main__':
                 audio = audio.cuda()
                 target = target.cuda()
 
+            # --accumulate_grad_batches > 1: N개 iteration(micro-batch)마다 딱 한 번만
+            # optimizer.step()/scheduler.step()을 호출 (beat_this 원 레시피: batch_size=8,
+            # accumulate_grad_batches=8 -> effective batch 64). is_accum_end은 그 N개의
+            # 마지막 iteration이거나(정확히 나누어떨어질 때), 에폭의 마지막 iteration일
+            # 때(나머지 micro-batch가 덜 찬 채로 에폭이 끝나도 그동안 쌓인 gradient를
+            # 버리지 않고 step하기 위함) 참이 됨.
+            is_accum_start = (iter_num % accum == 0)
+            is_accum_end = ((iter_num + 1) % accum == 0) or (iter_num == len(train_dataloader) - 1)
+
             try:
-                optimizer.zero_grad()
+                if is_accum_start:
+                    optimizer.zero_grad()
 
                 classification_loss, regression_loss,\
                 leftness_loss, adjacency_constraint_loss,\
@@ -746,43 +947,63 @@ if __name__ == '__main__':
                 # SubsetCriterion catches the known source; this catches the rest.
                 if not torch.isfinite(loss):
                     print(f"[train] WARNING: non-finite loss at epoch {epoch_num} "
-                          f"iteration {iter_num}; skipping optimizer step", flush=True)
-                    optimizer.zero_grad()
+                          f"iteration {iter_num}; skipping this micro-batch", flush=True)
+                    # zero_grad() 안 함: accum > 1일 때 이전 micro-batch들이 이미 쌓아둔
+                    # gradient를 여기서 지우면 그 기여가 통째로 사라짐. 이 micro-batch
+                    # 하나만 건너뛰고(backward 자체를 안 함) 누적은 계속 이어감.
                     continue
 
-                loss.backward()
+                # accum > 1이면 각 micro-batch의 loss를 accum으로 나눠서 backward -
+                # N개 micro-batch의 gradient를 그냥 다 더하면 평균이 아니라 합이 되어
+                # effective batch로 한 번에 학습한 것과 스케일이 달라짐. 나눠주면
+                # N개를 누적한 뒤의 총 gradient가 정확히 "평균 loss의 gradient"가 됨.
+                (loss / accum).backward()
 
-                # --grad_clip을 명시적으로 안 주면 기존처럼 자동 선택
-                # (hungarian=1.0, fcos=0.1). 0 이하로 주면 원 논문 방식대로
-                # clipping을 아예 안 함 (자세한 이유는 위 argparse 주석 참고).
-                if args.grad_clip is None:
-                    clip_norm = 1.0 if args.head_type in ("hungarian", "subset") else 0.1
+                if not is_accum_end:
+                    # 아직 이 accumulation window 안 -> step 없이 다음 micro-batch로.
+                    # loss_hist/epoch_loss 기록은 이 if/else 블록 다음의 공통 코드에서
+                    # 매 iteration마다 한 번씩 처리됨 (여기서 또 append하면 중복 카운트).
+                    pass
                 else:
-                    clip_norm = args.grad_clip
+                    # --grad_clip을 명시적으로 안 주면 기존처럼 자동 선택
+                    # (hungarian=1.0, fcos=0.1). 0 이하로 주면 원 논문 방식대로
+                    # clipping을 아예 안 함 (자세한 이유는 위 argparse 주석 참고).
+                    if args.grad_clip is None:
+                        clip_norm = 1.0 if args.head_type in ("hungarian", "subset") else 0.1
+                    else:
+                        clip_norm = args.grad_clip
 
-                # Check the GRADIENTS, not just the loss. A finite loss is not enough:
-                # log_softmax is computed over the whole batch at once, so a fragment
-                # whose logits are NaN stays in the graph even when its loss terms are
-                # dropped, and grad_weight = grad_out^T @ activation turns 0 x NaN into
-                # NaN. clip_grad_norm_ then spreads that single NaN across EVERY
-                # parameter (total_norm becomes NaN, so every grad is scaled by NaN).
-                # clip_grad_norm_ conveniently returns the pre-clip total norm, so this
-                # costs one extra scalar read on the path that already computes it.
-                if clip_norm > 0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
-                    grads_finite = bool(torch.isfinite(total_norm))
-                else:
-                    grads_finite = all(
-                        bool(torch.isfinite(p.grad).all())
-                        for p in beatfcos.parameters() if p.grad is not None)
+                    # Check the GRADIENTS, not just the loss. A finite loss is not enough:
+                    # log_softmax is computed over the whole batch at once, so a fragment
+                    # whose logits are NaN stays in the graph even when its loss terms are
+                    # dropped, and grad_weight = grad_out^T @ activation turns 0 x NaN into
+                    # NaN. clip_grad_norm_ then spreads that single NaN across EVERY
+                    # parameter (total_norm becomes NaN, so every grad is scaled by NaN).
+                    # clip_grad_norm_ conveniently returns the pre-clip total norm, so this
+                    # costs one extra scalar read on the path that already computes it.
+                    if clip_norm > 0:
+                        total_norm = torch.nn.utils.clip_grad_norm_(beatfcos.parameters(), clip_norm)
+                        grads_finite = bool(torch.isfinite(total_norm))
+                    else:
+                        grads_finite = all(
+                            bool(torch.isfinite(p.grad).all())
+                            for p in beatfcos.parameters() if p.grad is not None)
 
-                if not grads_finite:
-                    print(f"[train] WARNING: non-finite gradients at epoch {epoch_num} "
-                          f"iteration {iter_num}; skipping optimizer step", flush=True)
-                    optimizer.zero_grad()
-                    continue
+                    if not grads_finite:
+                        print(f"[train] WARNING: non-finite gradients at epoch {epoch_num} "
+                              f"iteration {iter_num}; skipping optimizer step", flush=True)
+                        optimizer.zero_grad()
+                        loss_hist.append(float(loss))
+                        epoch_loss.append(float(loss))
+                        continue
 
-                optimizer.step()
+                    optimizer.step()
+                    if args.lr_schedule == 'cosine_warmup':
+                        # plateau 모드의 scheduler.step(joint_f_measure)는 epoch당 한 번,
+                        # 검증 지표로 호출되지만(맨 아래), cosine_warmup은 accumulation
+                        # window가 끝날 때(=실제 optimizer step마다) 스텝을 세야 하는
+                        # 스케줄이라 여기서 호출.
+                        scheduler.step()
 
                 loss_hist.append(float(loss))
                 epoch_loss.append(float(loss))
@@ -870,7 +1091,10 @@ if __name__ == '__main__':
             print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | BBOX(L1): {np.mean(reg_losses):0.3f} | GIOU: {np.mean(lft_losses):0.3f}")
         else:
             print(f"Epoch = {epoch_num} | CLS: {np.mean(cls_losses):0.3f} | REG: {np.mean(reg_losses):0.3f} | LFT: {np.mean(lft_losses):0.3f} | ADJ: {np.mean(adj_losses):0.3f} | PHA: {np.mean(pha_losses):0.3f}")
-        scheduler.step(joint_f_measure)
+        if args.lr_schedule != 'cosine_warmup':
+            # cosine_warmup은 위 iteration 루프 안에서 매 step마다 이미 진행됨 -
+            # ReduceLROnPlateau만 검증 지표(joint_f_measure)로 epoch당 한 번 호출.
+            scheduler.step(joint_f_measure)
 
         should_save_checkpoint = False
         if joint_f_measure > highest_joint_f_measure:
@@ -891,6 +1115,18 @@ if __name__ == '__main__':
             # 20 에폭 넘게 이전 best를 못 넘는 정체가 있었음).
             new_optim_path = os.path.join(args.checkpoint_dir, 'optim_{}.pt'.format(epoch_num))
             torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict()}, new_optim_path)
+
+        # beat_this 원본은 best epoch을 고르지 않고 매 epoch 마지막 가중치를 그냥
+        # 덮어써서 씀(논문 9절: validation loss가 올라가도 계속 학습시켜 overconfident한
+        # 예측을 얻으려는 의도적 설계). 우리 subset head에서도 이 방식이 더 나은지는
+        # 검증된 바 없어서 위 best-checkpoint 저장 방식은 그대로 두되, 매 epoch 끝에
+        # "가장 최근 epoch" 가중치도 별도 고정 파일명(덮어쓰기)으로 추가 저장해서, 학습을
+        # 어느 시점에 멈추더라도 best와 last를 사후에 직접 비교할 수 있게 함.
+        last_checkpoint_path = os.path.join(args.checkpoint_dir, 'retinanet_last.pt')
+        torch.save(beatfcos.state_dict(), last_checkpoint_path)
+        last_optim_path = os.path.join(args.checkpoint_dir, 'optim_last.pt')
+        torch.save({'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
+                    'epoch': epoch_num, 'joint_f_measure': joint_f_measure}, last_optim_path)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

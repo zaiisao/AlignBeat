@@ -114,10 +114,47 @@
             "justMyCode": false
         },
         {
+            "name": "Debug train.py (beat_this + subset, tiny/fast)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--backbone_type", "beat_this", "--head_type", "subset",
+                "--spect_root", "/home/taegum/beat_this/data/audio/spectrograms",
+                "--spect_annot_root", "/home/taegum/beat_this/data/annotations",
+                // candombe만: 35트랙짜리라 로딩이 빨라서 디버깅용으로 씀. 흐름만 볼 거면
+                // 데이터셋 종류는 안 중요함 - 필요하면 다른 데이터셋으로 바꿔도 됨.
+                "--spect_datasets", "candombe",
+                "--audio_downsampling_factor", "441", "--validation_fold", "0", "--n_min", "150",
+                "--class_attention_layers", "1", "--class_attention_heads", "4",
+                "--optimizer", "adamw", "--lr", "0.0008",
+                "--lr_schedule", "cosine_warmup", "--warmup_steps", "200",
+                "--accumulate_grad_batches", "8", "--batch_size", "4",
+                "--epochs", "1",
+                // num_workers=0 필수: 워커가 별도 프로세스로 뜨면 그 안에 브레이크포인트가
+                // 안 걸림(디버거가 메인 프로세스만 붙잡고 있음). 흐름을 보는 게 목적이라
+                // 느려도 0으로 둬야 실제로 step-into가 됨.
+                "--num_workers", "0",
+                "--gpu", "3",
+                "--checkpoint_dir", "/tmp/debug_ckpt_tmp",
+                "--log_file", "/tmp/debug_train.log"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
             "name": "Python: Current File",
             "type": "python",
             "request": "launch",
             "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Debug check_shapes_beat_this.py",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/check_shapes_beat_this.py",
             "console": "integratedTerminal",
             "justMyCode": false
         }

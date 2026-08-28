@@ -953,4 +953,17 @@ def evaluate_beat_f_measure_subset(dataloader, model, audio_downsampling_factor,
     print(f"{label}Average beat F-measure: {beat_mean_f_measure:0.3f}")
     print(f"{label}Average downbeat F-measure: {downbeat_mean_f_measure:0.3f}\n")
 
+    # beat_this Table 2와 같은 열(F1/CMLt/AMLt)로 바로 대조할 수 있도록 추가.
+    # mir_eval.beat.evaluate()가 애초에 CMLt/AMLt까지 다 계산해서 beat_scores/
+    # downbeat_scores 안에 넣어주고 있었는데, 지금까지는 F-measure만 뽑아 썼음.
+    if results:
+        # mir_eval.beat.evaluate()의 실제 키는 "CMLt"/"AMLt"가 아니라 풀네임
+        # ("Correct/Any Metric Level Total")이다 (mir_eval.beat.evaluate 소스로 확인).
+        beat_cmlt = float(np.mean([r['beat_scores']['Correct Metric Level Total'] for r in results]))
+        beat_amlt = float(np.mean([r['beat_scores']['Any Metric Level Total'] for r in results]))
+        downbeat_cmlt = float(np.mean([r['downbeat_scores']['Correct Metric Level Total'] for r in results]))
+        downbeat_amlt = float(np.mean([r['downbeat_scores']['Any Metric Level Total'] for r in results]))
+        print(f"{label}Average beat CMLt: {beat_cmlt:0.3f} | AMLt: {beat_amlt:0.3f}")
+        print(f"{label}Average downbeat CMLt: {downbeat_cmlt:0.3f} | AMLt: {downbeat_amlt:0.3f}\n")
+
     return beat_mean_f_measure, downbeat_mean_f_measure, results

@@ -33,17 +33,60 @@ import torch
 
 from beatfcos.dataloader import BEAT_ONLY_DATASETS, CLASS_BEAT_ONLY
 
+# Mask augmentation, ported from beat_this/dataset/augment.py (augment_mask_ /
+# apply_mask_excerpt) with beat_this's own default params (launch_scripts/train.py:50-56):
+# kind="permute", 1-6 masks per crop, each 0.1-2s long, split into 5-9 pieces and
+# shuffled in place. Operates on the already-cropped torch tensor (our pipeline
+# converts to a tensor earlier than beat_this's numpy-based loader does).
+_MASK_DEFAULTS = dict(kind="permute", min_count=1, max_count=6,
+                       min_len=0.1, max_len=2.0, min_parts=5, max_parts=9)
+
+
+def _apply_mask_excerpt(excerpt, kind, min_parts, max_parts):
+    if kind == "permute":
+        num_parts = random.randint(min_parts, max_parts)
+        num_parts = min(num_parts, len(excerpt) + 1)
+        if num_parts <= 1:
+            return
+        positions = sorted(random.sample(range(len(excerpt)), num_parts - 1))
+        parts, prev = [], 0
+        for pos in positions:
+            parts.append(excerpt[prev:pos])
+            prev = pos
+        parts.append(excerpt[prev:])
+        order = list(range(len(parts)))
+        random.shuffle(order)
+        excerpt[:] = torch.cat([parts[i] for i in order])
+    elif kind == "zero":
+        excerpt[:] = 0
+    else:
+        raise ValueError(f"Unsupported mask operation: {kind}")
+
+
+def _augment_mask(spect, fps, kind="permute", min_count=1, max_count=6,
+                   min_len=0.1, max_len=2.0, min_parts=5, max_parts=9):
+    count = random.randint(min_count, max_count)
+    min_len_f, max_len_f = int(min_len * fps), int(max_len * fps)
+    for _ in range(count):
+        length = random.randint(min_len_f, max_len_f)
+        if length <= 0 or length >= len(spect):
+            continue
+        start = random.randint(0, len(spect) - length)
+        _apply_mask_excerpt(spect[start:start + length], kind, min_parts, max_parts)
+    return spect
+
 
 class BeatThisSpectDataset(torch.utils.data.Dataset):
     def __init__(self, spect_root, annot_root, datasets, subset="train",
                  validation_fold=0, num_folds=8, target_length=1280,
                  frames_per_second=50.0, tempo_aug=(), pitch_aug=(),
-                 beat_only_datasets=None):
+                 mask_aug=False, beat_only_datasets=None):
         self.spect_root, self.annot_root = spect_root, annot_root
         self.subset, self.target_length = subset, target_length
         self.fps = frames_per_second
         self.tempo_aug = tuple(tempo_aug)
         self.pitch_aug = tuple(pitch_aug)
+        self.mask_aug = bool(mask_aug)
         # Which datasets lack downbeat labels is read from their own info.json rather
         # than hardcoded: our BEAT_ONLY_DATASETS lists only smc, but this corpus also
         # ships simac with has_downbeats=false (595 tracks). Treating those beats as
@@ -144,6 +187,9 @@ class BeatThisSpectDataset(torch.utils.data.Dataset):
             start = 0
             spect = torch.nn.functional.pad(spect, (0, 0, 0, self.target_length - total))
         offset = start / self.fps
+
+        if self.subset == "train" and self.mask_aug:
+            spect = _augment_mask(spect, self.fps, **_MASK_DEFAULTS)
 
         target = torch.zeros(2, self.target_length)
         for t in beats - offset:
