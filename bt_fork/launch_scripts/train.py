@@ -78,6 +78,14 @@ def main(args):
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
+    if args.marginal_meters:
+        text = args.marginal_meters
+        args.marginal_meters = (tuple(range(int(text.split('-')[0]), int(text.split('-')[1]) + 1))
+                                if '-' in text else tuple(int(v) for v in text.split(',')))
+        args.marginal = True
+    else:
+        args.marginal_meters = ()
+
     pl_model = PLBeatThis(
         spect_dim=128,
         fps=50,
@@ -98,19 +106,31 @@ def main(args):
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
         head_type=args.head_type,
+        predict_precision=args.predict_precision,
+        quantize_targets=args.quantize_targets,
         encoder_input_frames=args.train_length,
         n_min=args.n_min,
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
         tau_beat=args.tau_beat,
         tau_downbeat=args.tau_downbeat,
+        # Every SubsetCriterion knob is passed explicitly. A construction that is
+        # implemented but has no path from the CLI is worse than one that is absent:
+        # an ablation of it shows no difference and reads as "the idea does not help",
+        # when in fact it never ran. --lambda_r was exactly that until now.
         subset_kwargs={
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
             "b_scale": args.b_scale,
+            "learn_b": args.learn_b,
             "joint_phase": args.joint_phase,
             "marginal": args.marginal,
+            "marginal_background": not args.literal_eq23,
+            "marginal_meters": args.marginal_meters,
             "meter_length": args.meter_L,
+            "mu_meter": args.mu_meter,
+            "lambda_r": args.lambda_r,
+            "cont_weight": args.cont_weight,
         },
     )
     for part in args.compile:
@@ -225,6 +245,22 @@ if __name__ == "__main__":
     parser.add_argument("--joint_phase", action="store_true", default=False)
     parser.add_argument("--marginal", action="store_true", default=False)
     parser.add_argument("--meter_L", type=int, default=0)
+    parser.add_argument("--mu_meter", type=float, default=0.0,
+                        help="Section 4.2 eq. (6): known-meter spacing inside the selection")
+    parser.add_argument("--lambda_r", type=float, default=0.0,
+                        help="Section 10.4 eqs. (36)-(37): downbeat periodicity regularizer")
+    parser.add_argument("--cont_weight", type=float, default=0.0)
+    parser.add_argument("--learn_b", action="store_true", default=False,
+                        help="Section 4.1 eq. (5): estimate the Laplace scale b by MLE")
+    parser.add_argument("--literal_eq23", action="store_true", default=False,
+                        help="use eq. (23) literally (-log Z alone); unbounded below")
+    parser.add_argument("--marginal_meters", type=str, default="",
+                        help="Section 8.6: e.g. 2-12 or 3,4,6; empty keeps L fixed")
+    parser.add_argument("--predict_precision", action="store_true", default=False,
+                        help="Section 4.1.2/4.1.3: per-candidate Laplace precision b_j")
+    parser.add_argument("--quantize_targets", action="store_true", default=False,
+                        help="round ground-truth event times to the frame grid, matching "
+                             "what the dense head is necessarily trained on")
     parser.add_argument(
         "--train-length",
         type=int,

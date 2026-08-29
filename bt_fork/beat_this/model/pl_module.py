@@ -44,6 +44,9 @@ class PLBeatThis(LightningModule):
         sum_head=True,
         partial_transformers=True,
         head_type: str = "dense",
+        predict_precision: bool = False,
+        quantize_targets: bool = False,
+        stitch_border: int = None,
         # Only used by head_type="subset": T is needed to precompute the downsampling
         # schedule, and N_min is the physical tempo bound the schedule may not go below.
         encoder_input_frames: int = 1500,
@@ -59,6 +62,8 @@ class PLBeatThis(LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
+        self.quantize_targets = quantize_targets
+        self.stitch_border = stitch_border
         self.tau_beat = tau_beat
         self.tau_downbeat = tau_downbeat
         # create model
@@ -77,6 +82,7 @@ class PLBeatThis(LightningModule):
             n_min=n_min,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
+            predict_precision=predict_precision,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -171,8 +177,19 @@ class PLBeatThis(LightningModule):
             downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
             has_downbeats = bool(batch["downbeat_mask"][index])
 
-            keep = (beats >= 0) & (beats < window_seconds)
-            beats = np.sort(beats[keep])
+            keep = (beats >= 0) & (beats <= window_seconds)
+            beats = np.unique(beats[keep])   # unique, not just sorted: Definition 1
+            if self.quantize_targets:
+                # Round to the frame grid, which is what the DENSE head is necessarily
+                # trained on (its output is per-frame, so it cannot represent sub-frame
+                # targets). Off by default: eq. (1) produces a continuous time and
+                # Definition 1 is stated over continuous ground truth, so quantizing
+                # would degrade this head to match a limitation of the other one.
+                # Exposed as a flag because it is a real asymmetry in the A/B -- the
+                # subset arm otherwise sees ground truth up to 1/(2*fps) = 10 ms more
+                # precise than the dense arm does -- and its size should be measured
+                # rather than argued about.
+                beats = np.round(beats * self.fps) / self.fps
             if has_downbeats:
                 classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
             else:
@@ -186,10 +203,12 @@ class PLBeatThis(LightningModule):
 
     def _compute_loss(self, batch, model_prediction):
         if self.subset_criterion is not None:
+            raw_precision = model_prediction.get("raw_precision")
             losses, _stats = self.subset_criterion(
                 model_prediction["class_logits"].float(),
                 model_prediction["t_hat"].float(),
-                self._subset_targets(batch))
+                self._subset_targets(batch),
+                None if raw_precision is None else raw_precision.float())
             # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
             # are unchanged; they carry the class and timing terms of loss (8).
             return {"beat": losses["class"], "downbeat": losses["time"],
@@ -400,7 +419,17 @@ class PLBeatThis(LightningModule):
         from beat_this.inference import split_piece
 
         spect = batch["spect"][0]
-        chunks, starts = split_piece(spect, chunk_size, border_size=0,
+        # Border at chunk seams. The dense path always discards 2*tolerance frames
+        # either side of an internal boundary (aggregate_prediction), and Section 9.3
+        # likewise requires beta in (0, D/2) so that a candidate near a fragment edge is
+        # never the ONLY candidate covering that moment. Using 0 here left the two arms
+        # decoding under different edge conventions, which is not a head difference.
+        # Default matches whatever the dense arm uses, so the A/B stays controlled.
+        border = self.stitch_border
+        if border is None:
+            border = 2 * getattr(self.beat_loss, "tolerance", 3) if hasattr(
+                self, "beat_loss") else 6
+        chunks, starts = split_piece(spect, chunk_size, border_size=border,
                                      avoid_short_end=True)
         beats, downbeats = [], []
         covered_to = 0.0                       # end of what earlier chunks already own

@@ -54,6 +54,7 @@ class BeatThis(nn.Module):
         n_min: int = 172,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
+        predict_precision: bool = False,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -114,7 +115,8 @@ class BeatThis(nn.Module):
             self.task_heads = SubsetHead(
                 transformer_dim, encoder_input_frames=encoder_input_frames,
                 n_min=n_min, class_attention_layers=class_attention_layers,
-                class_attention_heads=class_attention_heads)
+                class_attention_heads=class_attention_heads,
+                predict_precision=predict_precision)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -328,7 +330,8 @@ class SubsetHead(nn.Module):
     """
 
     def __init__(self, input_dim, encoder_input_frames=1500, n_min=172,
-                 class_attention_layers=0, class_attention_heads=4):
+                 class_attention_layers=0, class_attention_heads=4,
+                 predict_precision=False):
         super().__init__()
         self.downsample = ProgressiveDownsample(
             d_model=input_dim, T=encoder_input_frames, N_min=n_min)
@@ -337,12 +340,20 @@ class SubsetHead(nn.Module):
         self.head = SubsetSelectionHead(
             feature_size=input_dim, num_candidates=self.num_candidates,
             level_strides=(1,), class_attention_layers=class_attention_layers,
-            class_attention_heads=class_attention_heads)
+            class_attention_heads=class_attention_heads,
+            predict_precision=predict_precision)
 
     def forward(self, x):                      # x: (B, T, dim)
         z = self.downsample(x)                 # (B, N, dim)
         out = self.head([z.transpose(1, 2)])   # the head wants channel-first levels
-        return {"class_logits": out[0], "t_hat": out[1]}
+        result = {"class_logits": out[0], "t_hat": out[1]}
+        if len(out) > 2:
+            # Section 4.1.2's raw per-candidate precision output u_j; the criterion
+            # applies b_j = b_min + softplus(u_j). Only present when the head was built
+            # with predict_precision, so its absence is how the criterion knows to fall
+            # back to the shared global b.
+            result["raw_precision"] = out[2]
+        return result
 
 
 class SumHead(nn.Module):
