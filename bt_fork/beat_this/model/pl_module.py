@@ -13,7 +13,11 @@ from pytorch_lightning import LightningModule
 
 import beat_this.model.loss
 from beat_this.inference import split_predict_aggregate
+import numpy as np
+
 from beat_this.model.beat_tracker import BeatThis
+from beat_this.model.subset_head import (BEAT, CLASS_UNKNOWN, DOWNBEAT,
+                                         SubsetCriterion, decode_events)
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
 
@@ -39,14 +43,27 @@ class PLBeatThis(LightningModule):
         eval_trim_beats=5,
         sum_head=True,
         partial_transformers=True,
+        head_type: str = "dense",
+        # Only used by head_type="subset": T is needed to precompute the downsampling
+        # schedule, and N_min is the physical tempo bound the schedule may not go below.
+        encoder_input_frames: int = 1500,
+        n_min: int = 172,
+        class_attention_layers: int = 0,
+        class_attention_heads: int = 4,
+        subset_kwargs: dict = None,
+        tau_beat: float = 0.2,
+        tau_downbeat: float = 0.2,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
+        self.tau_beat = tau_beat
+        self.tau_downbeat = tau_downbeat
         # create model
         self.model = BeatThis(
+            head_type=head_type,
             spect_dim=spect_dim,
             transformer_dim=transformer_dim,
             ff_mult=ff_mult,
@@ -56,12 +73,22 @@ class PLBeatThis(LightningModule):
             dropout=dropout,
             sum_head=sum_head,
             partial_transformers=partial_transformers,
+            encoder_input_frames=encoder_input_frames,
+            n_min=n_min,
+            class_attention_layers=class_attention_layers,
+            class_attention_heads=class_attention_heads,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         # set up the losses
         self.pos_weights = pos_weights
-        if loss_type == "shift_tolerant_weighted_bce":
+        # The order-preserving alignment head brings its own loss: the DP selects which
+        # candidates are responsible for which events, and the loss is evaluated at that
+        # selection. Nothing frame-wise applies, so the BCE variants below are skipped.
+        self.subset_criterion = None
+        if head_type == "subset":
+            self.subset_criterion = SubsetCriterion(**(subset_kwargs or {}))
+        elif loss_type == "shift_tolerant_weighted_bce":
             self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
                 pos_weight=pos_weights["beat"]
             )
@@ -96,7 +123,78 @@ class PLBeatThis(LightningModule):
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
+    def _subset_decode(self, batch, model_prediction):
+        """Algorithm 5 per excerpt, returned as predicted TIMES in seconds.
+
+        The dense path peak-picks a frame activation; here each candidate already
+        carries a continuous time, so decoding is a per-candidate class decision and a
+        threshold, with no NMS -- eq. (1) forbids crossings structurally. Returning
+        times in seconds means _compute_metrics needs no change at all: it already
+        compares predicted times against truth_orig_*.
+
+        The beat list includes downbeats, matching the convention the ground truth and
+        mir_eval use (a downbeat is also a beat).
+        """
+        num_frames = batch["truth_beat"].shape[-1]
+        window_seconds = num_frames / self.fps
+        beats, downbeats = [], []
+        for index in range(len(batch["spect"])):
+            classes, times, _scores = decode_events(
+                model_prediction["class_logits"][index].float(),
+                model_prediction["t_hat"][index].float(),
+                self.tau_beat, self.tau_downbeat)
+            seconds = (times * window_seconds).detach().cpu().numpy()
+            classes = classes.detach().cpu().numpy()
+            beats.append(np.sort(seconds))
+            downbeats.append(np.sort(seconds[classes == DOWNBEAT]))
+        return tuple(beats), tuple(downbeats)
+
+    def _subset_targets(self, batch):
+        """Ground-truth events for the alignment head, from this batch's own annotations.
+
+        truth_orig_beat / truth_orig_downbeat are unquantized times in seconds, already
+        cropped and shifted to the excerpt by prepare_annotations, stored as bytes so
+        variable-length arrays survive collation. Times are normalized by the excerpt
+        duration to land on eq. (1)'s (0, 1] axis.
+
+        downbeat_mask is False for datasets with no downbeat annotation (smc, simac).
+        Their events become CLASS_UNKNOWN -- the B* label of Section 2 -- rather than
+        being asserted to be non-downbeats, which is what routes them through the
+        beat-only loss of Section 8 instead of supervising them wrongly.
+        """
+        num_frames = batch["truth_beat"].shape[-1]
+        window_seconds = num_frames / self.fps
+        device = batch["spect"].device
+        targets = []
+        for index in range(len(batch["spect"])):
+            beats = np.frombuffer(batch["truth_orig_beat"][index])
+            downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
+            has_downbeats = bool(batch["downbeat_mask"][index])
+
+            keep = (beats >= 0) & (beats < window_seconds)
+            beats = np.sort(beats[keep])
+            if has_downbeats:
+                classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
+            else:
+                classes = np.full(len(beats), CLASS_UNKNOWN)
+            targets.append({
+                "times": torch.as_tensor(beats / window_seconds,
+                                         dtype=torch.float32, device=device),
+                "classes": torch.as_tensor(classes, dtype=torch.long, device=device),
+            })
+        return targets
+
     def _compute_loss(self, batch, model_prediction):
+        if self.subset_criterion is not None:
+            losses, _stats = self.subset_criterion(
+                model_prediction["class_logits"].float(),
+                model_prediction["t_hat"].float(),
+                self._subset_targets(batch))
+            # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
+            # are unchanged; they carry the class and timing terms of loss (8).
+            return {"beat": losses["class"], "downbeat": losses["time"],
+                    "total": losses["total"]}
+
         beat_mask = batch["padding_mask"]
         beat_loss = self.beat_loss(
             model_prediction["beat"], batch["truth_beat"].float(), beat_mask
@@ -210,11 +308,14 @@ class PLBeatThis(LightningModule):
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
         # postprocess the predictions
-        postp_beat, postp_downbeat = self.postprocessor(
-            model_prediction["beat"],
-            model_prediction["downbeat"],
-            batch["padding_mask"],
-        )
+        if self.subset_criterion is not None:
+            postp_beat, postp_downbeat = self._subset_decode(batch, model_prediction)
+        else:
+            postp_beat, postp_downbeat = self.postprocessor(
+                model_prediction["beat"],
+                model_prediction["downbeat"],
+                batch["padding_mask"],
+            )
         # compute the metrics
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="val")
         # log
@@ -223,9 +324,13 @@ class PLBeatThis(LightningModule):
 
     def test_step(self, batch, batch_idx):
         metrics, model_prediction, _, _ = self.predict_step(batch, batch_idx)
-        losses = self._compute_loss(batch, model_prediction)
-        # log
-        self.log_losses(losses, len(batch["spect"]), "test")
+        # The alignment head returns no piece-level framewise prediction (its loss is
+        # defined over a fixed-length excerpt against a matched set of events, which a
+        # whole piece is not), so there is no test loss to log -- only metrics, which
+        # are the comparable quantity anyway.
+        if model_prediction is not None:
+            losses = self._compute_loss(batch, model_prediction)
+            self.log_losses(losses, len(batch["spect"]), "test")
         self.log_metrics(metrics, batch["spect"].shape[0], "test")
 
     def predict_step(
@@ -254,6 +359,9 @@ class PLBeatThis(LightningModule):
             raise ValueError(
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
+        if self.subset_criterion is not None:
+            return self._subset_predict_piece(batch, chunk_size, overlap_mode)
+
         # compute border size according to the loss type
         if hasattr(
             self.beat_loss, "tolerance"
@@ -275,6 +383,48 @@ class PLBeatThis(LightningModule):
         # compute the metrics
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="test")
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
+
+    def _subset_predict_piece(self, batch, chunk_size, overlap_mode):
+        """Whole-piece decoding for the alignment head (Section 9.3).
+
+        split_predict_aggregate cannot be reused: it stitches FRAME-WISE activations
+        along a time axis, whereas this head emits N events per chunk whose times are
+        normalised within their own chunk. So the chunking is reproduced exactly --
+        split_piece with the same chunk_size and avoid_short_end, so the A/B sees the
+        same excerpts -- and the aggregation is done on decoded events instead.
+
+        overlap_mode is honoured at the event level: split_piece moves the final chunk
+        backwards rather than padding, so it overlaps its predecessor, and "keep_first"
+        means an event in that overlap is taken from the earlier chunk.
+        """
+        from beat_this.inference import split_piece
+
+        spect = batch["spect"][0]
+        chunks, starts = split_piece(spect, chunk_size, border_size=0,
+                                     avoid_short_end=True)
+        beats, downbeats = [], []
+        covered_to = 0.0                       # end of what earlier chunks already own
+        for chunk, start in zip(chunks, starts):
+            prediction = self.model(chunk.unsqueeze(0))
+            classes, times, _scores = decode_events(
+                prediction["class_logits"][0].float(),
+                prediction["t_hat"][0].float(),
+                self.tau_beat, self.tau_downbeat)
+            seconds = (start + times * chunk.shape[0]).detach().cpu().numpy() / self.fps
+            classes = classes.detach().cpu().numpy()
+            if overlap_mode == "keep_first":
+                keep = seconds >= covered_to
+                seconds, classes = seconds[keep], classes[keep]
+            covered_to = max(covered_to, (start + chunk.shape[0]) / self.fps)
+            beats.append(seconds)
+            downbeats.append(seconds[classes == DOWNBEAT])
+
+        beats = (np.sort(np.concatenate(beats)),) if beats else (np.zeros(0),)
+        downbeats = (np.sort(np.concatenate(downbeats)),) if downbeats else (np.zeros(0),)
+        metrics = self._compute_metrics(batch, beats, downbeats, step="test")
+        # model_prediction is returned for the caller's loss computation; the alignment
+        # head has no piece-level framewise prediction to hand back, so None is honest.
+        return metrics, None, batch["dataset"], batch["spect_path"]
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW

@@ -116,3 +116,5 @@ downbeat_histogram_*.png
 
 # training artefacts: logs and checkpoints from experiment runs
 runs/
+# machine-specific symlink to the corpus
+bt_fork/data

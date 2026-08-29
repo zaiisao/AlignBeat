@@ -3,6 +3,9 @@ Model definitions for the Beat This! beat tracker.
 """
 
 import contextlib
+
+from beat_this.model.progressive_downsample import ProgressiveDownsample
+from beat_this.model.subset_head import SubsetSelectionHead
 from collections import OrderedDict
 
 import torch
@@ -46,6 +49,11 @@ class BeatThis(nn.Module):
         dropout: dict = {"frontend": 0.1, "transformer": 0.2},
         sum_head: bool = True,
         partial_transformers: bool = True,
+        head_type: str = "dense",
+        encoder_input_frames: int = 1500,
+        n_min: int = 172,
+        class_attention_layers: int = 0,
+        class_attention_heads: int = 4,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -97,7 +105,17 @@ class BeatThis(nn.Module):
         )
 
         # create the output heads
-        if sum_head:
+        if head_type == "subset":
+            # Order-preserving alignment head: the transformer's (B, T, dim) output is
+            # downsampled to N candidates, each emitting a 3-way class distribution and
+            # a raw scalar that eq. (1) turns into a strictly increasing time. Everything
+            # before this line is untouched, which is the point -- the A/B against the
+            # dense head differs in the head and its loss and in nothing else.
+            self.task_heads = SubsetHead(
+                transformer_dim, encoder_input_frames=encoder_input_frames,
+                n_min=n_min, class_attention_layers=class_attention_layers,
+                class_attention_heads=class_attention_heads)
+        elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
             self.task_heads = Head(transformer_dim)
@@ -299,6 +317,32 @@ class PartialFTTransformer(nn.Module):
         x = x + self.ffT(x)
         x = rearrange(x, "(b f) t c -> b c f t", b=b)
         return x
+
+
+class SubsetHead(nn.Module):
+    """Progressive downsample T -> N, then the order-preserving alignment head.
+
+    Returns {"class_logits": (B, N, 3), "t_hat": (B, N)} rather than the dense head's
+    per-frame {"beat", "downbeat"} logits. pl_module branches on the presence of
+    "class_logits" to pick the matching loss and decode path.
+    """
+
+    def __init__(self, input_dim, encoder_input_frames=1500, n_min=172,
+                 class_attention_layers=0, class_attention_heads=4):
+        super().__init__()
+        self.downsample = ProgressiveDownsample(
+            d_model=input_dim, T=encoder_input_frames, N_min=n_min)
+        self.num_candidates = self.downsample.N
+        # No FPN here, so a single level whose stride is 1: the length is already N.
+        self.head = SubsetSelectionHead(
+            feature_size=input_dim, num_candidates=self.num_candidates,
+            level_strides=(1,), class_attention_layers=class_attention_layers,
+            class_attention_heads=class_attention_heads)
+
+    def forward(self, x):                      # x: (B, T, dim)
+        z = self.downsample(x)                 # (B, N, dim)
+        out = self.head([z.transpose(1, 2)])   # the head wants channel-first levels
+        return {"class_logits": out[0], "t_hat": out[1]}
 
 
 class SumHead(nn.Module):

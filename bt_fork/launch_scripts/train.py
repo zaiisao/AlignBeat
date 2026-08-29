@@ -97,6 +97,21 @@ def main(args):
         eval_trim_beats=args.eval_trim_beats,
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
+        head_type=args.head_type,
+        encoder_input_frames=args.train_length,
+        n_min=args.n_min,
+        class_attention_layers=args.class_attention_layers,
+        class_attention_heads=args.class_attention_heads,
+        tau_beat=args.tau_beat,
+        tau_downbeat=args.tau_downbeat,
+        subset_kwargs={
+            "gamma": args.gamma,
+            "omega_downbeat": args.omega_db,
+            "b_scale": args.b_scale,
+            "joint_phase": args.joint_phase,
+            "marginal": args.marginal,
+            "meter_length": args.meter_L,
+        },
     )
     for part in args.compile:
         if hasattr(pl_model.model, part):
@@ -189,6 +204,27 @@ if __name__ == "__main__":
         "--batch-size", type=int, default=8, help="batch size for training"
     )
     parser.add_argument("--accumulate-grad-batches", type=int, default=8)
+    # --- order-preserving alignment head -------------------------------------------
+    # Everything before the head is shared with the dense baseline, so
+    # "--head_type subset" against the default is a controlled A/B: same encoder, data,
+    # augmentation, trainer, precision and metrics, differing only in the head and the
+    # loss it brings with it.
+    parser.add_argument("--head_type", type=str, default="dense",
+                        choices=["dense", "subset"])
+    parser.add_argument("--train_length", type=int, default=1500,
+                        help="T, the excerpt length in frames; N is derived from it")
+    parser.add_argument("--n_min", type=int, default=172,
+                        help="N_min = BPM_max * D; the schedule may not shrink below it")
+    parser.add_argument("--class_attention_layers", type=int, default=0)
+    parser.add_argument("--class_attention_heads", type=int, default=4)
+    parser.add_argument("--tau_beat", type=float, default=0.2)
+    parser.add_argument("--tau_downbeat", type=float, default=0.2)
+    parser.add_argument("--gamma", type=float, default=0.5)
+    parser.add_argument("--omega_db", type=float, default=2.0)
+    parser.add_argument("--b_scale", type=float, default=0.005)
+    parser.add_argument("--joint_phase", action="store_true", default=False)
+    parser.add_argument("--marginal", action="store_true", default=False)
+    parser.add_argument("--meter_L", type=int, default=0)
     parser.add_argument(
         "--train-length",
         type=int,
