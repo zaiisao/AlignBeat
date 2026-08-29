@@ -9,6 +9,7 @@ encoder wrapper without the rest of BeatThis (task_heads etc.).
 """
 
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 from einops import rearrange
@@ -16,7 +17,7 @@ from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
-from beatfcos import roformer
+from alignbeat import roformer
 
 """
 Why BatchNorm1d comes first: each of the 128 frequency bands has a completely
@@ -66,8 +67,8 @@ def make_frontend_block(
     in_dim: int,
     out_dim: int,
     partial_transformers: bool = True,
-    head_dim: int | None = 32,
-    rotary_embed: RotaryEmbedding | None = None,
+    head_dim: Optional[int] = 32,
+    rotary_embed: Optional[RotaryEmbedding] = None,
     dropout: float = 0.1,
 ) -> nn.Module:
     if partial_transformers and (head_dim is None or rotary_embed is None):

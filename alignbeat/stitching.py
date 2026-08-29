@@ -1,8 +1,8 @@
-"""Piece-level inference by stitching overlapping fragments (Algorithm 4).
+"""Piece-level inference by stitching overlapping fragments (Section 9.3).
 
 The subset-selection head emits a fixed N candidates for a fixed-duration window, so
-unlike the FCOS path it cannot simply be handed a whole song. A piece is processed as
-overlapping D-frame fragments, each decoded independently by Algorithm 3, and the
+it cannot simply be handed a whole song. A piece is processed as
+overlapping D-frame fragments, each decoded independently by Algorithm 5, and the
 per-fragment detection lists are combined into one piece-level list.
 
 Section 8.3's key observation: sigma_hat is a correspondence internal to one fragment's
@@ -25,7 +25,7 @@ border. Beat This! carries the same residual risk.
 """
 import torch
 
-from beatfcos.subset_head import decode_events
+from alignbeat.subset_head import decode_events
 
 
 def fragment_offsets(total_frames, window_frames, border_frames):
@@ -60,11 +60,12 @@ def fragment_offsets(total_frames, window_frames, border_frames):
 
 def stitch_piece(mel, forward_fn, window_frames, border_frames,
                  threshold_beat=0.2, threshold_downbeat=0.2):
-    """Algorithm 4 over one piece.
+    """Section 9.3 over one piece.
 
     mel: (T, n_mels) log-mel for the whole piece (already on the right device).
-    forward_fn: callable taking (1, window_frames, n_mels) and returning
-        (class_logits (1, N, 3), t_hat (1, N)) - normally the model's eval path.
+    forward_fn: callable taking (B, window_frames, n_mels) and returning
+        (class_logits (B, N, 3), t_hat (B, N)) - normally the model's eval path. It is
+        called ONCE, with every fragment of the piece stacked into one batch.
 
     Returns (classes, frames, scores) as 1-D tensors on the absolute frame axis of the
     piece, ascending in time. Frames are float: a candidate's time is continuous within
@@ -73,18 +74,28 @@ def stitch_piece(mel, forward_fn, window_frames, border_frames,
     total_frames, num_mels = mel.shape
     fragments = fragment_offsets(total_frames, window_frames, border_frames)
 
-    all_classes, all_frames, all_scores = [], [], []
-    for offset, keep_start, keep_end in fragments:
+    # Build every fragment first, then run them through the model as ONE batch.
+    # Decoding is per fragment either way, but the forward is not: one call at batch B
+    # replaces B calls at batch 1, which on a transformer this size is the difference
+    # between saturating the GPU and paying kernel-launch overhead B times over. This
+    # is numerically identical -- the model is in eval mode and uses LayerNorm, so no
+    # statistic crosses the batch axis.
+    batch = []
+    for offset, _keep_start, _keep_end in fragments:
         fragment = mel[offset:offset + window_frames]
         if fragment.shape[0] < window_frames:
             # Only the final fragment can be short. Zero-pad to the fixed window: the
             # dataloader pads short pieces the same way, and log1p(mel) == 0 is silence.
-            pad = window_frames - fragment.shape[0]
-            fragment = torch.nn.functional.pad(fragment, (0, 0, 0, pad))
+            fragment = torch.nn.functional.pad(
+                fragment, (0, 0, 0, window_frames - fragment.shape[0]))
+        batch.append(fragment)
+    batched_logits, batched_t_hat = forward_fn(torch.stack(batch))
 
-        class_logits, t_hat = forward_fn(fragment.unsqueeze(0))
+    all_classes, all_frames, all_scores = [], [], []
+    for index, (offset, keep_start, keep_end) in enumerate(fragments):
         classes, times, scores = decode_events(
-            class_logits[0], t_hat[0], threshold_beat, threshold_downbeat)
+            batched_logits[index], batched_t_hat[index],
+            threshold_beat, threshold_downbeat)
         if classes.numel() == 0:
             continue
 

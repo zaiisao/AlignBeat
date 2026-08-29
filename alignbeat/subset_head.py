@@ -1,27 +1,20 @@
-"""Order-constrained subset selection head ("Beat Tracking as an Order-Constrained
-Subset Selection Problem", beat_dp_matching-1.pdf).
+"""Order-preserving alignment head ("Beat Tracking as Latent Order-Preserving
+Alignment").
 
-[What] Replaces the FCOS anchor + interval-regression + Soft-NMS pipeline with a
-fixed set of N candidate *point* predictors. Each candidate emits a 3-way class
-distribution over {DB, B, none} and one raw scalar; a global cumulative-softplus
-reparameterization (eq. 1) turns those scalars into a strictly increasing time
-sequence. Because both the ground truth and the candidate times are sorted by
-construction, deciding which candidate is responsible for which event reduces to
-choosing an order-preserving subset, solved exactly by an O(N*M) dynamic program
-(Alg. 1). No anchors, no clusters, no NMS.
+[What] A fixed set of N candidate *point* predictors. Each candidate emits a
+3-way class distribution over {DB, B, none} and one raw scalar; a global
+cumulative-softplus reparameterization (eq. 1) turns those scalars into a
+strictly increasing time sequence. Because both the ground truth and the
+candidate times are sorted by construction, deciding which candidate is
+responsible for which event reduces to choosing an order-preserving subset,
+solved exactly by an O(N*M) dynamic program (Alg. 1). No anchors, no NMS.
 
-[Why it is not the abandoned hungarian_head.py] That head's candidates were DETR
-learned queries passed through a decoder, which collapsed. Here candidates come
-from Downsample(FPN features) and their times are monotone by construction, so
-there is nothing to collapse and nothing to sort: the DP indexes candidates in
-their natural order. hungarian_head.monotonic_match is the same recursion, but it
-sorts by predicted centre first and uses the DETR raw-probability cost (-p) that
-section 4 of the paper explicitly corrects to -log p.
+[Why the candidates cannot collapse] A DETR-style head with learned queries and
+a decoder collapses. Here candidates come from Downsample(encoder features) and
+their times are monotone by construction, so there is nothing to collapse and
+nothing to sort: the DP indexes candidates in their natural order.
 
-[Class index convention] 0 = downbeat, 1 = beat, 2 = background. Indices 0/1 match
-the existing repo convention (see get_jth_targets / model_module.py: "class_id 0 =
-downbeat, class_id 1 = beat"), so downstream code that already assumes it keeps
-working.
+[Class index convention] 0 = downbeat, 1 = beat, 2 = background.
 
 Equation numbers below refer to the PDF.
 """
@@ -36,14 +29,14 @@ BACKGROUND = 2
 NUM_CLASSES = 3
 
 # Ground-truth marker for an event that is known to be a beat but whose B/DB
-# distinction was never annotated (section 7.1; SMC is the case in practice). It is a
+# distinction was never annotated (section 8; SMC is the case in practice). It is a
 # label for the TARGET, never a class the network predicts - the head always emits the
 # same three-way distribution over {DB, B, empty}.
 CLASS_UNKNOWN = -1
 
 # Floor for log-probabilities entering the DP cost. Once the model becomes confident,
 # p(background) for some candidate underflows to 0 in float32, -log gives +inf, and the
-# section 7.2 corrected cost (which SUBTRACTS gamma * that term) becomes -inf; the
+# section 8.4 corrected cost (which SUBTRACTS gamma * that term) becomes -inf; the
 # running-minimum DP then cannot backtrack and the whole batch is lost. Observed live:
 # 2 failures in 11,200 iterations, both at epoch 29, i.e. it appears only once training
 # has progressed and would grow more frequent. exp(-60) ~ 1e-26 is far below any
@@ -70,14 +63,15 @@ class SubsetSelectionHead(nn.Module):
     of three.
 
     Note on monotonicity: t_hat is computed from z_j only. If a candidate-level
-    self-attention pass (section 9.2) is later added it must feed the *classification*
+    self-attention pass (section 10.2) is later added it must feed the *classification*
     branch only, otherwise equation (1)'s guarantee is unaffected but the argument in
     9.2 for why it is safe no longer applies.
     """
 
     def __init__(self, feature_size=256, num_candidates=160, level_strides=(8, 4, 2),
                  hidden_size=256, dropout=0.0, class_prior=(0.10, 0.30, 0.60),
-                 class_attention_layers=0, class_attention_heads=4):
+                 class_attention_layers=0, class_attention_heads=4,
+                 predict_precision=False):
         super(SubsetSelectionHead, self).__init__()
         self.num_candidates = num_candidates
         self.level_strides = tuple(level_strides)
@@ -142,11 +136,18 @@ class SubsetSelectionHead(nn.Module):
 
         self.class_head = nn.Linear(hidden_size, NUM_CLASSES)
         self.regression_head = nn.Linear(hidden_size, 1)
+        # Section 4.1.2: a small head reading z_j so the model can express reduced
+        # confidence in acoustically ambiguous passages rather than assuming a single
+        # dataset-wide noise level. Off by default -- section 4.1's own analysis is
+        # that this reopens two failure modes the shared global b closes, and the
+        # mitigations of 4.1.3 (a floor by construction, a Gamma prior, a stop-gradient
+        # and a warm-up) are what make it safe to enable.
+        self.precision_head = nn.Linear(hidden_size, 1) if predict_precision else None
 
         self._initialize_weights(class_prior)
 
     def _initialize_weights(self, class_prior):
-        # candidate_attention (section 9.2) is skipped: nn.TransformerEncoder ships its
+        # candidate_attention (section 10.2) is skipped: nn.TransformerEncoder ships its
         # own Xavier init, and sweeping every nn.Linear here overwrote out_proj/linear1/
         # linear2 with Kaiming-relu while in_proj_weight escaped (it is a raw Parameter,
         # not a Linear). Measured: weight std 0.088 vs the stock 0.036, and the block
@@ -172,7 +173,7 @@ class SubsetSelectionHead(nn.Module):
         nn.init.zeros_(self.regression_head.weight)
         nn.init.zeros_(self.regression_head.bias)
 
-        # Same treatment for the classifier, for the same reason the FCOS path sets a
+        # Same treatment for the classifier, for the same reason a detector sets a
         # focal-loss prior on its final layer. Left at a plain Kaiming init the logits
         # start at magnitude ~35, i.e. near-certain and arbitrary, so the background
         # term of loss (8) opens in the hundreds and step 0 is a large meaningless
@@ -218,14 +219,18 @@ class SubsetSelectionHead(nn.Module):
         z = pooled.transpose(1, 2)  # (B, N, C)
         z = self.trunk(self.input_norm(z))
 
-        # Regression reads z directly and is therefore unaffected by section 9.2's
+        # Regression reads z directly and is therefore unaffected by section 10.2's
         # attention pass; only the classifier sees the contextualised features.
         r = self.regression_head(z).squeeze(dim=2)      # (B, N)
         t_hat = monotonic_times(r)
 
         z_class = z if self.candidate_attention is None else self.candidate_attention(z)
         class_logits = self.class_head(z_class)         # (B, N, 3)
-        return class_logits, t_hat
+
+        if self.precision_head is None:
+            return class_logits, t_hat
+        # Raw output u_j; the criterion applies b_j = b_min + softplus(u_j).
+        return class_logits, t_hat, self.precision_head(z).squeeze(dim=2)
 
 
 def monotonic_times(r, epsilon=1e-4):
@@ -286,7 +291,7 @@ def monotonic_times(r, epsilon=1e-4):
 # The correspondence problem (sections 4-5)
 # ---------------------------------------------------------------------------
 
-def subset_select_dp(cost):
+def subset_select_dp(cost, return_cost=False):
     """Algorithm 1 - exact O(N*M) order-constrained subset selection.
 
     cost: (M, N) numpy array of per-pair costs, ground truth by candidate, both in
@@ -339,6 +344,10 @@ def subset_select_dp(cost):
             raise RuntimeError("backtracking failed; cost matrix contains non-finite values")
         sigma[i - 1] = j_star - 1
         j = j_star - 1
+    if return_cost:
+        # previous[] now holds D[M, .]; D[M, N] is the optimal total cost, which
+        # eq. (19) compares across phase hypotheses.
+        return sigma, float(previous[N])
     return sigma
 
 
@@ -348,8 +357,20 @@ def subset_select_dp_meter(cost, downbeat_positions, t_hat, meter_length, mu):
     (6) penalises the gap between consecutive matched downbeats against L * Delta_bar.
     It depends on TWO matched positions jointly, breaking recursion (7)'s first-order
     structure, so the most recent downbeat's matched candidate is carried as extra
-    state: D[i, j_star, j], O(N^2 M / L) instead of O(N M). j_star = N means "no
-    downbeat matched yet". mu = 0 reduces exactly to subset_select_dp.
+    state: D[i, j_star, j]. j_star = N means "no downbeat matched yet". mu = 0 reduces
+    exactly to subset_select_dp, and exactness is checked against brute-force
+    enumeration in tests/test_regressions.py.
+
+    Complexity, stated honestly. The paper derives O(N^2 M / L) on the grounds that
+    j_star need only be tracked BETWEEN consecutive downbeat indices, so the O(N^2)
+    work is incurred once per inter-downbeat segment rather than once per event. This
+    implementation does not realize that saving: the (N+1)-wide j_star axis is carried
+    through every event, giving O(N^2 M). The array work is fully vectorised (the
+    O(N) Python inner loop this used to run at every i is gone), so the constants are
+    now reasonable, but the asymptotic saving would need the intermediate events of a
+    segment collapsed into a transfer matrix computed once per segment -- a genuine
+    restructure, not a constant-factor tidy, and one whose exactness would need its own
+    proof. Left undone deliberately rather than claimed.
 
     This is the only mechanism in the paper that can change WHICH candidates are
     selected; 9.4's regulariser and 7.1's imputation act after sigma_hat is fixed.
@@ -382,18 +403,25 @@ def subset_select_dp_meter(cost, downbeat_positions, t_hat, meter_length, mu):
     else:
         D[NONE, :] = cost[0, :]
 
+    # run[s, j] = min_{j' < j} D[s, j'], the running minimum along the candidate axis,
+    # with run_arg the j' achieving it. This is the same quantity subset_select_dp
+    # computes with minimum.accumulate, batched over the j* state rows -- written as
+    # two vectorised numpy calls rather than the O(N) Python loop it replaces, which
+    # was the dominant cost here (M * N interpreter iterations per fragment, ~25k at
+    # N=160, on top of the array work the recursion genuinely requires).
+    candidate_axis = np.arange(N, dtype=np.int32)[None, :]
     for i in range(1, M):
         run = np.full((N + 1, N), inf)
         run_arg = np.full((N + 1, N), -1, dtype=np.int32)
-        best = np.full(N + 1, inf)
-        best_arg = np.full(N + 1, -1, dtype=np.int32)
-        for j in range(N):
-            if j > 0:
-                better = D[:, j - 1] < best
-                best = np.where(better, D[:, j - 1], best)
-                best_arg = np.where(better, j - 1, best_arg)
-            run[:, j] = best
-            run_arg[:, j] = best_arg
+        if N > 1:
+            shifted = D[:, : N - 1]
+            accumulated = np.minimum.accumulate(shifted, axis=1)
+            run[:, 1:] = accumulated
+            # argmin of a running minimum: j' attains it exactly when it is a new (weak)
+            # minimum, and a later tie is just as optimal as an earlier one.
+            is_new_minimum = shifted <= accumulated
+            run_arg[:, 1:] = np.maximum.accumulate(
+                np.where(is_new_minimum, candidate_axis[:, : N - 1], 0), axis=1)
 
         newD = np.full((N + 1, N), inf)
         if not is_db[i]:
@@ -428,13 +456,174 @@ def subset_select_dp_meter(cost, downbeat_positions, t_hat, meter_length, mu):
     return sigma
 
 
+# ---------------------------------------------------------------------------
+# Phase (sections 8, 8.1, 8.3, 8.5, 8.6)
+# ---------------------------------------------------------------------------
+#
+# One fact underpins every construction below: phase propagation is deterministic.
+# Fixing phi_0 fixes the whole sequence, phi_i = (phi_0 + i - 1) mod L, because the
+# increment counts MATCHED EVENTS, never candidates -- an unmatched candidate is
+# simply not counted, exactly as CTC's blank contributes nothing to its own
+# alignment. There is no branching latent past phi_0, which is what makes joint
+# treatment of (sigma, phi_0) cost a constant factor L rather than a new algorithm.
+
+
+def event_is_downbeat_under(M, L, p, device=None):
+    """Which of the M matched events are downbeats under the hypothesis phi_0 = p.
+
+    Event i (1-indexed) carries phase (p + i - 1) mod L, and is a downbeat exactly
+    when that is 0. Returned 0-indexed, so entry i0 is event i0 + 1.
+    """
+    i0 = torch.arange(M, device=device)
+    return ((p + i0) % L) == 0
+
+
+def phase_star(M, L, device=None):
+    """p*_i = (1 - i) mod L: the unique hypothesis under which event i is a downbeat.
+
+    Section 8 verifies this is a singleton rather than a general subset -- for fixed
+    i and L exactly one p satisfies (p + i - 1) mod L = 0 -- which is what makes
+    r_i a direct lookup of the phase posterior (eq. 14, 27, 34) rather than a sum.
+    """
+    i0 = torch.arange(M, device=device)
+    return (-i0) % L
+
+
+def phase_class_nll(log_probabilities, M, L, p):
+    """The class term of eq. (18): -log p_hat_j(phi_j = (p + i - 1) mod L | x; theta).
+
+    Section 8's phase-valued query on the classification head: phase 0 reads the DB
+    probability, every nonzero phase reads the same B probability, since the head
+    only ever distinguishes downbeat from non-downbeat and never one non-downbeat
+    phase from another.
+
+    log_probabilities: (N, 3). Returns (M, N).
+    """
+    is_db = event_is_downbeat_under(M, L, p, log_probabilities.device)
+    downbeat = -log_probabilities[:, DOWNBEAT]                            # (N,)
+    beat = -log_probabilities[:, BEAT]                                    # (N,)
+    return torch.where(is_db[:, None], downbeat[None, :], beat[None, :])
+
+
+def subset_select_dp_joint_phase(costs):
+    """Equation (19): the joint MAP of (sigma, phi_0), by L reruns of Algorithm 1.
+
+    Once phi_0 = p is fixed, every event's hypothesized phase is determined, so
+    L^p_match is an ordinary per-pair cost of exactly the shape Algorithm 1 already
+    minimises. Run it once per hypothesis and keep whichever run achieved the lowest
+    D^(p)[M, N], together with the matching that run produced.
+
+    This is what makes the coupling genuine rather than cosmetic: sigma is re-derived
+    under every hypothesis, so a matching that looks cheap under one phase but
+    metrically implausible under the phase that wins is never the one reported. A
+    candidate whose class prediction favours DB is a cheap match for an event one
+    hypothesis calls a downbeat and an expensive match for the same event under a
+    hypothesis that calls it a beat -- so sigma genuinely differs across p.
+
+    costs: (L, M, N) array of phase-conditioned costs. Returns (sigma, p_hat).
+    Cost O(L * N * M), a constant-factor increase over the phase-blind O(N * M).
+    """
+    costs = np.asarray(costs, dtype=np.float64)
+    L = costs.shape[0]
+    best_sigma, best_p, best_cost = None, 0, np.inf
+    for p in range(L):
+        sigma, total = subset_select_dp(costs[p], return_cost=True)
+        if total < best_cost:
+            best_sigma, best_p, best_cost = sigma, p, total
+    return best_sigma, best_p
+
+
+def subset_select_dp_phase_segments(cost_fn, M, N, segments):
+    """Equation (20): the mixed-meter joint DP, phase carried as augmented state.
+
+    Section 8.1's segments do not reduce to independent reruns the way a single
+    meter does, because order-preservation is a global constraint: which candidates
+    remain available to segment k+1 depends on where segment k's matching ended. So
+    the phase is carried as extra state instead, generalizing Section 4.2's own
+    augmented-state device.
+
+        D[i, j, phi] = min( D[i, j-1, phi],
+                            D[i-1, j-1, phi'] + cost(i, j-1, phi) )
+
+    where phi' is the unique value with (phi' + 1) mod L_k = phi when event i is not
+    the first of its segment (propagation within a segment is deterministic, so there
+    is genuinely one predecessor, not a minimum over several), and min over all phi'
+    when i starts a new segment, whose phase origin is chosen independently of
+    whatever phase the previous segment happened to end on.
+
+    cost_fn(i0, phi) -> (N,) array: the cost of matching event i0 (0-indexed) to each
+    candidate, given that event's own phase is phi.
+    segments: list of (start_event_index, L_k), ascending, first starting at 0.
+    Returns sigma. Cost O(N * M * L_max).
+    """
+    if M == 0:
+        return np.empty(0, dtype=np.int64)
+    if M > N:
+        raise ValueError(
+            f"infeasible correspondence: {M} ground-truth events but only {N} candidates.")
+
+    segment_of, meter_of = np.empty(M, dtype=np.int64), np.empty(M, dtype=np.int64)
+    starts = [start for start, _ in segments]
+    for k, (start, meter) in enumerate(segments):
+        end = segments[k + 1][0] if k + 1 < len(segments) else M
+        segment_of[start:end] = k
+        meter_of[start:end] = meter
+    max_meter = int(meter_of.max())
+
+    # previous[phi, j] = D[i-1, j, phi]; phi >= L_k entries stay +inf and never win.
+    previous = np.zeros((max_meter, N + 1), dtype=np.float64)
+    choice = np.zeros((M + 1, max_meter, N + 1), dtype=np.int32)
+    back_phase = np.zeros((M + 1, max_meter, N + 1), dtype=np.int32)
+    candidate_index = np.arange(1, N + 1, dtype=np.int32)
+
+    for i0 in range(M):
+        meter = int(meter_of[i0])
+        starts_segment = i0 in starts
+        current = np.full((max_meter, N + 1), np.inf, dtype=np.float64)
+        for phi in range(meter):
+            if starts_segment:
+                # New segment: its phase origin is free, so the match branch may
+                # arrive from whatever phase the previous segment ended on.
+                source = previous[:, 0:N].min(axis=0)
+                source_phase = previous[:, 0:N].argmin(axis=0)
+            else:
+                previous_phase = (phi - 1) % meter
+                source = previous[previous_phase, 0:N]
+                source_phase = np.full(N, previous_phase, dtype=np.int64)
+            a = source + cost_fn(i0, phi)
+            accumulated = np.minimum.accumulate(a)
+            is_new_minimum = a <= accumulated
+            arg = np.maximum.accumulate(np.where(is_new_minimum, candidate_index, 0))
+            current[phi, 0] = np.inf
+            current[phi, 1:] = accumulated
+            choice[i0 + 1, phi, 1:] = arg
+            back_phase[i0 + 1, phi, 1:] = source_phase[np.maximum(arg - 1, 0)]
+        previous = current
+
+    final_meter = int(meter_of[M - 1])
+    phi = int(np.argmin(previous[:final_meter, N]))
+    if not np.isfinite(previous[phi, N]):
+        raise RuntimeError("backtracking failed; cost contains non-finite values")
+
+    sigma = np.empty(M, dtype=np.int64)
+    j = N
+    for i0 in range(M - 1, -1, -1):
+        j_star = int(choice[i0 + 1, phi, j])
+        if j_star < 1:
+            raise RuntimeError("backtracking failed; cost contains non-finite values")
+        sigma[i0] = j_star - 1
+        phi = int(back_phase[i0 + 1, phi, j])
+        j = j_star - 1
+    return sigma
+
+
 def subset_select_logsumexp(cost, lengths=None):
     """Equation (13) - the marginalised counterpart of the DP, log Z(theta, x).
 
     Same recursion with min replaced by logsumexp on the negated cost, giving the
     total probability mass over every order-preserving injection instead of the
     single cheapest one (the forward algorithm to Algorithm 1's Viterbi). Provided
-    for the section 7.2 training mode; not used by the default hard path. Operates
+    for the section 8.4 training mode; not used by the default hard path. Operates
     on torch tensors because, unlike Algorithm 1, this one is differentiated through.
     """
     batched = cost.dim() == 3
@@ -466,12 +655,13 @@ def subset_select_logsumexp(cost, lengths=None):
 
 
 def subset_posterior_marginals(cost):
-    """Equation (21): the exact posterior P(sigma(i) = j | y, theta, x).
+    """The exact posterior P(sigma(i) = j | y, theta, x) over eq. (21)'s distribution.
 
-    Algorithm 6 (--marginal) never needs this - it differentiates -log Z directly - but
-    the explicit E-step/M-step form of Algorithm 7 does, and it is the only way to SEE
-    the soft correspondence rather than infer it. Needs a backward pass mirroring the
-    forward recursion (19):
+    The direct --marginal path never needs this -- it differentiates -log Z directly --
+    but section 8.4's equivalent E-step/M-step perspective does, it is the only way to
+    SEE the soft correspondence rather than infer it, and eq. (29) mixes it over the
+    phase posterior to get the fully joint matching marginal. Needs the backward
+    companion (28) to the forward recursion (22):
 
         E~[i, j] = logsumexp( E~[i, j+1], E~[i+1, j+1] - L'match(y_{i+1}, y^_{j+1}) )
         E~[M, j] = 0,   E~[i, N] = -inf for i < M
@@ -508,6 +698,107 @@ def subset_posterior_marginals(cost):
     return w.exp()
 
 
+def joint_phase_log_partition(costs):
+    """Equations (25) and (30): log Z_joint = log sum_p Z^(p).
+
+    For fixed p the inner sum over sigma in eq. (24) is exactly Section 8.4's own
+    partition function with L'^p_match substituted, so the joint object needs no new
+    machinery: run the log-sum-exp recursion (22) once per hypothesis and add the
+    results in log space. This is the soft analogue of eq. (19) -- there the joint MAP
+    was the MINIMUM of L hard costs, here the joint marginal likelihood is the SUM of
+    L soft partition functions, the same Viterbi/forward relationship one level up.
+
+    costs: (L, M, N) tensor of phase-conditioned corrected costs, differentiable.
+    Returns (log_z_joint, log_z_per_phase) with log_z_per_phase of shape (L,).
+    Every quantity is differentiable; eq. (30) needs no stop-gradient anywhere.
+    """
+    per_phase = torch.stack([subset_select_logsumexp(costs[p]) for p in range(costs.shape[0])])
+    return torch.logsumexp(per_phase, dim=0), per_phase
+
+
+def joint_phase_posterior(log_z_per_phase):
+    """Equation (26): P(phi_0 = p | x; theta) = Z^(p) / Z_joint, in log space."""
+    return log_z_per_phase - torch.logsumexp(log_z_per_phase, dim=0)
+
+
+def downbeat_marginal_from_phase_posterior(log_phase_posterior, M, L):
+    """Equations (27) and (14): r_i = P(C_i = DB | x; theta) = P(phi_0 = p*_i | x; theta).
+
+    No forward-backward pass is needed. The hypothesized phase (p + i - 1) mod L
+    depends only on (p, i), never on which candidate sigma assigns to event i, so
+    sigma was never part of what determines a hypothesis's own downbeat pattern --
+    and since {p : (p + i - 1) mod L = 0} is the singleton {p*_i}, event i's downbeat
+    marginal is a direct lookup rather than a sum.
+    """
+    return log_phase_posterior[phase_star(M, L, log_phase_posterior.device)].exp()
+
+
+def joint_phase_matching_marginals(costs, log_phase_posterior):
+    """Equation (29): P(sigma(i) = j | x; theta), mixed over the phase posterior.
+
+    Unlike r_i, the MATCHING marginal genuinely couples to sigma, so it needs a real
+    forward-backward pass (eq. 28) within each phase hypothesis, mixed afterwards by
+    eq. (26)'s own posterior weights.
+
+    costs: (L, M, N). Returns (M, N); rows sum to 1.
+    """
+    weights = log_phase_posterior.exp()
+    return sum(weights[p] * subset_posterior_marginals(costs[p])
+               for p in range(costs.shape[0]))
+
+
+def meter_joint_log_partition(cost_builder, meters):
+    """Equation (32): log Z_joint = log sum_{L in M} sum_p Z^(L,p).
+
+    Section 8.6 removes the last standing assumption -- that L is known external
+    metadata. L belongs in the same category as sigma and phi_0, a genuine unobserved
+    quantity, and is marginalized the same way: one log-sum-exp recursion per (L, p)
+    pair, summed in log space. No prior over L is introduced; every triple is weighted
+    by its own cost alone, an implicitly uniform prior over the candidate set, with all
+    discrimination between meters coming from how well each one's phase-consistent
+    class predictions fit the data.
+
+    cost_builder(L, p) -> (M, N) differentiable cost.
+    meters: iterable of candidate meter lengths, e.g. range(2, 13).
+    Returns (log_z_joint, hypotheses) where hypotheses is a list of
+    (L, p, log_z) triples covering every pair.
+    Cost O(N * M * sum_L L) -- 77 recursions for M = {2, ..., 12}.
+    """
+    hypotheses = []
+    for meter in meters:
+        for p in range(meter):
+            hypotheses.append((meter, p, subset_select_logsumexp(cost_builder(meter, p))))
+    log_z_all = torch.stack([h[2] for h in hypotheses])
+    return torch.logsumexp(log_z_all, dim=0), hypotheses
+
+
+def meter_posterior(hypotheses, log_z_joint):
+    """Equation (33): P(L | x; theta), by summing the joint posterior over p."""
+    posterior = {}
+    for meter, _p, log_z in hypotheses:
+        contribution = (log_z - log_z_joint).exp()
+        posterior[meter] = posterior.get(meter, 0.0) + contribution
+    return posterior
+
+
+def downbeat_marginal_over_meters(hypotheses, log_z_joint, M, device=None):
+    """Equation (34): r_i = sum_{L in M} P(L, phi_0 = p*_i(L) | x; theta).
+
+    For each fixed L the inner sum over p is again the singleton lookup at
+    p*_i(L) = (1 - i) mod L -- now depending on L, since which phase makes event i a
+    downbeat shifts with the hypothesized meter -- leaving only the outer sum over
+    candidate meters genuine.
+    """
+    i0 = torch.arange(M, device=device)
+    r = torch.zeros(M, device=device, dtype=log_z_joint.dtype)
+    for meter, p, log_z in hypotheses:
+        # this hypothesis contributes to event i exactly when p == p*_i(L)
+        contributes = ((-i0) % meter) == p
+        r = r + torch.where(contributes, (log_z - log_z_joint).exp(),
+                            torch.zeros((), device=device, dtype=r.dtype))
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Training loss (sections 4, 7)
 # ---------------------------------------------------------------------------
@@ -532,7 +823,10 @@ class SubsetCriterion(nn.Module):
                  diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7,
                  cont_weight=0.0, cont_windows=8, lambda_r=0.0, meter_length=0,
                  marginal=False, marginal_background=True, fragment_seconds=29.7215,
-                 mu_meter=0.0, phase_marginal=False):
+                 mu_meter=0.0,
+                 joint_phase=False, marginal_meters=(),
+                 precision_warmup=2000, precision_prior_alpha=2.0,
+                 precision_prior_beta=None):
         super(SubsetCriterion, self).__init__()
         self.gamma = gamma
         # cont_weight > 0: penalise the variance of the log expected event count across
@@ -542,11 +836,11 @@ class SubsetCriterion(nn.Module):
         # tempo INSTABILITY, not octave errors. Never trained yet.
         self.cont_weight = cont_weight
         self.cont_windows = cont_windows
-        # Section 9.4, equation (17). Penalises deviation of consecutive predicted
+        # Section 10.4, equations (36)-(37). Penalises deviation of consecutive predicted
         # DOWNBEAT spacing from L beat periods, where the beat period is estimated
         # differentiably from the model's own matched candidates:
-        #     Delta_bar = mean_i ( t_sigma(i+1) - t_sigma(i) )  over all M matched
-        #     R = sum_k ( t_sigma(i_{k+1}) - t_sigma(i_k) - L * Delta_bar )^2
+        #     Delta_bar = mean_i ( t_sigma(i+1) - t_sigma(i) )  over all M matched  (36)
+        #     R = sum_k ( t_sigma(i_{k+1}) - t_sigma(i_k) - L * Delta_bar )^2       (37)
         # Added after sigma_hat is fixed (it depends on the whole matched downbeat
         # sequence, so it cannot be a per-pair term in L_match). lambda_r = 0 is off.
         # meter_length = 0 derives L per fragment from the ground truth as the median
@@ -555,13 +849,13 @@ class SubsetCriterion(nn.Module):
         # ballroom 3.98, harmonix 4.03, carnatic 6.01 beats per bar).
         self.lambda_r = lambda_r
         self.meter_length = meter_length
-        # Section 7.2: train on the marginal likelihood over EVERY order-preserving
+        # Section 8.4: train on the marginal likelihood over EVERY order-preserving
         # injection instead of one hard-selected sigma. Writing g_j = -log p_j(empty),
         # the full loss of section 7 is
         #     sum_i L_match(i, sigma(i)) + gamma * sum_{j not in im(sigma)} g_j
         #   = sum_i [ L_match(i, sigma(i)) - gamma * g_sigma(i) ] + gamma * sum_j g_j
         # and the bracketed quantity is exactly build_cost's `corrected`. So the
-        # marginal loss (14) is -log Z over that corrected cost, plus the same
+        # marginal loss (23) is -log Z over that corrected cost, plus the same
         # sigma-independent gamma * sum_j g_j. No stop-gradient: unlike the hard path,
         # every quantity here is differentiable.
         # Measured motivation (temp_wide, val): the posterior over sigma is a near
@@ -571,7 +865,7 @@ class SubsetCriterion(nn.Module):
         self.marginal = marginal
         # Marginalising the FULL loss (8) gives gamma*sum_j g_j - log Z', because
         # sum_{j not in im(sigma)} g_j = sum_j g_j - sum_i g_sigma(i) and the second half
-        # is already folded into build_cost's `corrected`. The paper's equation (14) is
+        # is already folded into build_cost's `corrected`. The paper's equation (23) is
         # -log Z alone; with the term omitted, build_cost still subtracts gamma*g_j and
         # nothing compensates, so dL/dg_j <= 0 for every j and the objective is unbounded
         # below. Default to the exact marginalisation; set False for (14) literally.
@@ -582,22 +876,51 @@ class SubsetCriterion(nn.Module):
         self.fragment_seconds = fragment_seconds
         # Section 4.2: weight of equation (6) inside the SELECTION. 0 = plain Algorithm 1.
         self.mu_meter = mu_meter
-        # Equation (22): for beat-only data with a KNOWN meter L, the downbeat positions
-        # in a matched run are not independent - exactly one in every L is a downbeat,
-        # with a single unknown phase offset phi in {0..L-1} shared by the whole run.
-        # Marginalising phi gives labels mutually consistent across the run instead of
-        # equation (12)'s independent per-candidate guesses, which is the mechanism most
-        # likely behind our extra SMC penalty (-0.085 vs ~-0.03 for heads that do not
-        # take this path). Requires meter_length > 0; the spec flags that the premise
-        # breaks if the DP misassigns anywhere in the run, since one error shifts the
-        # phase for everything after it.
-        self.phase_marginal = phase_marginal
+        # Section 8.3, equation (19): infer (sigma, phi_0) JOINTLY rather than
+        # sequentially. The sequential decomposition of section 8.2 has two named
+        # failure modes, both tracing to the same cause -- L_match (3) is evaluated
+        # before any phase hypothesis exists, so it cannot use one. A candidate that is
+        # a middling match by class and timing alone but would sit at a metrically
+        # implausible phase has no way to be penalised for that; and once sigma_hat is
+        # fixed, no later phase evidence can revise it. Running Algorithm 1 once per
+        # hypothesis and keeping the cheapest run resolves both, at O(L * N * M) --
+        # a bounded constant-factor cost, not an asymptotic one. Requires a meter.
+        self.joint_phase = joint_phase
+        # Section 8.6: treat the meter itself as latent, marginalizing over a finite
+        # candidate set M = {2, ..., L_max} alongside sigma and phi_0. Empty tuple
+        # keeps L fixed external metadata (sections 8 through 8.5). The cost rises to
+        # O(N * M * sum_L L) -- 77 recursions for {2, ..., 12}, a larger but still
+        # tractable constant. No prior over L is introduced: all discrimination comes
+        # from how well each meter's phase-consistent class predictions fit the data.
+        self.marginal_meters = tuple(marginal_meters)
+        # Section 4.1.3, the three mitigations for per-candidate precision. Each closes
+        # one specific way b_j can be used to cheat rather than to localise:
+        #
+        #   (1) b_j = b_min + softplus(u_j) bounds b_j away from zero BY CONSTRUCTION,
+        #       the same device equation (1) uses for monotonicity, rather than hoping a
+        #       penalty suppresses collapse. Without it, a candidate that already fits
+        #       well can drive b_j toward 0 and reduce its loss without bound.
+        #   (2) A Gamma prior on the precision 1/b_j -- the conjugate prior for a
+        #       Laplace scale -- adds a MAP term pulling b_j toward a data-informed
+        #       default, damping runaway inflation on hard candidates rather than only
+        #       bounding it. precision_prior_beta defaults to the shared b, so the
+        #       default IS what the data says.
+        #   (3) A stop-gradient on b_j when computing dL/dt_hat_j, so one step cannot
+        #       simultaneously widen b_j and leave t_hat_j unimproved; b_j is updated
+        #       only through its own separate term.
+        #
+        # A warm-up on a fixed global b completes the set: it forces accurate
+        # localisation to be learned before the network has an uncertainty channel
+        # available to substitute for it.
+        self.precision_warmup = precision_warmup
+        self.precision_prior_alpha = precision_prior_alpha
+        self.precision_prior_beta = precision_prior_beta
         # Printed from inside the criterion rather than returned to train.py because
         # under DataParallel the forward runs on a replica, so an attribute set here
         # never reaches the parent module.
         self.diagnostic_every = diagnostic_every
         self._call_count = 0
-        # Section 7.1 confirmation-bias mitigations: train beat-only events on the
+        # Section 8.4 confirmation-bias mitigations: train beat-only events on the
         # marginal (9) alone for the first `beat_only_warmup` steps so the shared head
         # first learns B vs DB from fully-labelled data, and only trust the pseudo-label
         # (11) when the head is actually decided.
@@ -621,6 +944,8 @@ class SubsetCriterion(nn.Module):
               f"b={float(self.b):.5f} learn_b={self.learn_b} marginal={self.marginal} "
               f"marginal_bg={self.marginal_background} lambda_r={self.lambda_r} "
               f"cont_weight={self.cont_weight} mu_meter={self.mu_meter} "
+              f"joint_phase={self.joint_phase} "
+              f"marginal_meters={self.marginal_meters or 'off'} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -670,7 +995,7 @@ class SubsetCriterion(nn.Module):
         return ((log_counts - log_counts.mean()) ** 2).mean()
 
     def build_cost(self, log_probabilities, t_hat, event_classes, event_times):
-        """Per-pair cost (3) plus the section 7.2 background correction.
+        """Per-pair cost (3) plus the section 8.4 background correction.
 
         (3) is L_match = -log p_j(c_i) + lambda_l1 * |t_i - t_hat_j|, term for term the
         negative log-likelihood of the observation model (2). The paper is explicit
@@ -678,7 +1003,7 @@ class SubsetCriterion(nn.Module):
         literature.
 
         The corrected cost L'_match = L_match - gamma * g_j subtracts the background
-        term a candidate would otherwise have paid. Section 7.2 shows the full loss
+        term a candidate would otherwise have paid. Section 8.4 shows the full loss
         (8) contains gamma * sum_{j not in im(sigma)} g_j, and since |im(sigma)| = M is
         fixed, minimising (8) over sigma is minimising sum_i [L_match - gamma *
         g_sigma(i)]. Without this subtraction the DP minimises only part of the loss it
@@ -693,12 +1018,54 @@ class SubsetCriterion(nn.Module):
         corrected = class_cost + time_cost - self.gamma * background[None, :]
         return corrected, class_cost, time_cost
 
+    def build_phase_cost(self, log_probabilities, t_hat, event_classes, event_times,
+                         meter, p):
+        """Equation (18), and its section 8.5 background-corrected form L'^p_match.
+
+        Generalizes build_cost by conditioning the CLASS term on a phase hypothesis:
+        candidate j's cost against event i reads the probability of the phase j would
+        carry were it matched to i under hypothesis p, rather than of an observed
+        class. This is what lets the DP prefer a candidate that is metrically
+        consistent with the pattern the other events establish.
+
+        Only events whose label was never observed use the phase-conditioned term. For
+        a fully-labeled event c_i is observed directly rather than hypothesized, so
+        equation (3) is used unchanged and L^p_match plays no role, exactly as section
+        8.3 specifies. A fragment mixing both kinds therefore gets each event scored
+        against whatever its annotation actually supports.
+        """
+        M = event_times.shape[0]
+        phase_cost = phase_class_nll(log_probabilities, M, meter, p)          # (M, N)
+        observed_cost = self.class_nll(log_probabilities, event_classes)      # (M, N)
+        unknown = (event_classes == CLASS_UNKNOWN)[:, None]
+        class_cost = torch.where(unknown, phase_cost, observed_cost)
+
+        time_cost = self.lambda_l1 * (event_times[:, None] - t_hat[None, :]).abs()
+        background = -log_probabilities[:, BACKGROUND]
+        return class_cost + time_cost - self.gamma * background[None, :]
+
+    def _fragment_meter(self, event_classes):
+        """The meter L in force for this fragment, or 0 if none is available.
+
+        Explicit metadata wins. Failing that, derive it from the annotation as the
+        median number of events between consecutive downbeats -- the paper assumes L
+        known at dataset or track level, and a fully-labeled annotation already
+        carries it. A beat-only fragment has no downbeats to measure, so it has no
+        fallback and depends on --meter_L being set.
+        """
+        if self.meter_length > 0:
+            return int(self.meter_length)
+        positions = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
+        if positions.numel() < 2:
+            return 0
+        return int(np.median(np.diff(positions.cpu().numpy())))
+
     @staticmethod
     def class_nll(log_probabilities, event_classes):
         """-log p_j(c_i) for every (event, candidate) pair, handling unlabelled classes.
 
         For a normally annotated event this is just the log-probability of its class.
-        For a beat-only event (CLASS_UNKNOWN, section 7.1) the class is known to lie in
+        For a beat-only event (CLASS_UNKNOWN, section 8) the class is known to lie in
         {B, DB} but which one was never observed, so the likelihood of what is ACTUALLY
         known is the marginal over that superset - equation (9):
 
@@ -709,7 +1076,7 @@ class SubsetCriterion(nn.Module):
         its gradient with respect to any redistribution of mass between B and DB that
         holds their sum fixed is exactly zero, so on its own it teaches nothing about
         telling downbeats from beats - it only pushes the candidate away from
-        background. Section 7.1's EM pseudo-label (equations 10-11) is what recovers
+        background. Section 8's EM over the shared phase latent (equations 12-15) is what recovers
         that signal, and SubsetCriterion applies it once warm-up has passed.
         """
         unknown = event_classes == CLASS_UNKNOWN
@@ -723,7 +1090,7 @@ class SubsetCriterion(nn.Module):
             cost = torch.where(unknown[:, None], (-active)[None, :], cost)
         return cost
 
-    def forward(self, class_logits, t_hat, targets):
+    def forward(self, class_logits, t_hat, targets, raw_precision=None):
         """class_logits (B, N, 3), t_hat (B, N), targets: list of B dicts with
         'classes' (M_b,) long and 'times' (M_b,) float in [0, 1].
 
@@ -734,6 +1101,15 @@ class SubsetCriterion(nn.Module):
         """
         batch_size, num_candidates, _ = class_logits.shape
         log_probabilities = F.log_softmax(class_logits, dim=-1).clamp(min=LOG_PROB_FLOOR)
+        # Section 4.1.3's closing recommendation: even when the training loss uses a
+        # per-candidate b_j, the cost driving the SELECTION uses the shared, globally
+        # updated b. build_cost reads self.lambda_l1 = 1/b, so that holds by
+        # construction here. It matters because L_match is not only a loss term but the
+        # cost the DP minimizes, formed BEFORE any gradient exists: an inflated b_j
+        # would make a badly localised candidate look artificially cheap and corrupt
+        # sigma itself, not merely the loss computed after it.
+        precision_scales = self._precision_scales(raw_precision)
+        precision_terms = []
 
         # Per-fragment normalized terms. Normalization is PER FRAGMENT, not by the
         # batch-wide event count: with a shared batch denominator an M=0 fragment's
@@ -803,13 +1179,25 @@ class SubsetCriterion(nn.Module):
                 class_spread_sum += float((class_cost[:, 1:] - class_cost[:, :-1]).abs().mean())
                 class_spread_count += 1
                 # Selection is a non-differentiable combinatorial step evaluated at the
-                # current parameters; sigma enters the loss as data (Alg. 2 line 17).
+                # current parameters; sigma enters the loss as data (Algorithm 3).
+                fragment_meter = self._fragment_meter(event_classes)
                 if not cost_is_finite:
                     sigma_np = None
+                elif self.joint_phase and fragment_meter > 1:
+                    # Equation (19): search over (sigma, phi_0) together. Each
+                    # hypothesis gets its own phase-conditioned cost, and the cheapest
+                    # run wins -- so a matching attractive under a losing hypothesis is
+                    # never the one reported.
+                    phase_costs = torch.stack([
+                        self.build_phase_cost(log_probabilities_b, t_hat[b],
+                                              event_classes, event_times,
+                                              fragment_meter, p)
+                        for p in range(fragment_meter)])
+                    sigma_np, _phi_hat = subset_select_dp_joint_phase(
+                        phase_costs.detach().cpu().numpy())
                 elif self.mu_meter > 0.0:
                     _dbp = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten().cpu().numpy()
-                    _L = (float(self.meter_length) if self.meter_length > 0
-                          else (float(np.median(np.diff(_dbp))) if len(_dbp) >= 2 else 0.0))
+                    _L = float(fragment_meter)
                     sigma_np = (subset_select_dp_meter(
                                     corrected.detach().cpu().numpy(), _dbp,
                                     t_hat[b].detach().cpu().numpy(), _L, self.mu_meter)
@@ -853,17 +1241,44 @@ class SubsetCriterion(nn.Module):
 
             if self.marginal:
                 denominator = float(M) if self.normalize_by_events else 1.0
-                # (14): -log Z over the corrected cost, plus gamma * sum_j g_j.
-                # REBUILD the cost here: the `corrected` computed above lives inside a
-                # `with torch.no_grad()` block that exists for the hard path, whose DP
-                # only needs a detached matrix. The marginal path differentiates THROUGH
-                # the cost, so reusing it yields a class term with requires_grad=False -
-                # the loss still falls via the background term while the class logits
-                # never learn, and every candidate stays at its initialisation prior and
-                # decodes nothing. That is exactly what killed three marginal arms.
-                corrected = self.build_cost(
-                    log_probabilities_b, t_hat[b], event_classes, event_times)[0]
-                log_z = subset_select_logsumexp(corrected)
+                # -log Z over the corrected cost, plus gamma * sum_j g_j. Which
+                # partition function depends on how much is being marginalized:
+                # (23) sigma alone, (30) sigma with phi_0, (32) sigma with phi_0 and L.
+                if self.marginal_meters and fragment_meter != 0:
+                    # (31)-(32): L is latent too. One log-sum-exp recursion per (L, p)
+                    # pair, summed in log space -- the same construction as (25), one
+                    # level further marginalized, with an implicitly uniform prior over
+                    # the candidate meter set.
+                    log_z = meter_joint_log_partition(
+                        lambda meter, p: self.build_phase_cost(
+                            log_probabilities_b, t_hat[b], event_classes,
+                            event_times, meter, p),
+                        self.marginal_meters)[0]
+                elif self.joint_phase and fragment_meter > 1:
+                    # (24)-(25), (30): marginalize sigma and phi_0 TOGETHER. For fixed
+                    # p the inner sum over sigma is exactly (22) with L'^p_match
+                    # substituted, so this is L calls to the same recursion, summed in
+                    # log space. Fully differentiable, no stop-gradient.
+                    phase_costs = torch.stack([
+                        self.build_phase_cost(log_probabilities_b, t_hat[b],
+                                              event_classes, event_times,
+                                              fragment_meter, p)
+                        for p in range(fragment_meter)])
+                    log_z = joint_phase_log_partition(phase_costs)[0]
+                else:
+                    # (23): -log Z over sigma alone, phase left out of the
+                    # marginalization entirely.
+                    # REBUILD the cost here: the `corrected` computed above lives inside
+                    # a `with torch.no_grad()` block that exists for the hard path, whose
+                    # DP only needs a detached matrix. The marginal path differentiates
+                    # THROUGH the cost, so reusing it yields a class term with
+                    # requires_grad=False - the loss still falls via the background term
+                    # while the class logits never learn, and every candidate stays at
+                    # its initialisation prior and decodes nothing. That is exactly what
+                    # killed three marginal arms.
+                    corrected = self.build_cost(
+                        log_probabilities_b, t_hat[b], event_classes, event_times)[0]
+                    log_z = subset_select_logsumexp(corrected)
                 class_terms.append(-log_z / denominator)
                 if self.marginal_background:
                     background_terms.append(background.sum() / denominator)
@@ -898,8 +1313,13 @@ class SubsetCriterion(nn.Module):
             per_event = -matched_log.gather(1, safe_classes[:, None]).squeeze(1)
 
             if bool(unknown.any()):
+                # Section 8.1: a fragment may carry known meter change-points as
+                # [(first_event_index, L_k), ...]. Absent that, the whole fragment is
+                # one segment under the fragment's own meter, which is the single-meter
+                # derivation of section 8 unchanged.
+                segments = targets[b].get('segments')
                 per_event = torch.where(
-                    unknown, self._beat_only_term(matched_log), per_event)
+                    unknown, self._beat_only_term(matched_log, segments), per_event)
                 unlabelled_events += int(unknown.sum())
 
             omega = torch.where(
@@ -909,7 +1329,13 @@ class SubsetCriterion(nn.Module):
             class_terms.append((omega * per_event).sum() / denominator)
 
             residual = (event_times - t_hat[b][sigma]).abs()
-            time_terms.append(self.lambda_l1 * residual.sum() / denominator)
+            if precision_scales is None:
+                time_terms.append(self.lambda_l1 * residual.sum() / denominator)
+            else:
+                b_j = precision_scales[b][sigma]
+                time_terms.append(
+                    self._per_candidate_time_term(residual, b_j).sum() / denominator)
+                precision_terms.append(self._precision_prior(b_j) / denominator)
             matched_residuals.append(residual.detach())
 
             # --- loss (8), background term -----------------------------------
@@ -960,6 +1386,10 @@ class SubsetCriterion(nn.Module):
             losses['continuity'] = zero
         losses['periodicity'] = ((self.lambda_r * torch.stack(periodicity_terms).sum()
                                   / batch_denominator) if periodicity_terms else zero)
+        # The Gamma MAP term rides along with the time channel it regularizes.
+        if precision_terms:
+            losses['time'] = losses['time'] + (torch.stack(precision_terms).sum()
+                                               / batch_denominator)
         losses['total'] = (losses['class'] + losses['time'] + losses['background']
                            + losses['continuity'] + losses['periodicity'])
 
@@ -1015,68 +1445,144 @@ class SubsetCriterion(nn.Module):
                   f"infeasible={stats['infeasible']}", flush=True)
         return losses, stats
 
-    def _beat_only_term(self, matched_log):
-        """Section 7.1 class term for events whose B/DB label was never observed.
+    def _beat_only_term(self, matched_log, segments=None):
+        """Section 8 class term for events whose B/DB label was never observed.
 
-        Two regimes, switched by warm-up:
+        The single-event marginal (9), l_i = -log(p(B) + p(DB)), is exactly correct
+        but structurally unable to teach the distinction: both classes enter only
+        through their sum, so its gradient along any B-versus-DB redistribution is
+        identically zero. What recovers that signal is pooling evidence across the
+        fragment's M matched events, coupled by the meter, which is what the EM of
+        equations (12)-(15) does.
 
-        Warm-up (or gating declines): equation (9), the marginal likelihood
-            l_i = -log( p(B) + p(DB) )
-        which is exactly correct but, as its own derivation notes, carries no gradient
-        for distinguishing B from DB.
+        E-step (12): the posterior over the fragment's one unresolved latent, the
+        phase of the first matched event,
 
-        After warm-up: equations (10)-(11). The shared classification head has been
-        trained on data where the distinction IS observed, so its own current estimate
-        of DB-versus-B is a soft pseudo-label for the withheld one:
-            q(DB) = p(DB) / (p(DB) + p(B)),   q(B) = 1 - q(DB)
-        detached exactly as sigma_hat is detached, and used as a soft cross-entropy
-        target. This is a genuine E-step posterior over a real latent variable (the
-        withheld label), so it is EM-shaped rather than EM by analogy.
+            pi_p  propto  prod_i p_hat_sigma(i)( phi = (p + i - 1) mod L )
 
-        Confidence gating guards against bootstrapping early mistakes: if the head is
-        not yet decided (max q below the threshold), fall back to (9) rather than
-        force-fitting an unreliable pseudo-label.
+        computed at theta_old and detached, which is the unique choice of q making
+        Jensen's inequality tight.
+
+        M-step (15): each event's own weighted cross-entropy, with
+
+            r_i = pi_{p*_i},     p*_i = (1 - i) mod L
+            l_i = -[ r_i log p_hat(DB) + (1 - r_i) log p_hat(B) ]
+
+        r_i is a direct lookup rather than a sum because exactly one hypothesis makes
+        event i a downbeat. Every r_i is coupled to every OTHER matched event's
+        prediction through the shared posterior pi -- precisely what (9) lacked by
+        never looking beyond event i's own prediction. By Fisher's identity a gradient
+        step on this surrogate coincides with one on the true marginal (11).
+
+        Under mixed meter (section 8.1) the derivation is unchanged in form: eq. (16)
+        factors the joint marginal across segments before any sum is taken, so each
+        segment gets its own posterior (17) computed from its own events alone, and
+        the per-event loss formula never changes. Only how r_i is computed changes.
+
+        Confidence gating guards against bootstrapping early mistakes: if the pooled
+        posterior is still undecided, fall back to (9) rather than force-fitting an
+        unreliable pseudo-label. Warm-up does the same, one level up.
         """
-        if self.phase_marginal and self.meter_length > 0 and matched_log.shape[0] >= self.meter_length:
-            return self._phase_marginal_term(matched_log)
         active = torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)     # log(1-p(empty))
         marginal = -active
         if self._call_count < self.beat_only_warmup:
             return marginal
+
+        r = self._phase_posterior_marginal(matched_log, segments)
+        if r is None:
+            # No usable meter: (9) is all the annotation supports.
+            return marginal
+
         with torch.no_grad():
-            q = torch.softmax(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)        # (M, 2), normalised
-            confident = q.max(dim=-1).values >= self.beat_only_confidence
-        pseudo = -(q[:, 0] * matched_log[:, DOWNBEAT] + q[:, 1] * matched_log[:, BEAT])
-        # Keep the marginal alongside the pseudo-label term: (11) supervises WHICH of
-        # B/DB, while (9) is what keeps the candidate off the background class at all.
-        return torch.where(confident, pseudo + marginal, marginal)
+            confident = torch.maximum(r, 1.0 - r) >= self.beat_only_confidence
+        # (15). The marginal is kept alongside it: (15) supervises WHICH of B/DB,
+        # while (9) is what keeps the candidate off the background class at all.
+        weighted = -(r * matched_log[:, DOWNBEAT] + (1.0 - r) * matched_log[:, BEAT])
+        return torch.where(confident, weighted + marginal, marginal)
 
-    @torch.no_grad()
-    def _phase_marginal_term(self, matched_log):
-        """Equation (22): marginalise the bar phase over a run of beat-only events.
+    def _phase_posterior_marginal(self, matched_log, segments=None):
+        """Equations (12)/(14), and (17) per segment: r_i = P(phi_i = 0 | y, x; theta).
 
-            P(c | x; theta, phi) = prod_i p_sigma(i)( c_i(phi) ),
-            c_i(phi) = DB if i = phi (mod L) else B,
-            P(c | x; theta) = (1/L) sum_phi P(c | x; theta, phi)
-
-        so the loss is -log P(c | x; theta) = -logsumexp_phi [ sum_i log p_i(c_i(phi)) ]
-        + log L. Unlike (12), which picks a label per candidate independently, this
-        couples the whole run through one shared latent phase: the model can be unsure
-        WHICH beat is the downbeat while still being forced to place them L apart.
-
-        Returned per event (the scalar split evenly) so the caller's per-event weighting
-        and normalisation are unchanged.
+        Returns (M,) detached posterior downbeat probabilities, or None if no meter is
+        available. This is the E-step, evaluated at theta_old, so it is computed under
+        no_grad and recomputed fresh every forward pass -- caching a stale E-step is
+        exactly what would break the monotonicity guarantee.
         """
         M = matched_log.shape[0]
-        L = int(self.meter_length)
-        index = torch.arange(M, device=matched_log.device)
-        totals = []
-        for phi in range(L):
-            is_db = (index % L) == phi
-            picked = torch.where(is_db, matched_log[:, DOWNBEAT], matched_log[:, BEAT])
-            totals.append(picked.sum())
-        log_mix = torch.logsumexp(torch.stack(totals), dim=0) - float(np.log(L))
-        return (-log_mix / M).expand(M)
+        if segments is None:
+            L = int(self.meter_length)
+            if L <= 1 or M < L:
+                return None
+            segments = [(0, L)]
+
+        with torch.no_grad():
+            r = torch.zeros(M, device=matched_log.device, dtype=matched_log.dtype)
+            for k, (start, meter) in enumerate(segments):
+                end = segments[k + 1][0] if k + 1 < len(segments) else M
+                span = matched_log[start:end]
+                length = end - start
+                if meter <= 1 or length == 0:
+                    continue
+                # (12)/(17): unnormalized log posterior of each phase hypothesis,
+                # from this segment's own matched events only.
+                log_pi = torch.stack([
+                    torch.where(event_is_downbeat_under(length, meter, p, span.device),
+                                span[:, DOWNBEAT], span[:, BEAT]).sum()
+                    for p in range(meter)])
+                pi = torch.softmax(log_pi, dim=0)
+                # (14)/(34): singleton lookup at p*_i, indexed within the segment.
+                r[start:end] = pi[phase_star(length, meter, span.device)]
+        return r
+
+    def _precision_scales(self, raw_precision):
+        """Equation of section 4.1.3: b_j = b_min + softplus(u_j).
+
+        The floor rules out precision collapse by construction. Returns None when no
+        precision head is present or the warm-up has not elapsed, in which case the
+        caller uses the shared global b -- which is mitigation four, forcing accurate
+        localisation to be learned before an uncertainty channel exists to substitute
+        for it.
+        """
+        if raw_precision is None or self._call_count < self.precision_warmup:
+            return None
+        return self.b_min + F.softplus(raw_precision)
+
+    def _per_candidate_time_term(self, residual, b_j):
+        """The time channel under per-candidate precision, with the 4.1.3 stop-gradient.
+
+        The per-example loss is |t_i - t_hat_j| / b_j + log(2 b_j). Written naively,
+        one gradient step can widen b_j and leave t_hat_j unimproved -- the cheating
+        direction, since inflating precision is a much smaller penalty than the harder
+        work of localising correctly, and it is self-reinforcing, because the residual
+        gradient scales as 1/b_j.
+
+        So the two roles b_j plays are decoupled: t_hat_j sees b_j only through a
+        DETACHED value, and b_j is updated only through its own separate term. Neither
+        term is dropped -- both are the same loss -- but no single step can trade one
+        against the other.
+        """
+        localisation = residual / b_j.detach()
+        precision = residual.detach() / b_j + torch.log(2.0 * b_j)
+        return localisation + precision
+
+    def _precision_prior(self, b_j):
+        """Mitigation two: a Gamma prior on the precision 1/b_j, as a MAP term.
+
+        Gamma(alpha, beta) on tau := 1/b_j has log-density (alpha - 1) log tau - beta *
+        tau up to a constant, so the negative log prior contributed to the objective is
+
+            -(alpha - 1) * log(1 / b_j) + beta / b_j
+             = (alpha - 1) * log b_j + beta / b_j,
+
+        convex in b_j with its minimum at b_j = beta / (alpha - 1). Setting beta from
+        the shared, data-estimated b makes that default what the data actually says
+        rather than an arbitrary constant, so the prior damps runaway inflation toward
+        the dataset-wide scale instead of toward an unrelated one.
+        """
+        alpha = self.precision_prior_alpha
+        beta = (self.precision_prior_beta if self.precision_prior_beta is not None
+                else float(self.b) * max(alpha - 1.0, 1e-6))
+        return ((alpha - 1.0) * torch.log(b_j) + beta / b_j).sum()
 
     def _update_b(self, residuals):
         """Equation (5): b_hat = mean absolute residual over matched pairs, the
@@ -1101,7 +1607,7 @@ def targets_to_events(target, num_frames=None):
 
     Times are normalised by the frame count, matching equation (1)'s (0, 1) range.
     Quantisation to the frame grid costs up to half a frame (11.6 ms at 43.07 fps) of
-    target precision; the FCOS path has always had the same quantisation, so this
+    target precision; the annotation grid has always had the same quantisation, so this
     keeps the comparison apples-to-apples. Passing exact annotation seconds through
     the dataloader would remove it and is the obvious later refinement.
     """
@@ -1148,9 +1654,9 @@ def intervals_to_events(annotations, num_frames):
 
     [Inherited quirk, deliberately not worked around] make_intervals returns an empty
     array whenever a crop holds fewer than two downbeats OR fewer than two beats, so
-    such a crop contributes no targets at all rather than a partial set. The FCOS path
+    such a crop contributes no targets at all rather than a partial set. The interval
     has always trained under exactly this rule, so reproducing it keeps the comparison
-    against fcos_lite honest. It does mean very slow or near-silent crops are silently
+    conversion is honest. It does mean very slow or near-silent crops are silently
     empty; SubsetCriterion counts them as all-background.
 
     annotations: (M, 3) for one fragment, or (B, M, 3) for a batch.
@@ -1211,27 +1717,60 @@ def intervals_to_events(annotations, num_frames):
 
 
 # ---------------------------------------------------------------------------
-# Inference (section 8.2, Algorithm 3)
+# Inference (section 9.2, Algorithm 5)
 # ---------------------------------------------------------------------------
 
-def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.2):
-    """Algorithm 3 for one fragment: per-candidate argmax, then a class threshold.
+def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.2,
+                  literal_argmax=False):
+    """Algorithm 5 for one fragment: decide per candidate, then threshold.
 
     No NMS and no de-duplication: exactly one classification decision is made per
     candidate and t_hat is strictly increasing by equation (1), so two reported
     detections can never coincide or cross. The predicted times are points, and the
     property that matters for a point sequence is strict ordering, not disjointness.
 
+    Two decision rules, differing only in how a candidate is judged to be an event at
+    all. Algorithm 5 as written takes the argmax over {DB, B, empty} and discards the
+    candidate if empty wins. That throws away a candidate at, say,
+    (DB 0.30, B 0.31, empty 0.39) even though it assigns 0.61 to SOMETHING being there
+    -- the empty class only has to beat each active class separately, not their sum,
+    so an underconfident model loses recall for no good reason.
+
+    The default here instead thresholds p(event) = 1 - p(empty), the same quantity
+    equation (9) uses to express "some beat occurred", and only then picks DB versus B
+    by their relative mass. That is the decision the three-way distribution actually
+    supports: whether an event is present, and separately which kind. Measured at epoch
+    5 of a training run: joint F 0.514 -> 0.525, almost all of it beat F
+    (0.615 -> 0.636), with downbeat F unchanged -- a small, free gain, larger while the
+    model is underconfident and shrinking as it sharpens.
+
+    literal_argmax=True restores Algorithm 5 exactly.
+
     class_logits (N, 3), t_hat (N,). Returns (classes, times, scores), ascending in
     time, with times still normalised to (0, 1).
     """
     probabilities = F.softmax(class_logits, dim=-1)
-    scores, predicted = probabilities.max(dim=-1)
 
+    if literal_argmax:
+        scores, predicted = probabilities.max(dim=-1)
+        thresholds = torch.where(
+            predicted == DOWNBEAT,
+            torch.full_like(scores, threshold_downbeat),
+            torch.full_like(scores, threshold_beat))
+        keep = (predicted != BACKGROUND) & (scores >= thresholds)
+        return predicted[keep], t_hat[keep], scores[keep]
+
+    # p(event) = 1 - p(empty): is anything here at all?
+    event_probability = 1.0 - probabilities[:, BACKGROUND]
+    # ... and if so, which kind? The two thresholds stay per-class, so beat and
+    # downbeat can still be swept independently (their confidence distributions differ).
+    predicted = torch.where(
+        probabilities[:, DOWNBEAT] >= probabilities[:, BEAT],
+        torch.full_like(event_probability, DOWNBEAT, dtype=torch.long),
+        torch.full_like(event_probability, BEAT, dtype=torch.long))
     thresholds = torch.where(
         predicted == DOWNBEAT,
-        torch.full_like(scores, threshold_downbeat),
-        torch.full_like(scores, threshold_beat))
-    keep = (predicted != BACKGROUND) & (scores >= thresholds)
-
-    return predicted[keep], t_hat[keep], scores[keep]
+        torch.full_like(event_probability, threshold_downbeat),
+        torch.full_like(event_probability, threshold_beat))
+    keep = event_probability >= thresholds
+    return predicted[keep], t_hat[keep], event_probability[keep]

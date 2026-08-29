@@ -113,3 +113,6 @@ dataset_folds/*/label/*
 *.log.nanrun
 beat_histogram_*.png
 downbeat_histogram_*.png
+
+# training artefacts: logs and checkpoints from experiment runs
+runs/

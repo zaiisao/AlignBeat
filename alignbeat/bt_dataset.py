@@ -31,7 +31,9 @@ import random
 import numpy as np
 import torch
 
-from beatfcos.dataloader import BEAT_ONLY_DATASETS, CLASS_BEAT_ONLY
+from alignbeat.mmnpz import MemmappedNpzFile
+
+from alignbeat.dataloader import BEAT_ONLY_DATASETS, CLASS_BEAT_ONLY
 
 # Mask augmentation, ported from beat_this/dataset/augment.py (augment_mask_ /
 # apply_mask_excerpt) with beat_this's own default params (launch_scripts/train.py:50-56):
@@ -102,6 +104,7 @@ class BeatThisSpectDataset(torch.utils.data.Dataset):
                             beat_only_datasets.add(name)
         self.beat_only = set(beat_only_datasets)
         self._handles = {}
+        self._handles_pid = os.getpid()
 
         test_fold = (validation_fold + 1) % num_folds
         self.items = []
@@ -138,11 +141,28 @@ class BeatThisSpectDataset(torch.utils.data.Dataset):
         return len(self.items)
 
     def _npz(self, name):
-        # opened lazily and cached per worker: np.load on a multi-GB npz is cheap
-        # (it memory-maps the zip index) but doing it per item is not.
+        # Opened lazily and cached PER PROCESS: np.load on a multi-GB npz is cheap (it
+        # reads the zip index) but doing it per item is not.
+        #
+        # The per-process part is load-bearing, not tidiness. An NpzFile wraps an open
+        # file descriptor, and DataLoader workers are forked -- so a handle opened in
+        # the parent is INHERITED by every worker, which then interleave seeks and reads
+        # on one shared fd. The reads come back corrupted, surfacing as
+        # `BadZipFile: Bad CRC-32` from a worker, and the failure depends on whether
+        # anything happened to touch the dataset before the fork, so it looks
+        # intermittent. That is why --num_workers had to stay at 0, which left training
+        # data-loading bound at ~15% GPU utilisation.
+        #
+        # Comparing the PID and dropping the cache on a mismatch gives each worker its
+        # own handles. Do not replace this with a plain dict again.
+        if os.getpid() != self._handles_pid:
+            self._handles = {}
+            self._handles_pid = os.getpid()
         if name not in self._handles:
-            self._handles[name] = np.load(
-                os.path.join(self.spect_root, f"{name}.npz"), allow_pickle=True)
+            # MemmappedNpzFile, not np.load: see alignbeat/mmnpz.py for why. np.load
+            # decodes a whole track to serve a 30-second crop; this returns a view.
+            self._handles[name] = MemmappedNpzFile(
+                os.path.join(self.spect_root, f"{name}.npz"))
         return self._handles[name]
 
     def _beats(self, name, track):
@@ -174,18 +194,26 @@ class BeatThisSpectDataset(torch.utils.data.Dataset):
                     if kind == "ts":
                         scale = 1.0 / (1.0 + amount / 100.0)
 
-        spect = torch.from_numpy(np.asarray(z[key], dtype=np.float32))   # (T, 128)
+        # Crop BEFORE casting. The corpus stores float16 and the model wants float32,
+        # but a track is typically much longer than target_length, so casting the whole
+        # thing and then slicing converts frames that are immediately discarded.
+        # Measured on a 4756-frame track: 12.7 ms to cast whole then crop, 2.7 ms to
+        # crop then cast. That is per item, on the dataloader's critical path.
+        raw = z[key]                                                     # (T, 128) fp16
         beats, downbeats = self._beats(name, track)
         beats, downbeats = beats * scale, downbeats * scale
 
-        total = spect.shape[0]
+        total = raw.shape[0]
         if total > self.target_length:
             start = (random.randint(0, total - self.target_length)
                      if self.subset == "train" else 0)
-            spect = spect[start:start + self.target_length]
+            raw = raw[start:start + self.target_length]
         else:
             start = 0
-            spect = torch.nn.functional.pad(spect, (0, 0, 0, self.target_length - total))
+        spect = torch.from_numpy(np.asarray(raw, dtype=np.float32))
+        if spect.shape[0] < self.target_length:
+            spect = torch.nn.functional.pad(
+                spect, (0, 0, 0, self.target_length - spect.shape[0]))
         offset = start / self.fps
 
         if self.subset == "train" and self.mask_aug:

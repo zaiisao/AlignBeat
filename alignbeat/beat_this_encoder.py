@@ -14,8 +14,8 @@ from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
-from beatfcos import roformer
-from beatfcos.beat_this_frontend import make_stem, make_frontend_block
+from alignbeat import roformer
+from alignbeat.beat_this_frontend import make_stem, make_frontend_block
 
 
 class BeatThisEncoder(nn.Module):
