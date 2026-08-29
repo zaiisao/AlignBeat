@@ -1,49 +1,55 @@
 #!/usr/bin/env python3
 """Reproduce Beat Transformer's published 8-fold splits for our datasets.
 
-[왜] ballroom/beatles/hainsworth의 기존 .folds 파일은 사실 Beat This!(Foscarin et
-al. 2024)가 공개한 split과 byte-identical이었고, carnatic/harmonix에는 아예 fold
-파일이 없어서 임의의 80/10/10 fallback을 쓰고 있었다. 두 출처의 fold 배정은 서로
-완전히 무관하다(ballroom 기준 일치율 11.8%, 8-fold 무작위 기대치 12.5%). 즉 어느
-쪽을 쓰는지가 결과에 영향을 주므로 하나로 통일해야 한다.
+Why: the existing .folds files for ballroom/beatles/hainsworth turned out to be
+byte-identical to the split published by Beat This! (Foscarin et al. 2024), while
+carnatic/harmonix had no fold file at all and fell back to an arbitrary 80/10/10.
+The two sources' fold assignments are entirely unrelated - on ballroom they agree
+on 11.8% of songs, against 12.5% expected by chance for 8 folds. Which one is used
+therefore changes the results, so it has to be unified on one.
 
-Beat Transformer(Zhao et al. 2022)를 택한 이유는 학습 데이터 구성이 우리와 거의
-같기 때문이다 - 그들의 7개(ballroom, hainsworth, rwc_popular, harmonix, carnatic,
-smc + gtzan은 test-only)에서 beatles만 빠진다. Beat This!는 18개 데이터셋으로
-학습해서, fold를 맞춰봐야 published 숫자와 비교가 성립하지 않는다.
+Beat Transformer (Zhao et al. 2022) was chosen because its training data is nearly
+the same as ours - of their seven (ballroom, hainsworth, rwc_popular, harmonix,
+carnatic, smc, plus gtzan as test-only) only beatles is missing. Beat This! trains
+on 18 datasets, so matching their folds would not make our numbers comparable to
+their published ones anyway.
 
-[방법] 그들의 분할 규칙은 완전히 재현 가능하다 (code/spectrogram_dataset.py
+How: their splitting rule is fully reproducible (code/spectrogram_dataset.py
 L328-355):
     FOLD_SIZE = len(data) // 8
     np.random.seed(0); np.random.shuffle(audio_root)
     fold i (i < 7) = audio_root[i*FOLD_SIZE : (i+1)*FOLD_SIZE]
-    fold 7         = 나머지 전부
-셔플 이전 순서는 저장소에 함께 공개된 data/audio_lists/{key}.txt의 줄 순서다.
+    fold 7         = everything left over
+The pre-shuffle order is the line order of data/audio_lists/{key}.txt, published
+alongside the repository.
 
-[출처별 신뢰도]
+Confidence per source:
   ballroom / hainsworth / carnatic / smc
-      공개된 audio_lists를 그대로 사용. stem이 우리 파일명과 직접 일치.
+      The published audio_lists are used as-is; the stems match our filenames
+      directly.
   harmonix
-      그들은 파일을 000~911로 재명명해서 공개 목록만으로는 어느 곡인지 알 수 없다.
-      annotation 시그니처(비트 수, 첫/마지막 시각)로 역매핑함 - 912개 중 910개가
-      유일하게 결정되고 나머지 2개(0250_sexyandiknowit / 0324_yeah3x)는 시그니처가
-      완전히 같아 임의로 갈랐다. 최악의 경우 두 곡의 fold가 서로 바뀌는 정도.
+      They renamed the files to bare 000-911, so the published list alone does not
+      say which song is which. Recovered by annotation signature (beat count, first
+      and last time) - 910 of 912 are uniquely determined, and the remaining two
+      (0250_sexyandiknowit / 0324_yeah3x) have identical signatures and were split
+      arbitrarily. Worst case, those two songs swap folds.
   rwc_popular
-      audio_lists/rwc.txt는 공개되지 않았다(README: RWC는 royalty 문제로 오디오
-      배포 불가). npz의 annotation과 우리 RM-P 파일을 Hungarian 매칭으로 복원 -
-      100곡 중 87곡은 시각이 정확히 일치(0.000s), 나머지 13곡은 bijection 제약으로
-      소거법으로 결정됨. 이 13곡은 Beat This! README가 언급한 "Böck이 부분 수정한
-      RWC pop annotation"과 겹치는 것으로 보인다. 검증이 아니라 추론이므로 논문에
-      그대로 밝힐 것.
+      audio_lists/rwc.txt was never published (per the README, RWC audio cannot be
+      redistributed for royalty reasons). Recovered by matching the npz annotations
+      against our RM-P files with an assignment solver - 87 of 100 match times
+      exactly (0.000s) and the remaining 13 fall out by elimination under the
+      bijection constraint. Those 13 appear to be the "RWC pop annotations partially
+      corrected by Böck" the Beat This! README mentions. This is inference, not
+      verification, and should be stated as such in the paper.
 
-[주의] 우리 ballroom 사본은 두 출처가 공통으로 나열하는 685곡 중 13곡이 없다
-(예: Albums-AnaBelen_Veneo-03, -11). fold 배정 자체는 그들 것이지만 fold 구성은
-부분집합이며, 이는 어느 fold 출처를 쓰든 동일하게 적용된다.
+Caveat: our ballroom copy is missing 13 of the 685 songs both sources list (e.g.
+Albums-AnaBelen_Veneo-03, -11). The fold assignment is theirs, but the fold
+membership is a subset - which applies equally whichever fold source is used.
 
-사용법:
-  python make_bt_folds.py            # 미리보기
-  python make_bt_folds.py --write    # dataset_folds/<ds>/label/ 에 기록
-                                     #   (annotation은 symlink로 미러링)
+Usage:
+  python make_bt_folds.py            # preview
+  python make_bt_folds.py --write    # write into dataset_folds/<ds>/label/
+                                     #   (annotations are mirrored as symlinks)
 """
 import argparse
 import glob

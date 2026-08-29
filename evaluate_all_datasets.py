@@ -1,182 +1,133 @@
 #!/usr/bin/env python3
 """
-학습 끝난 체크포인트를 각 데이터셋(val subset)별로 따로 평가.
-train.py는 4개 데이터셋(ballroom/beatles/hainsworth/rwc_popular)을 합쳐서
-하나의 val_dataloader로만 평가하기 때문에, 데이터셋별 성능이 안 보였음 - 이
-스크립트는 데이터셋마다 따로 BeatDataset(val)/DataLoader를 만들어서 개별 평가.
+Evaluate a trained checkpoint on each dataset's val subset separately.
+train.py pools four datasets (ballroom/beatles/hainsworth/rwc_popular) into a
+single val_dataloader, so per-dataset performance was invisible - this script
+builds one dataset/DataLoader per corpus dataset and scores them individually.
 
-gtzan, smc 둘 다 train.py에는 CLI 인자 자체가 없어서 학습에는 전혀 안 쓰였음 -
-즉 이 체크포인트한테는 완전히 처음 보는 데이터셋들임.
-smc는 다운비트 구분이 없는 데이터셋인데, dataloader.py의 파서가 모든 이벤트를
-beat=1로 하드코딩하고(line 461) 그 값이 다운비트 판정 로직에도 그대로
-재사용돼서(line 483-485), SMC의 ground truth downbeat == ground truth beat가
-되어버림. 즉 "다운비트가 없어서 0이 나오는" 게 아니라 "모든 beat가 다운비트로도
-라벨링된" 상태로 정상 평가됨 - Downbeat F-measure가 0이 아니어도 이상한 게
-아님.
+Neither gtzan nor smc has a CLI argument in train.py, so neither was used for
+training - they are completely unseen for this checkpoint.
+smc has no downbeat distinction, but dataloader.py's parser hardcodes every event
+as beat=1 (line 461) and that value is reused verbatim by the downbeat decision
+logic (lines 483-485), so SMC's ground-truth downbeats end up identical to its
+ground-truth beats. The evaluation is therefore not "zero because there are no
+downbeats" but "every beat is also labelled as a downbeat" - a nonzero Downbeat
+F-measure here is not surprising.
 
-fold 정합성: ballroom/beatles/hainsworth/rwc_popular 4개는 8-fold CV로
-학습했으므로 반드시 --validation_fold로 실제 held-out fold를 지정해야 함
-(subset="val", validation_fold=None으로 두면 8-fold 분할과 무관한 옛
-80/10/10 split의 val 부분을 봐서, 학습에 쓰인 곡이 섞여 들어가는 data
-leakage가 생김). gtzan/smc는 fold 파일 자체가 없고 학습에도 전혀 안 쓰였으니
-subset="full-val"로 전체 데이터를 봄.
+Fold consistency: ballroom/beatles/hainsworth/rwc_popular were trained with 8-fold
+CV, so --validation_fold must name the actual held-out fold. Leaving subset="val"
+with validation_fold=None reads the val portion of the old 80/10/10 split, which
+is unrelated to the 8-fold partition, and training songs leak into the evaluation
+set. gtzan/smc have no fold file at all and were never trained on, so they use
+subset="full-val" over the whole dataset.
 """
 import argparse
 import os
 import sys
-# 이 스크립트가 있는 repo의 beatfcos 패키지를 항상 최우선으로 import.
-# (예전에 여기 하드코딩돼 있던 '/disk1/taegum/mnt/BeatFCOS' 절대경로는 오래된
-# 트리를 가리켜서, 새로 추가된 모듈(subset_head 등)이 없는 옛 코드가 로컬 코드를
-# 가리는(shadow) 문제가 있었음 - 어느 checkout에서 실행하든 자기 자신의 패키지를
-# 쓰도록 스크립트 위치 기준으로 바꿈.)
+# Always import the alignbeat package from the repo this script lives in.
+# The absolute path '/disk1/taegum/mnt/AlignBeat' that used to be hardcoded here
+# pointed at a stale tree, so old code missing the newer modules shadowed the local
+# ones. Deriving the path from the script location makes any checkout use its own
+# package.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import torch
-from beatfcos import model_module
-from beatfcos.dataloader import BeatDataset, collater
-from beatfcos.beat_eval import evaluate_beat_f_measure, evaluate_beat_f_measure_subset
+from alignbeat import model_module
+from alignbeat.bt_dataset import BeatThisSpectDataset
+from alignbeat.dataloader import collater
+from alignbeat.beat_eval import evaluate_beat_f_measure_subset
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint', type=str, required=True)
-parser.add_argument('--score_threshold', type=float, default=0.20)
-parser.add_argument('--downbeat_score_threshold', type=float, default=0.20,
-                     help="train.py가 학습 중 자체 평가에 쓰는 값과 동일하게 0.20이 기본값 (beat/downbeat 동일 threshold). 다르게 주면 train.py 로그의 epoch별 점수와 비교가 안 맞음")
-parser.add_argument('--downbeat_sigma', type=float, default=None,
-                     help="soft-NMS의 downbeat 전용 sigma (안 주면 기존처럼 beat/downbeat 둘 다 0.5 사용)")
-parser.add_argument('--downbeat_phase_reweight', action='store_true',
-                     help="phase head 예측을 이용해 downbeat 점수를 재조정 (재학습 불필요, model_module.py 주석 참고)")
 parser.add_argument('--validation_fold', type=int, default=0,
-                     help="ballroom/beatles/hainsworth/rwc_popular의 8-fold CV held-out fold 번호 (체크포인트를 학습시킨 validation_fold와 일치해야 함)")
-# 체크포인트를 학습시킨 training_data_clusters와 반드시 일치해야 함 (anchor
-# base_size가 여기서 나오기 때문 - 학습 때와 다른 clusters로 평가하면 anchor
-# 스케일이 어긋남). 예전 5-클러스터 체크포인트는 기본값 그대로, FPN
-# 레벨/클러스터 개수 불일치를 고친 이후 체크포인트는 3개짜리로 넘겨야 함
-# (train.py의 training_data_clusters 줄 주석 참고).
-parser.add_argument('--clusters', type=str, default="0.42574675,0.66719675,1.24245649,1.93286828,2.78558922",
-                     help="콤마로 구분된 클러스터 값. 체크포인트 학습에 쓴 값과 일치시킬 것")
-# nhead=2로 학습된 옛날 체크포인트(이 버그 발견 이전 전부)를 평가하려면
-# --nhead 2로 명시해야 함. 기본값은 train.py의 고쳐진 기본값과 맞춰 8.
-parser.add_argument('--smc_subset', type=str, default='full-val', choices=['full-val', 'val'],
-                    help="use 'val' when the checkpoint was trained with --smc_* (else 75%% leakage)")
-parser.add_argument('--dmodel', type=int, default=128)
-parser.add_argument('--d_hid', type=int, default=512)
-parser.add_argument('--nhead', type=int, default=8,
-                     help="체크포인트 학습에 쓴 nhead와 반드시 일치시킬 것 (DilatedTransformerLayer의 8-head 하드코딩 분할 때문에 다르면 Er 파라미터 shape mismatch/의미 불일치 발생)")
-parser.add_argument('--head_type', type=str, default="fcos", choices=['fcos', 'hungarian', 'fcos_lite', 'fcos_no_fpn', 'subset'],
-                     help="체크포인트 학습에 쓴 head_type과 반드시 일치시킬 것 (pyramid_levels/Anchors/head 구조가 달라짐)")
-# --- subset head (--head_type subset) 전용 ---
-# 학습 때 쓴 num_candidates와 반드시 일치해야 함 (downsample stride/입력 길이가 여기서 나옴).
-parser.add_argument('--num_candidates', type=int, default=160)
-# Algorithm 3의 threshold. beat/downbeat 분포가 달라 따로 sweep할 수 있게 분리.
+                     help="8-fold CV held-out fold index for ballroom/beatles/hainsworth/rwc_popular (must match the validation_fold the checkpoint was trained with)")
+# Must match the value the checkpoint was trained with (N is derived from it).
+parser.add_argument('--spect_root', required=True,
+                    help='dir of {dataset}.npz from the Beat This corpus')
+parser.add_argument('--spect_annot_root',
+                    default='/disk4/shared/beat_this/data/annotations')
+parser.add_argument('--datasets', type=str,
+                    default='asap,ballroom,beatles,candombe,filosax,groove_midi,guitarset,'
+                            'hainsworth,harmonix,hjdb,jaah,rwc,simac,smc,tapcorrect,gtzan')
+parser.add_argument('--eval_length', type=int, default=2097152)
+parser.add_argument('--window_frames', type=int, default=1500)
+parser.add_argument('--n_min', type=int, default=172)
+parser.add_argument('--transformer_dim', type=int, default=512)
+parser.add_argument('--class_attention_layers', type=int, default=0)
+# Algorithm 3's threshold. Split in two so beat and downbeat, whose score
+# distributions differ, can be swept independently.
 parser.add_argument('--tau_beat', type=float, default=0.2)
 parser.add_argument('--tau_downbeat', type=float, default=0.2)
-# Algorithm 4의 border beta (frame 단위). 기본값은 후보 간격 D/N = 8 frame.
+# Border beta for the Section 9.3 stitching, in frames. The default is the candidate
+# spacing D/N = 8 frames.
 parser.add_argument('--stitch_beta_frames', type=int, default=8)
 args = parser.parse_args()
 
-# (audio_dir, annot_dir, subset, validation_fold)
-# 학습(train.py)이 쓴 annot_dir과 동일한 dataset_folds/*/label을 가리킴.
-# 예전에는 /disk1/taegum/mnt/labeled_data/*/label을 봤는데, 그쪽에는
-# *_8-fold_cv_dancestyle.folds / *_genre.folds가 있고 학습 쪽에는
-# *_8-fold_cv_beat_transformer.folds가 있어서, 같은 --validation_fold 0이어도
-# 서로 다른 분할이 됨 -> eval val set에 학습에 쓰인 곡이 섞여 들어가는 leakage.
-FOLD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_folds")
-
-DATASETS = {
-    "ballroom": ("/disk1/taegum/mnt/labeled_data/ballroom/data", f"{FOLD_ROOT}/ballroom/label", "val", args.validation_fold),
-    "hainsworth": ("/disk1/taegum/mnt/labeled_data/hains/data", f"{FOLD_ROOT}/hainsworth/label", "val", args.validation_fold),
-    "rwc_popular": ("/disk1/taegum/mnt/labeled_data/rwc_popular/data", f"{FOLD_ROOT}/rwc_popular/label", "val", args.validation_fold),
-    "carnatic": ("/disk4/taegum/carnatic/data", f"{FOLD_ROOT}/carnatic/label", "val", args.validation_fold),
-    "harmonix": ("/disk4/taegum/harmonix_griffinlim/audio", f"{FOLD_ROOT}/harmonix/label", "val", args.validation_fold),
-    # 아래 3개는 train.py에 CLI 인자가 없거나(gtzan/beatles) 이번 arm에서 안 넘겼으므로
-    # 체크포인트가 한 번도 본 적 없는 데이터셋 - zero-shot 측정용.
-    "beatles": ("/disk1/taegum/mnt/labeled_data/beatles/data", "/disk1/taegum/mnt/labeled_data/beatles/label", "val", args.validation_fold),
-    "gtzan": ("/disk1/taegum/mnt/labeled_data/gtzan/data", "/disk1/taegum/mnt/labeled_data/gtzan/label", "full-val", None),
-    # SMC_MIREX_Annotations 디렉토리는 비어 있음(실제 주석은 _05_08_2014 쪽).
-    # 학습이 쓰는 dataset_folds/smc/label과 같은 걸 씀.
-    # SMC as "full-val"/fold=None is only zero-shot for arms trained WITHOUT --smc_*.
-    # For an SMC-trained arm 163/217 of these files are in its fold-0 train split, so
-    # the number is 75% contaminated. Use --smc_subset val (with --validation_fold) then.
-    "smc": ("/disk1/taegum/mnt/SMC_MIREX/SMC_MIREX/SMC_MIREX_Audio", f"{FOLD_ROOT}/smc/label",
-            args.smc_subset, (args.validation_fold if args.smc_subset == "val" else None)),
-}
+# Every dataset in the corpus. gtzan has no fold split at all -- it ships whole, as
+# the held-out test set -- so it is evaluated as "test" while everything else is scored
+# on its own validation fold.
+DATASETS = [d.strip() for d in args.datasets.split(',') if d.strip()]
 
 AUDIO_SAMPLE_RATE = 22050
-AUDIO_DOWNSAMPLING_FACTOR = 512
+AUDIO_DOWNSAMPLING_FACTOR = 441   # the corpus is 50 fps
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-training_data_clusters = torch.tensor([float(x) for x in args.clusters.split(",")])
-model = model_module.create_beatfcos_model(
-    num_classes=2, clusters=training_data_clusters, args=None,
-    head_type=args.head_type,
-    # dmodel=128, nhead=2, d_hid=512, nlayers=9, attn_len=5, dropout=0.1,  # nhead=2는 dilated head가 죽는 버그 - args.nhead로 대체
-    dmodel=args.dmodel, nhead=args.nhead, d_hid=args.d_hid, nlayers=9, attn_len=5, dropout=0.1,
-    downbeat_weight=0.6, audio_downsampling_factor=AUDIO_DOWNSAMPLING_FACTOR,
-    centerness=False, postprocessing_type="soft_nms",
-    audio_sample_rate=AUDIO_SAMPLE_RATE, backbone_type="wavebeat",
-    num_candidates=args.num_candidates,
+# WINDOW_FRAMES must match what the checkpoint was trained with: the
+# downsampling schedule derives N from it, and the head rejects any other N.
+WINDOW_FRAMES = args.window_frames
+_eval_frames = args.eval_length // AUDIO_DOWNSAMPLING_FACTOR
+model = model_module.create_alignbeat_model(
+    args=None,
+    audio_downsampling_factor=AUDIO_DOWNSAMPLING_FACTOR,
+    audio_sample_rate=AUDIO_SAMPLE_RATE,
+    encoder_input_frames=WINDOW_FRAMES,
+    n_min=args.n_min,
+    transformer_dim=args.transformer_dim,
+    dropout={"frontend": 0.1, "transformer": 0.2},
+    class_attention_layers=args.class_attention_layers,
 )
 
 state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-# strict=False: phase auxiliary head(regressionModel.phase.*)가 새로 추가돼서
-# phase 도입 이전 체크포인트에는 이 키가 없음 - eval(soft-NMS 후처리)에는 phase
-# 출력이 안 쓰이므로 누락돼도 무방함 (0으로 초기화된 채로 그냥 안 쓰이고 남음).
 missing, unexpected = model.load_state_dict(state_dict, strict=False)
 if unexpected:
-    raise RuntimeError(f"체크포인트에 모델에 없는 키가 있음: {unexpected}")
-if args.head_type == "subset":
-    # subset 체크포인트는 현재 train.py가 저장하는 모든 키(subset_criterion.b 버퍼
-    # 포함)를 반드시 갖고 있어야 함 - phase 키 allowlist는 fcos 계열 전용이고,
-    # subset에서 키가 하나라도 빠졌다는 건 랜덤 초기화된 서브모듈로 평가한다는
-    # 뜻이라(그럴듯해 보이는 쓰레기 숫자가 나옴) 무조건 에러로 처리.
-    if missing:
-        raise RuntimeError(
-            f"subset 체크포인트에 키 누락: {missing} - 다른 head_type으로 학습된 "
-            f"체크포인트이거나 손상된 파일임")
-elif missing and missing != ["regressionModel.phase.weight", "regressionModel.phase.bias"]:
-    raise RuntimeError(f"예상 못한 키 누락: {missing}")
+    raise RuntimeError(f"checkpoint has keys the model does not: {unexpected}")
+# Any missing key means evaluating with a randomly initialised submodule, which
+# yields plausible-looking garbage numbers, so always treat it as an error.
+if missing:
+    raise RuntimeError(
+        f"missing keys in checkpoint: {missing} - it was trained with a different "
+        f"configuration, or the file is corrupt")
 model = model.to(device)
 
-print(f"체크포인트: {args.checkpoint}")
-print(f"score_threshold(beat)={args.score_threshold} | downbeat_score_threshold={args.downbeat_score_threshold} | downbeat_sigma={args.downbeat_sigma}\n")
+print(f"checkpoint: {args.checkpoint}")
+print(f"tau_beat={args.tau_beat} | tau_downbeat={args.tau_downbeat} | "
+      f"window_frames={WINDOW_FRAMES} | n_min={args.n_min}\n")
 
 results = {}
-for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
-    val_dataset = BeatDataset(
-        audio_dir, annot_dir, dataset=name,
-        audio_sample_rate=AUDIO_SAMPLE_RATE,
-        audio_downsampling_factor=AUDIO_DOWNSAMPLING_FACTOR,
-        subset=subset, augment=False, half=True, preload=False,
-        length=2097152, dry_run=False, spectral=True, validation_fold=validation_fold,
-    )
+beat_only_names = set()
+for name in DATASETS:
+    subset = "test" if name == "gtzan" else "val"
+    val_dataset = BeatThisSpectDataset(
+        args.spect_root, args.spect_annot_root, [name], subset=subset,
+        validation_fold=args.validation_fold, target_length=_eval_frames)
+    if name in val_dataset.beat_only:
+        beat_only_names.add(name)
     val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1, shuffle=False, collate_fn=collater
-    )
+        val_dataset, batch_size=1, shuffle=False, collate_fn=collater)
 
-    if args.head_type == "subset":
-        # subset head는 고정 길이 window만 받으므로 곡을 타일링해 디코딩하고
-        # Algorithm 4로 이어붙임. length=2097152(4096 frame)는 그대로 둬서 fcos
-        # 계열과 정확히 같은 구간을 평가함 - 숫자를 직접 비교해야 하므로.
-        beat_f, downbeat_f, song_results = evaluate_beat_f_measure_subset(
-            val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
-            window_frames=args.num_candidates * 8,
-            border_frames=args.stitch_beta_frames,
-            threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat,
-        )
-    else:
-        beat_f, downbeat_f, song_results = evaluate_beat_f_measure(
-            val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
-            score_threshold=args.score_threshold,
-            downbeat_score_threshold=args.downbeat_score_threshold,
-            downbeat_sigma=args.downbeat_sigma,
-            downbeat_phase_reweight=args.downbeat_phase_reweight,
-        )
-    # mir_eval.beat.evaluate가 곡마다 돌려주는 dict에서 CMLt(Correct Metric
-    # Level Total)/AMLt(Any Metric Level Total)를 뽑아서 곡 평균을 냄 -
-    # evaluate_beat_f_measure 자체는 F-measure만 집계해서 반환하기 때문.
+    beat_f, downbeat_f, song_results = evaluate_beat_f_measure_subset(
+        val_dataloader, model, AUDIO_DOWNSAMPLING_FACTOR, AUDIO_SAMPLE_RATE,
+        window_frames=WINDOW_FRAMES,
+        border_frames=args.stitch_beta_frames,
+        threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat,
+        full_metrics=True, verbose=True,
+    )
+    # Pull CMLt (Correct Metric Level Total) and AMLt (Any Metric Level Total) out of
+    # the per-song dicts mir_eval.beat.evaluate returns and average over songs - the
+    # evaluation helper itself only aggregates and returns F-measure.
     beat_cmlt = np.mean([r['beat_scores']['Correct Metric Level Total'] for r in song_results])
     beat_amlt = np.mean([r['beat_scores']['Any Metric Level Total'] for r in song_results])
     downbeat_cmlt = np.mean([r['downbeat_scores']['Correct Metric Level Total'] for r in song_results])
@@ -187,8 +138,25 @@ for name, (audio_dir, annot_dir, subset, validation_fold) in DATASETS.items():
           f"Downbeat F: {downbeat_f:.3f} CMLt: {downbeat_cmlt:.3f} AMLt: {downbeat_amlt:.3f} | "
           f"Joint F: {(beat_f+downbeat_f)/2:.3f}")
 
-print("\n=== 요약 ===")
+print("\n=== Summary ===")
 for name, (beat_f, downbeat_f, beat_cmlt, beat_amlt, downbeat_cmlt, downbeat_amlt) in results.items():
+    downbeat = ("      n/a (beat-only)" if name in beat_only_names else
+                f"F:{downbeat_f:.3f} CMLt:{downbeat_cmlt:.3f} AMLt:{downbeat_amlt:.3f}")
     print(f"{name:<12} Beat  F:{beat_f:.3f} CMLt:{beat_cmlt:.3f} AMLt:{beat_amlt:.3f}  |  "
-          f"Downbeat  F:{downbeat_f:.3f} CMLt:{downbeat_cmlt:.3f} AMLt:{downbeat_amlt:.3f}  |  "
-          f"Joint F:{(beat_f+downbeat_f)/2:.3f}")
+          f"Downbeat  {downbeat}  |  Joint F:{(beat_f+downbeat_f)/2:.3f}")
+
+# Macro averages, on the same rules train.py uses: gtzan is the held-out test set and is
+# reported separately rather than folded into the number that describes validation, and
+# datasets with no downbeat annotation are excluded from the downbeat mean instead of
+# contributing a structural zero.
+val = {k: v for k, v in results.items() if k != "gtzan"}
+if val:
+    beat_macro = np.mean([v[0] for v in val.values()])
+    down_macro = np.mean([v[1] for k, v in val.items() if k not in beat_only_names])
+    print(f"\nmacro over {len(val)} val datasets | Beat: {beat_macro:.3f} | "
+          f"Downbeat: {down_macro:.3f} ({len(val)-len(beat_only_names & val.keys())} datasets) | "
+          f"Joint: {(beat_macro+down_macro)/2:.3f}")
+if "gtzan" in results:
+    g = results["gtzan"]
+    print(f"GTZAN (held-out test)          | Beat: {g[0]:.3f} | Downbeat: {g[1]:.3f} | "
+          f"Joint: {(g[0]+g[1])/2:.3f}")
