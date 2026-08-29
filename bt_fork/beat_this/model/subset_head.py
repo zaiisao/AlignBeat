@@ -23,6 +23,8 @@ it is the paper's contribution and the reference implementation lives there.
 
 Equation numbers below refer to the PDF.
 """
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -296,6 +298,55 @@ def monotonic_times(r, epsilon=1e-4):
 # The correspondence problem (sections 4-5)
 # ---------------------------------------------------------------------------
 
+# Optional compiled kernel for recursion (7). The numpy path below is already
+# vectorised over j (np.minimum.accumulate), so its cost is not arithmetic but ~5 numpy
+# calls per row -- roughly 3600 tiny calls per training step at M=90, N=172, B=8. That
+# call overhead is what collapses under multi-process load: three concurrent arms went
+# to 1200 ms/step against a single arm's 251 ms, while the dense baseline (pure GPU
+# tensor ops) showed no degradation at all. A compiled scalar loop removes the call
+# storm entirely and touches no BLAS thread pool.
+#
+# Falls back to numpy transparently when numba is absent; the two produce BIT-IDENTICAL
+# sigma (verified on 300 random cost matrices including forced ties, and by
+# tests/test_criterion_equivalence.py).
+try:
+    from numba import njit as _njit
+
+    @_njit(cache=True, fastmath=False)
+    def _dp_kernel(cost, choice):
+        """Recursion (7) as a compiled scalar loop.
+
+        Tie-breaking must match the numpy path exactly. numpy does
+            accumulated = minimum.accumulate(a)
+            is_new = a <= accumulated
+            arg = maximum.accumulate(where(is_new, index, 0))
+        i.e. the LATEST index attaining the running weak minimum. The scalar form of
+        that is `if a <= best` (weak inequality), which updates on ties.
+        """
+        M, N = cost.shape
+        previous = np.zeros(N + 1, dtype=np.float64)
+        current = np.empty(N + 1, dtype=np.float64)
+        for i in range(1, M + 1):
+            best = np.inf
+            best_index = 0
+            for j in range(N):
+                a = previous[j] + cost[i - 1, j]
+                if a <= best:
+                    best = a
+                    best_index = j + 1
+                current[j + 1] = best
+                choice[i, j + 1] = best_index
+            current[0] = np.inf
+            previous, current = current, previous
+        return previous[N]
+
+    # ALIGNBEAT_NO_NUMBA=1 forces the numpy path -- used to A/B the two
+    # implementations against each other, which must agree bit for bit.
+    _HAVE_NUMBA = not os.environ.get("ALIGNBEAT_NO_NUMBA")
+except ImportError:                                          # pragma: no cover
+    _HAVE_NUMBA = False
+
+
 def subset_select_dp(cost, return_cost=False):
     """Algorithm 1 - exact O(N*M) order-constrained subset selection.
 
@@ -319,6 +370,20 @@ def subset_select_dp(cost, return_cost=False):
         raise ValueError(
             f"infeasible correspondence: {M} ground-truth events but only {N} "
             f"candidates. Increase num_candidates or drop the fragment.")
+
+    if _HAVE_NUMBA:
+        choice = np.zeros((M + 1, N + 1), dtype=np.int32)
+        final = _dp_kernel(np.ascontiguousarray(cost), choice)
+        sigma = np.empty(M, dtype=np.int64)
+        j = N
+        for i in range(M, 0, -1):
+            j_star = int(choice[i, j])
+            if j_star < 1:
+                raise RuntimeError(
+                    "backtracking failed; cost matrix contains non-finite values")
+            sigma[i - 1] = j_star - 1
+            j = j_star - 1
+        return (sigma, float(final)) if return_cost else sigma
 
     # D[i, j], 1-indexed in both axes. D[0, j] = 0 (empty injection costs nothing),
     # D[i, 0] = +inf for i >= 1 (no candidates cannot cover a nonempty domain).
@@ -925,6 +990,12 @@ class SubsetCriterion(nn.Module):
         # never reaches the parent module.
         self.diagnostic_every = diagnostic_every
         self._call_count = 0
+        # Diagnostic-only stats are recomputed only on steps that will actually print
+        # them; every one costs a GPU->CPU sync, and pl_module discards `stats`
+        # entirely. Off-steps reuse the last computed values so logging still reads
+        # something meaningful rather than zeros.
+        self._diag_cache = {'cost_class_mean': 0.0, 'class_spread': 0.0,
+                            'residual_mean': 0.0, 'min_gap': float('inf')}
         # Section 8.4 confirmation-bias mitigations: train beat-only events on the
         # marginal (9) alone for the first `beat_only_warmup` steps so the shared head
         # first learns B vs DB from fully-labelled data, and only trust the pseudo-label
@@ -1115,6 +1186,10 @@ class SubsetCriterion(nn.Module):
         # sigma itself, not merely the loss computed after it.
         precision_scales = self._precision_scales(raw_precision)
         precision_terms = []
+        # Matches the print gate at the bottom of this function (which tests the
+        # POST-increment count), so the numbers printed are always freshly computed.
+        want_diag = bool(self.diagnostic_every) and (
+            (self._call_count + 1) % self.diagnostic_every == 1)
 
         # Per-fragment normalized terms. Normalization is PER FRAGMENT, not by the
         # batch-wide event count: with a shared batch denominator an M=0 fragment's
@@ -1177,15 +1252,19 @@ class SubsetCriterion(nn.Module):
                 # reporting a frozen model. Skip just this fragment instead, and surface
                 # it in the stats so a run that starts degrading is visible.
                 cost_is_finite = bool(torch.isfinite(corrected).all())
-                cost_class_sum += float(class_cost.sum())
-                cost_cells += class_cost.numel()
+                if want_diag:
+                    cost_class_sum += float(class_cost.sum())
+                    cost_cells += class_cost.numel()
                 # Spread of the class term between neighbouring candidates: the amount
                 # of class evidence available to overcome one slot of time cost.
-                class_spread_sum += float((class_cost[:, 1:] - class_cost[:, :-1]).abs().mean())
-                class_spread_count += 1
+                if want_diag:
+                    class_spread_sum += float(
+                        (class_cost[:, 1:] - class_cost[:, :-1]).abs().mean())
+                    class_spread_count += 1
                 # Selection is a non-differentiable combinatorial step evaluated at the
                 # current parameters; sigma enters the loss as data (Algorithm 3).
                 fragment_meter = self._fragment_meter(event_classes)
+                phi_hat = None   # set only by the joint (sigma, phi_0) MAP below
                 if not cost_is_finite:
                     sigma_np = None
                 elif self.joint_phase and fragment_meter > 1:
@@ -1198,7 +1277,7 @@ class SubsetCriterion(nn.Module):
                                               event_classes, event_times,
                                               fragment_meter, p)
                         for p in range(fragment_meter)])
-                    sigma_np, _phi_hat = subset_select_dp_joint_phase(
+                    sigma_np, phi_hat = subset_select_dp_joint_phase(
                         phase_costs.detach().cpu().numpy())
                 elif self.mu_meter > 0.0:
                     _dbp = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten().cpu().numpy()
@@ -1323,14 +1402,24 @@ class SubsetCriterion(nn.Module):
                 # one segment under the fragment's own meter, which is the single-meter
                 # derivation of section 8 unchanged.
                 segments = targets[b].get('segments')
-                per_event = torch.where(
-                    unknown, self._beat_only_term(matched_log, segments), per_event)
+                beat_only_term, beat_only_r = self._beat_only_term(
+                    matched_log, segments, phi_hat=phi_hat, meter=fragment_meter)
+                per_event = torch.where(unknown, beat_only_term, per_event)
                 unlabelled_events += int(unknown.sum())
+            else:
+                beat_only_r = None
 
             omega = torch.where(
                 event_classes == DOWNBEAT,
                 torch.full_like(event_times, self.omega_downbeat),
                 torch.full_like(event_times, self.omega_beat))
+            # NOTE: beat-only events keep omega_beat (default 1.0), NOT an r-weighted
+            # blend of omega_B/omega_DB. Section 10.3 scopes omega_c to eq. (8), and
+            # Algorithm 5 line 19's loss line carries no omega, so with the default
+            # omega_beat = 1.0 this is the unweighted term the paper specifies. An
+            # r-interpolated weight was tried here and reverted: it reads as principled
+            # but is a term no algorithm lists, and it silently re-weights the 3% of
+            # training that is beat-only.
             class_terms.append((omega * per_event).sum() / denominator)
 
             residual = (event_times - t_hat[b][sigma]).abs()
@@ -1414,21 +1503,31 @@ class SubsetCriterion(nn.Module):
             'b': float(self.b),
             'lambda_l1': self.lambda_l1,
             # Diagnostics for the scale warning above.
-            'cost_class_mean': cost_class_sum / max(cost_cells, 1),
-            'class_spread': class_spread_sum / max(class_spread_count, 1),
+            'cost_class_mean': (cost_class_sum / max(cost_cells, 1)) if want_diag
+                               else self._diag_cache['cost_class_mean'],
+            'class_spread': (class_spread_sum / max(class_spread_count, 1)) if want_diag
+                            else self._diag_cache['class_spread'],
             'slot_time_cost': self.lambda_l1 / num_candidates,
         }
         if matched_residuals:
-            stats['residual_mean'] = float(torch.cat(matched_residuals).mean())
+            stats['residual_mean'] = (float(torch.cat(matched_residuals).mean())
+                                      if want_diag else self._diag_cache['residual_mean'])
         with torch.no_grad():
             # Smallest spacing between consecutive candidate times. Equation (1)
             # guarantees this is >= 0 always; if it reaches exactly 0 the sequence has
             # stopped being strictly increasing in float32 (see monotonic_times) and
             # duplicate detection times become possible. (Guarded: at N=1 there are no
             # gaps and .min() of an empty tensor would crash.)
-            gaps = t_hat[:, 1:] - t_hat[:, :-1]
-            stats['min_gap'] = float(gaps.min()) if gaps.numel() else float('inf')
+            if want_diag:
+                gaps = t_hat[:, 1:] - t_hat[:, :-1]
+                stats['min_gap'] = float(gaps.min()) if gaps.numel() else float('inf')
+            else:
+                stats['min_gap'] = self._diag_cache['min_gap']
 
+        if want_diag:
+            for _k in self._diag_cache:
+                if _k in stats:
+                    self._diag_cache[_k] = stats[_k]
         self._call_count += 1
         if self.diagnostic_every and self._call_count % self.diagnostic_every == 1:
             # The scale warning light. If cost_time dwarfs cost_class the DP has become
@@ -1450,7 +1549,7 @@ class SubsetCriterion(nn.Module):
                   f"infeasible={stats['infeasible']}", flush=True)
         return losses, stats
 
-    def _beat_only_term(self, matched_log, segments=None):
+    def _beat_only_term(self, matched_log, segments=None, phi_hat=None, meter=0):
         """Section 8 class term for events whose B/DB label was never observed.
 
         The single-event marginal (9), l_i = -log(p(B) + p(DB)), is exactly correct
@@ -1491,19 +1590,41 @@ class SubsetCriterion(nn.Module):
         active = torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)     # log(1-p(empty))
         marginal = -active
         if self._call_count < self.beat_only_warmup:
-            return marginal
+            return marginal, None
 
-        r = self._phase_posterior_marginal(matched_log, segments)
-        if r is None:
+        if phi_hat is not None and meter > 1:
+            # Joint path (eq. 19 / Algorithm 7): sigma and phi_0 were selected TOGETHER,
+            # so phi_hat is already the MAP phase for this fragment under the chosen
+            # matching. Re-deriving a soft r from the sequential E-step here would
+            # discard it and apply Algorithm 5's matching-then-phase target on top of a
+            # jointly-decoded sigma -- neither algorithm as written. Use the hard target
+            # phi_hat implies; eq. (15) with r in {0, 1} is exactly that hard target.
+            with torch.no_grad():
+                r = event_is_downbeat_under(
+                    matched_log.shape[0], int(meter), int(phi_hat), matched_log.device
+                ).to(matched_log.dtype)
+            weighted = -(r * matched_log[:, DOWNBEAT] + (1.0 - r) * matched_log[:, BEAT])
+            return weighted, r
+
+        posterior = self._phase_posterior_marginal(matched_log, segments)
+        if posterior is None:
             # No usable meter: (9) is all the annotation supports.
-            return marginal
+            return marginal, None
+        r, valid = posterior
 
         with torch.no_grad():
-            confident = torch.maximum(r, 1.0 - r) >= self.beat_only_confidence
-        # (15). The marginal is kept alongside it: (15) supervises WHICH of B/DB,
-        # while (9) is what keeps the candidate off the background class at all.
+            confident = valid & (torch.maximum(r, 1.0 - r) >= self.beat_only_confidence)
         weighted = -(r * matched_log[:, DOWNBEAT] + (1.0 - r) * matched_log[:, BEAT])
-        return torch.where(confident, weighted + marginal, marginal)
+        # (15) exactly, and Algorithm 5 line 19's complete loss line: the weighted
+        # term ALONE. It previously read `weighted + marginal`, on the reasoning that
+        # (15) supervises which of B/DB while (9) keeps the candidate off the
+        # background class. That double-counts: log p(DB) and log p(B) here are
+        # unconditional, so each already contains one factor of log p(event) --
+        # weighted + marginal = [conditional CE] + 2 * (-log p(event)), weighting
+        # event-detection twice and the B-vs-DB decision once. Background pressure on
+        # unmatched candidates is separately supplied by the gamma term of loss (8).
+        return torch.where(confident, weighted, marginal), torch.where(
+            confident, r, torch.zeros_like(r))
 
     def _phase_posterior_marginal(self, matched_log, segments=None):
         """Equations (12)/(14), and (17) per segment: r_i = P(phi_i = 0 | y, x; theta).
@@ -1522,11 +1643,16 @@ class SubsetCriterion(nn.Module):
 
         with torch.no_grad():
             r = torch.zeros(M, device=matched_log.device, dtype=matched_log.dtype)
+            valid = torch.zeros(M, device=matched_log.device, dtype=torch.bool)
             for k, (start, meter) in enumerate(segments):
                 end = segments[k + 1][0] if k + 1 < len(segments) else M
                 span = matched_log[start:end]
                 length = end - start
                 if meter <= 1 or length == 0:
+                    # No usable meter for this segment: leave `valid` False so the
+                    # caller falls back to eq. (9). Leaving r at 0 here instead would
+                    # read as max(r, 1-r) = 1 >= confidence, i.e. a CONFIDENT "this is
+                    # a beat" pseudo-label, asserting exactly what we do not know.
                     continue
                 # (12)/(17): unnormalized log posterior of each phase hypothesis,
                 # from this segment's own matched events only.
@@ -1537,7 +1663,8 @@ class SubsetCriterion(nn.Module):
                 pi = torch.softmax(log_pi, dim=0)
                 # (14)/(34): singleton lookup at p*_i, indexed within the segment.
                 r[start:end] = pi[phase_star(length, meter, span.device)]
-        return r
+                valid[start:end] = True
+        return r, valid
 
     def _precision_scales(self, raw_precision):
         """Equation of section 4.1.3: b_j = b_min + softplus(u_j).
@@ -1726,7 +1853,7 @@ def intervals_to_events(annotations, num_frames):
 # ---------------------------------------------------------------------------
 
 def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.2,
-                  literal_argmax=False):
+                  literal_argmax=False, db_margin=0.0):
     """Algorithm 5 for one fragment: decide per candidate, then threshold.
 
     No NMS and no de-duplication: exactly one classification decision is made per
@@ -1749,7 +1876,11 @@ def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.
     (0.615 -> 0.636), with downbeat F unchanged -- a small, free gain, larger while the
     model is underconfident and shrinking as it sharpens.
 
-    literal_argmax=True restores Algorithm 5 exactly.
+    db_margin biases the B-versus-DB decision; see the comment at the decision
+    below. Default 0.0 preserves Algorithm 10's plain argmax.
+
+    literal_argmax=True restores Algorithm 5 exactly (db_margin is ignored there:
+    that branch exists to be the verbatim reference).
 
     class_logits (N, 3), t_hat (N,). Returns (classes, times, scores), ascending in
     time, with times still normalised to (0, 1).
@@ -1769,8 +1900,25 @@ def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.
     event_probability = 1.0 - probabilities[:, BACKGROUND]
     # ... and if so, which kind? The two thresholds stay per-class, so beat and
     # downbeat can still be swept independently (their confidence distributions differ).
+    log_p = torch.log_softmax(class_logits, dim=-1)
+    # db_margin: call DOWNBEAT only if log p(DB) - log p(B) > db_margin. A deliberate
+    # deviation from Algorithm 10 line 4, whose plain argmax assumes p-hat is the
+    # unweighted posterior. It is not: section 10.3's omega_DB trains under a
+    # class-weighted loss, so p-hat converges toward an importance-weighted posterior
+    # with the DB odds inflated by up to omega, and the minimum-error rule divides
+    # that back out (db_margin = log omega) -- the document applies omega at training
+    # but never propagates it to inference. Measured at omega_DB=4 (r1_learnb ep14,
+    # fold 0): downbeat F 0.710 -> 0.740 at log 2 on 150 val songs, beat F untouched.
+    # The margin relabels B<->DB; because the per-class threshold below is selected BY
+    # that label, it also changes the firing set whenever threshold_beat !=
+    # threshold_downbeat (with the default equal taus it cannot). The no-crossing/no-NMS
+    # guarantee is unaffected either way: it needs only eq. (1)'s ordering and one
+    # decision per candidate. The remaining deficit is spurious
+    # unmatched firing, which this cannot reach. If omega_DB returns to 1 the
+    # justified margin shrinks to 0 and this knob retires itself. KEEP IN SYNC with
+    # alignbeat/subset_head.py.
     predicted = torch.where(
-        probabilities[:, DOWNBEAT] >= probabilities[:, BEAT],
+        log_p[:, DOWNBEAT] - log_p[:, BEAT] > db_margin,
         torch.full_like(event_probability, DOWNBEAT, dtype=torch.long),
         torch.full_like(event_probability, BEAT, dtype=torch.long))
     thresholds = torch.where(

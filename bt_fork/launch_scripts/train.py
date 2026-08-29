@@ -69,6 +69,13 @@ def main(args):
         no_val=not args.val,
         fold=args.fold,
     )
+    if args.dbn and args.head_type == "subset":
+        # The DBN postprocessor consumes frame-wise activations; the alignment head
+        # emits per-candidate events and never builds them, so use_dbn would be silently
+        # ignored. Refuse rather than report DBN numbers that were not produced by one.
+        parser.error("--dbn is not supported with --head_type subset: the alignment "
+                     "head emits events, not the frame-wise activations a DBN needs.")
+
     datamodule.setup(stage="fit")
 
     # compute positive weights
@@ -114,6 +121,7 @@ def main(args):
         class_attention_heads=args.class_attention_heads,
         tau_beat=args.tau_beat,
         tau_downbeat=args.tau_downbeat,
+        db_margin=args.db_margin,
         # Every SubsetCriterion knob is passed explicitly. A construction that is
         # implemented but has no path from the CLI is worse than one that is absent:
         # an ablation of it shows no difference and reads as "the idea does not help",
@@ -141,14 +149,33 @@ def main(args):
             raise ValueError("The model is missing the part", part, "to compile")
 
     callbacks = [LearningRateMonitor(logging_interval="step")]
-    # save only the last model
-    callbacks.append(
-        ModelCheckpoint(
-            every_n_epochs=1,
-            dirpath=str(checkpoint_dir),
-            filename=f"{args.name} S{args.seed} {params_str}".strip(),
+    if args.snapshot_every:
+        # Keep a checkpoint per N epochs instead of overwriting one file. Validation
+        # reads WHOLE pieces (571 songs of ~95 s) rather than 30 s training crops, so on
+        # a shared machine it is the dominant disk cost -- measured at 11-12% iowait with
+        # several jobs blocked in D state, dropping training from 6.1 to 0.86 it/s.
+        # Snapshotting lets training run with validation disabled entirely
+        # (--val-frequency larger than --max-epochs) and the curve reconstructed
+        # afterwards by scoring the snapshots, which is what score_fold0_snapshots.py
+        # already does for the vanilla arms.
+        callbacks.append(
+            ModelCheckpoint(
+                every_n_epochs=args.snapshot_every,
+                save_top_k=-1,
+                save_on_train_epoch_end=True,
+                dirpath=str(checkpoint_dir),
+                filename=f"{args.name} S{args.seed} {params_str}".strip() + "-ep{epoch:03d}",
+            )
         )
-    )
+    else:
+        # save only the last model
+        callbacks.append(
+            ModelCheckpoint(
+                every_n_epochs=1,
+                dirpath=str(checkpoint_dir),
+                filename=f"{args.name} S{args.seed} {params_str}".strip(),
+            )
+        )
 
     trainer = Trainer(
         max_epochs=args.max_epochs,
@@ -229,6 +256,9 @@ if __name__ == "__main__":
     # "--head_type subset" against the default is a controlled A/B: same encoder, data,
     # augmentation, trainer, precision and metrics, differing only in the head and the
     # loss it brings with it.
+    parser.add_argument("--snapshot_every", type=int, default=0,
+                        help="keep a checkpoint every N epochs (0 = overwrite one file); "
+                             "pair with a large --val-frequency to train without eval")
     parser.add_argument("--head_type", type=str, default="dense",
                         choices=["dense", "subset"])
     parser.add_argument("--train_length", type=int, default=1500,
@@ -239,6 +269,11 @@ if __name__ == "__main__":
     parser.add_argument("--class_attention_heads", type=int, default=4)
     parser.add_argument("--tau_beat", type=float, default=0.2)
     parser.add_argument("--tau_downbeat", type=float, default=0.2)
+    parser.add_argument("--db_margin", type=float, default=0.0,
+                        help="B-vs-DB decode margin: call DOWNBEAT only if "
+                             "log p(DB) - log p(B) exceeds this. log(omega_db) "
+                             "undoes the class-weighted training bias; 0 keeps "
+                             "Algorithm 10's plain argmax. See decode_events.")
     parser.add_argument("--gamma", type=float, default=0.5)
     parser.add_argument("--omega_db", type=float, default=2.0)
     parser.add_argument("--b_scale", type=float, default=0.005)
@@ -261,12 +296,12 @@ if __name__ == "__main__":
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")
-    parser.add_argument(
-        "--train-length",
-        type=int,
-        default=1500,
-        help="maximum seq length for training in frames",
-    )
+    # NOTE: --train_length (underscore) is defined above and owns dest=train_length.
+    # A second "--train-length" action used to be declared here with its own default;
+    # both wrote the same dest, so whichever was declared later silently won. Kept as a
+    # pure alias so existing command lines keep working, with no competing default.
+    parser.add_argument("--train-length", dest="train_length", type=int,
+                        help="alias of --train_length")
     parser.add_argument(
         "--dbn",
         default=False,

@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alignbeat.subset_head import (  # noqa: E402
-    BEAT, DOWNBEAT,
+    BEAT, DOWNBEAT, SubsetCriterion,
     downbeat_marginal_from_phase_posterior,
     downbeat_marginal_over_meters,
     event_is_downbeat_under,
@@ -279,7 +279,8 @@ def test_em_posterior_matches_brute_force_and_couples_events():
                                     beat_only_warmup=0)
         torch.manual_seed(L)
         matched_log = torch.log_softmax(torch.randn(M, 3, dtype=torch.float64) * 2, dim=-1)
-        got = criterion._phase_posterior_marginal(matched_log)
+        got, got_valid = criterion._phase_posterior_marginal(matched_log)
+        assert bool(got_valid.all()), "a well-formed single-meter fragment must be valid everywhere"
 
         log_pi = [float(sum(matched_log[i0, DOWNBEAT if (p + i0) % L == 0 else BEAT]
                             for i0 in range(M)))
@@ -292,7 +293,7 @@ def test_em_posterior_matches_brute_force_and_couples_events():
         perturbed = matched_log.clone()
         perturbed[0] = torch.log_softmax(
             torch.tensor([5.0, -5.0, -5.0], dtype=torch.float64), dim=-1)
-        moved = criterion._phase_posterior_marginal(perturbed)
+        moved, _ = criterion._phase_posterior_marginal(perturbed)
         assert not np.allclose(got[1:].numpy(), moved[1:].numpy(), atol=1e-6), (
             "r_i is not coupled across events -- degenerated to the (9) failure mode")
     print("ok: EM posterior (12)/(14) == brute force, and r_i couples across events")
@@ -308,9 +309,10 @@ def test_segment_posteriors_use_only_their_own_events():
 
     torch.manual_seed(0)
     matched_log = torch.log_softmax(torch.randn(7, 3, dtype=torch.float64) * 2, dim=-1)
-    mixed = criterion(0)._phase_posterior_marginal(matched_log, segments=[(0, 2), (3, 3)])
-    assert torch.allclose(mixed[:3], criterion(2)._phase_posterior_marginal(matched_log[:3]))
-    assert torch.allclose(mixed[3:], criterion(3)._phase_posterior_marginal(matched_log[3:]))
+    mixed, mixed_valid = criterion(0)._phase_posterior_marginal(matched_log, segments=[(0, 2), (3, 3)])
+    assert bool(mixed_valid.all())
+    assert torch.allclose(mixed[:3], criterion(2)._phase_posterior_marginal(matched_log[:3])[0])
+    assert torch.allclose(mixed[3:], criterion(3)._phase_posterior_marginal(matched_log[3:])[0])
     print("ok: mixed-meter segment posteriors (17) factor across segments")
 
 
@@ -341,3 +343,29 @@ if __name__ == "__main__":
     test_segment_posteriors_use_only_their_own_events()
     test_joint_loss_is_differentiable()
     print("\nall phase tests passed")
+
+
+def test_degenerate_segment_falls_back_to_eq9_not_a_confident_beat():
+    """A segment with no usable meter must NOT be force-fitted to "beat".
+
+    Regression: the segment loop skipped meter <= 1, leaving r = 0 for those events.
+    The confidence gate reads max(r, 1-r) = 1 >= threshold, so r = 0 was indistinguishable
+    from a CONFIDENT downbeat-probability-zero pseudo-label, asserting exactly what an
+    absent meter means we do not know. Those events must fall back to eq. (9) instead.
+    """
+    torch.manual_seed(0)
+    crit = SubsetCriterion(meter_length=4, beat_only_warmup=0, beat_only_confidence=0.7,
+                           diagnostic_every=0)
+    matched_log = torch.log_softmax(torch.randn(6, 3), dim=-1)
+    # segment 0 has a degenerate meter (1), segment 1 is a normal 3
+    r, valid = crit._phase_posterior_marginal(matched_log, segments=[(0, 1), (3, 3)])
+    assert not bool(valid[:3].any()), "degenerate segment must be marked invalid"
+    assert bool(valid[3:].all()), "well-formed segment must stay valid"
+
+    term, _ = crit._beat_only_term(matched_log, segments=[(0, 1), (3, 3)])
+    eq9 = -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)
+    assert torch.allclose(term[:3], eq9[:3]), "degenerate segment must use eq. (9)"
+    print("ok: degenerate segment meter falls back to eq (9), not a confident beat")
+
+
+test_degenerate_segment_falls_back_to_eq9_not_a_confident_beat()

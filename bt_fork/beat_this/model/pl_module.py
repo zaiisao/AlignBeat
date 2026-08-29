@@ -56,6 +56,7 @@ class PLBeatThis(LightningModule):
         subset_kwargs: dict = None,
         tau_beat: float = 0.2,
         tau_downbeat: float = 0.2,
+        db_margin: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -66,6 +67,10 @@ class PLBeatThis(LightningModule):
         self.stitch_border = stitch_border
         self.tau_beat = tau_beat
         self.tau_downbeat = tau_downbeat
+        # Decode-time Bayes correction for omega_DB-weighted training; see
+        # decode_events. Enters through __init__ with a default so old checkpoints
+        # still load, and can be overridden at load_from_checkpoint time.
+        self.db_margin = db_margin
         # create model
         self.model = BeatThis(
             head_type=head_type,
@@ -143,14 +148,25 @@ class PLBeatThis(LightningModule):
         """
         num_frames = batch["truth_beat"].shape[-1]
         window_seconds = num_frames / self.fps
+        padding_mask = batch.get("padding_mask")
         beats, downbeats = [], []
         for index in range(len(batch["spect"])):
             classes, times, _scores = decode_events(
                 model_prediction["class_logits"][index].float(),
                 model_prediction["t_hat"][index].float(),
-                self.tau_beat, self.tau_downbeat)
+                self.tau_beat, self.tau_downbeat,
+                db_margin=self.db_margin)
             seconds = (times * window_seconds).detach().cpu().numpy()
             classes = classes.detach().cpu().numpy()
+            if padding_mask is not None:
+                # The dense arm passes padding_mask to its postprocessor; without the
+                # same restriction here, candidates landing in an excerpt's zero-padded
+                # tail are emitted as detections that no ground-truth event can match
+                # (truth_orig_* stops at the real end), so they are pure false positives
+                # charged to one arm of the A/B only.
+                valid_seconds = float(padding_mask[index].sum()) / self.fps
+                keep = seconds < valid_seconds
+                seconds, classes = seconds[keep], classes[keep]
             beats.append(np.sort(seconds))
             downbeats.append(np.sort(seconds[classes == DOWNBEAT]))
         return tuple(beats), tuple(downbeats)
@@ -177,7 +193,9 @@ class PLBeatThis(LightningModule):
             downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
             has_downbeats = bool(batch["downbeat_mask"][index])
 
-            keep = (beats >= 0) & (beats <= window_seconds)
+            # eq. (1) maps onto the half-open axis (0, 1], so a target at exactly 0 is
+            # unreachable by construction and would be an unmatchable event.
+            keep = (beats > 0) & (beats <= window_seconds)
             beats = np.unique(beats[keep])   # unique, not just sorted: Definition 1
             if self.quantize_targets:
                 # Round to the frame grid, which is what the DENSE head is necessarily
@@ -412,9 +430,11 @@ class PLBeatThis(LightningModule):
         split_piece with the same chunk_size and avoid_short_end, so the A/B sees the
         same excerpts -- and the aggregation is done on decoded events instead.
 
-        overlap_mode is honoured at the event level: split_piece moves the final chunk
-        backwards rather than padding, so it overlaps its predecessor, and "keep_first"
-        means an event in that overlap is taken from the earlier chunk.
+        overlap_mode is accepted for signature compatibility with the dense path but no
+        longer selects behaviour: Section 9.3's keep regions partition the timeline, so
+        no event is ever emitted by two fragments and there is nothing to break a tie
+        over. Previously "keep_last" fell through with no filtering at all, duplicating
+        every event in every overlap.
         """
         from beat_this.inference import split_piece
 
@@ -431,20 +451,47 @@ class PLBeatThis(LightningModule):
                 self, "beat_loss") else 6
         chunks, starts = split_piece(spect, chunk_size, border_size=border,
                                      avoid_short_end=True)
+        # Section 9.3 / Algorithm 11: fragment k owns [o_k + beta, o_k + D - beta], with
+        # the edge exceptions that the FIRST fragment owns from 0 and the LAST owns to
+        # the end of the piece. Previously each chunk owned its full span, so its
+        # trailing border -- the lowest-context frames it has, and exactly the ones the
+        # dense arm discards in aggregate_prediction -- won every seam over the next
+        # chunk's interior. That is an edge-convention difference between the two A/B
+        # arms, not a head difference.
+        piece_end = spect.shape[0] / self.fps
+        covered_to = 0.0          # high-water mark: end of what earlier fragments own
         beats, downbeats = [], []
-        covered_to = 0.0                       # end of what earlier chunks already own
-        for chunk, start in zip(chunks, starts):
+        n_chunks = len(chunks)
+        for index, (chunk, start) in enumerate(zip(chunks, starts)):
             prediction = self.model(chunk.unsqueeze(0))
             classes, times, _scores = decode_events(
                 prediction["class_logits"][0].float(),
                 prediction["t_hat"][0].float(),
-                self.tau_beat, self.tau_downbeat)
+                self.tau_beat, self.tau_downbeat,
+                db_margin=self.db_margin)
             seconds = (start + times * chunk.shape[0]).detach().cpu().numpy() / self.fps
             classes = classes.detach().cpu().numpy()
-            if overlap_mode == "keep_first":
-                keep = seconds >= covered_to
-                seconds, classes = seconds[keep], classes[keep]
-            covered_to = max(covered_to, (start + chunk.shape[0]) / self.fps)
+
+            # keep region for this fragment, in seconds. split_piece(avoid_short_end)
+            # shifts the LAST chunk's start left so it ends exactly at the piece end,
+            # which can overlap its predecessor by far more than `border` -- so the
+            # nominal starts are NOT uniformly strided and a naive start+border can land
+            # before the previous fragment's own_end, re-emitting every event in between.
+            # Clamping to the running high-water mark keeps the keep regions a true
+            # partition, which is what Section 9.3 requires.
+            own_start = (start + border) / self.fps if index > 0 else 0.0
+            own_start = max(own_start, covered_to)
+            own_end = ((start + chunk.shape[0] - border) / self.fps
+                       if index < n_chunks - 1 else piece_end)
+            own_end = max(own_end, own_start)
+            keep = (seconds >= own_start) & (seconds < own_end)
+            # The final chunk is right-zero-padded and t_hat is stretched over that
+            # padding, so clamp to the real end of the piece rather than emitting
+            # events into silence. The first chunk's left pad is handled by own_start.
+            keep &= (seconds >= 0.0) & (seconds <= piece_end)
+            seconds, classes = seconds[keep], classes[keep]
+            covered_to = max(covered_to, own_end)
+
             beats.append(seconds)
             downbeats.append(seconds[classes == DOWNBEAT])
 

@@ -12,7 +12,7 @@ import torch
 
 def evaluate_beat_f_measure_subset(dataloader, model, audio_downsampling_factor, audio_sample_rate,
                                    window_frames=1280, border_frames=8,
-                                   threshold_beat=0.2, threshold_downbeat=0.2,
+                                   threshold_beat=0.2, threshold_downbeat=0.2, db_margin=0.0,
                                    label="", use_amp=False, full_metrics=False,
                                    verbose=False):
     """Evaluation path.
@@ -61,7 +61,8 @@ def evaluate_beat_f_measure_subset(dataloader, model, audio_downsampling_factor,
 
             classes, frames, _scores = stitch_piece(
                 mel, forward_fn, window_frames, border_frames,
-                threshold_beat=threshold_beat, threshold_downbeat=threshold_downbeat)
+                threshold_beat=threshold_beat, threshold_downbeat=threshold_downbeat,
+                db_margin=db_margin)
 
             classes = classes.cpu()
             frames = frames.cpu()

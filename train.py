@@ -268,6 +268,11 @@ parser.add_argument('--precision_prior_alpha', type=float, default=2.0,
 # is kept separate per class because beat and downbeat confidence distributions differ.
 parser.add_argument('--tau_beat', type=float, default=0.2)
 parser.add_argument('--tau_downbeat', type=float, default=0.2)
+parser.add_argument('--db_margin', type=float, default=0.0,
+                    help='B-vs-DB decode margin: call DOWNBEAT only if log p(DB) - '
+                         'log p(B) exceeds this. log(omega_db) undoes the class-'
+                         'weighted training bias; 0 keeps the plain argmax. '
+                         'See decode_events.')
 # stitch_beta_frames: the border beta of Section 9.3's stitching, in frames. The paper
 # fixes no value and suggests starting near the candidate spacing D/N -- here
 # D/N = 8 frames (0.186s).
@@ -542,6 +547,7 @@ def evaluate_macro_joint_f_measure(model, label):
             window_frames=WINDOW_FRAMES,
             border_frames=args.stitch_beta_frames,
             threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat,
+            db_margin=args.db_margin,
             use_amp=args.amp)
         per_dataset_beat_f.append(ds_beat_f)
         # [beat-only datasets are excluded from the downbeat macro] smc and simac have
@@ -622,6 +628,7 @@ if __name__ == '__main__':
             window_frames=WINDOW_FRAMES,
             border_frames=args.stitch_beta_frames,
             threshold_beat=args.tau_beat, threshold_downbeat=args.tau_downbeat,
+            db_margin=args.db_margin,
             use_amp=args.amp, label="[GTZAN test] ")
         gtzan_joint = (gtzan_beat_f + gtzan_downbeat_f) / 2
         print(f"=== GTZAN TEST (checkpoint={args.eval_gtzan_ckpt}) ===")

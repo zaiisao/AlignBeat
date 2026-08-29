@@ -59,7 +59,7 @@ def fragment_offsets(total_frames, window_frames, border_frames):
 
 
 def stitch_piece(mel, forward_fn, window_frames, border_frames,
-                 threshold_beat=0.2, threshold_downbeat=0.2):
+                 threshold_beat=0.2, threshold_downbeat=0.2, db_margin=0.0):
     """Section 9.3 over one piece.
 
     mel: (T, n_mels) log-mel for the whole piece (already on the right device).
@@ -95,7 +95,7 @@ def stitch_piece(mel, forward_fn, window_frames, border_frames,
     for index, (offset, keep_start, keep_end) in enumerate(fragments):
         classes, times, scores = decode_events(
             batched_logits[index], batched_t_hat[index],
-            threshold_beat, threshold_downbeat)
+            threshold_beat, threshold_downbeat, db_margin=db_margin)
         if classes.numel() == 0:
             continue
 
