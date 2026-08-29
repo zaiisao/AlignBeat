@@ -6,6 +6,7 @@ launching arms.
 
     python -m pytest tests/test_regressions.py     (or just execute this file)
 """
+import itertools
 import os
 import sys
 
@@ -14,7 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from beatfcos.subset_head import (SubsetCriterion, subset_select_dp,
+from alignbeat.subset_head import (SubsetCriterion, subset_select_dp,
                                   subset_select_dp_meter, subset_select_logsumexp,
                                   subset_posterior_marginals)
 
@@ -62,17 +63,44 @@ def test_logsumexp_batched_matches_per_fragment():
 
 def test_flags_reach_the_criterion():
     """Four flags have silently failed to arrive at the criterion. Check the plumbing."""
-    from beatfcos import model_module
-    m = model_module.create_beatfcos_model(
-        num_classes=2, clusters=torch.tensor([0.4, 0.6, 1.2, 1.9, 3.0]), args=None,
-        head_type="subset", dmodel=128, nhead=8, d_hid=512, nlayers=9, attn_len=5,
-        dropout=0.1, downbeat_weight=0.6, audio_downsampling_factor=512, centerness=False,
-        postprocessing_type="soft_nms", audio_sample_rate=22050, backbone_type="wavebeat",
-        num_candidates=160, mu_meter=1e5, lambda_r=200.0, cont_weight=0.5,
-        phase_marginal=True, meter_length=4, marginal=True)
+    from alignbeat import model_module
+    m = model_module.create_alignbeat_model(
+        args=None, audio_downsampling_factor=512, audio_sample_rate=22050,
+        encoder_input_frames=1500, n_min=172,
+        dropout={"frontend": 0.1, "transformer": 0.2},
+        mu_meter=1e5, lambda_r=200.0, cont_weight=0.5,
+        joint_phase=True, meter_length=4, marginal=True)
     c = m.subset_criterion
     assert c.mu_meter == 1e5 and c.lambda_r == 200.0 and c.cont_weight == 0.5
-    assert c.phase_marginal and c.meter_length == 4 and c.marginal
+    assert c.joint_phase and c.meter_length == 4 and c.marginal
+
+
+def test_meter_dp_matches_brute_force():
+    """Section 4.2's augmented recursion is an EXACT minimizer, not a heuristic.
+
+    The existing reduction/monotonicity test cannot catch an off-by-one in the
+    prev_j/prev_s backtracking, which would still produce a plausible increasing
+    sigma. Enumeration can.
+    """
+    rng = np.random.default_rng(7)
+    for _ in range(20):
+        M, N, L, mu = 5, 9, 2, 30.0
+        cost = rng.random((M, N)) * 3
+        t_hat = np.sort(rng.random(N))
+        downbeats = np.array([0, 2, 4])
+        # the implementation derives Delta_bar with one EM step off the plain DP;
+        # mirror that here so both score against the same target
+        target = L * float(np.mean(np.diff(t_hat[subset_select_dp(cost)])))
+
+        def total(sigma):
+            c = sum(cost[i, sigma[i]] for i in range(M))
+            for a, b in zip(downbeats, downbeats[1:]):
+                c += mu * (t_hat[sigma[b]] - t_hat[sigma[a]] - target) ** 2
+            return c
+
+        want = min(itertools.combinations(range(N), M), key=total)
+        got = subset_select_dp_meter(cost, downbeats, t_hat, L, mu)
+        assert abs(total(want) - total(tuple(got))) < 1e-9
 
 
 def test_meter_dp_reduces_to_plain_dp_and_is_monotone():

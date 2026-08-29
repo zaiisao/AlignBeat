@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from beatfcos.subset_head import (  # noqa: E402
+from alignbeat.subset_head import (  # noqa: E402
     BACKGROUND, BEAT, DOWNBEAT,
     SubsetCriterion, SubsetSelectionHead,
     decode_events, intervals_to_events, monotonic_times,
@@ -331,7 +331,7 @@ def test_beat_only_events_use_the_marginal_not_a_fabricated_label():
     """A CLASS_UNKNOWN event must be scored by -log(p(B)+p(DB)), never by pretending
     it is a downbeat. The dataloader hardcodes beat=1 for SMC, which would otherwise
     make every SMC beat a downbeat - actively wrong supervision."""
-    from beatfcos.subset_head import CLASS_UNKNOWN
+    from alignbeat.subset_head import CLASS_UNKNOWN
     N = 8
     log_p = torch.log(torch.tensor([[0.25, 0.6, 0.15]]).repeat(N, 1))
     crit = SubsetCriterion(diagnostic_every=0)
@@ -347,7 +347,7 @@ def test_beat_only_events_use_the_marginal_not_a_fabricated_label():
 def test_marginal_is_invariant_to_b_db_split():
     """Equation (9) depends only on p(B)+p(DB) - the paper's stated zero-gradient
     property. Two distributions with the same active mass must score identically."""
-    from beatfcos.subset_head import CLASS_UNKNOWN
+    from alignbeat.subset_head import CLASS_UNKNOWN
     crit = SubsetCriterion(diagnostic_every=0)
     a = torch.log(torch.tensor([[0.10, 0.75, 0.15]]))
     b = torch.log(torch.tensor([[0.75, 0.10, 0.15]]))
@@ -358,7 +358,7 @@ def test_marginal_is_invariant_to_b_db_split():
 
 
 def test_beat_only_end_to_end_trains_without_crashing():
-    from beatfcos.subset_head import CLASS_UNKNOWN
+    from alignbeat.subset_head import CLASS_UNKNOWN
     N = 32
     torch.manual_seed(0)
     logits = torch.randn(1, N, 3, requires_grad=True)

@@ -10,8 +10,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from beatfcos.stitching import fragment_offsets, stitch_piece  # noqa: E402
-from beatfcos.subset_head import BACKGROUND, BEAT, DOWNBEAT  # noqa: E402
+from alignbeat.stitching import fragment_offsets, stitch_piece  # noqa: E402
+from alignbeat.subset_head import BACKGROUND, BEAT, DOWNBEAT  # noqa: E402
 
 
 def test_keep_regions_partition_exactly():
@@ -55,10 +55,11 @@ def test_every_event_reported_exactly_once():
 
     def fake_forward(fragment):
         # every candidate is a confident beat, uniformly spaced over the window
-        logits = torch.full((1, num_candidates, 3), -10.0)
-        logits[0, :, BEAT] = 10.0
+        B = fragment.shape[0]
+        logits = torch.full((B, num_candidates, 3), -10.0)
+        logits[:, :, BEAT] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
-        return logits, t_hat.unsqueeze(0)
+        return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
     mel = torch.zeros(total, 128)
     classes, frames, scores = stitch_piece(mel, fake_forward, window, border)
@@ -88,10 +89,11 @@ def test_short_piece_is_padded_not_dropped():
 
     def fake_forward(fragment):
         assert fragment.shape[1] == window, "model must always see a full window"
-        logits = torch.full((1, num_candidates, 3), -10.0)
-        logits[0, :, BEAT] = 10.0
+        B = fragment.shape[0]
+        logits = torch.full((B, num_candidates, 3), -10.0)
+        logits[:, :, BEAT] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
-        return logits, t_hat.unsqueeze(0)
+        return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
     classes, frames, _ = stitch_piece(torch.zeros(150, 128), fake_forward, window, border)
     assert len(frames) > 0
@@ -103,10 +105,11 @@ def test_background_only_model_returns_nothing():
     window, border, num_candidates = 400, 20, 40
 
     def fake_forward(fragment):
-        logits = torch.full((1, num_candidates, 3), -10.0)
-        logits[0, :, BACKGROUND] = 10.0
+        B = fragment.shape[0]
+        logits = torch.full((B, num_candidates, 3), -10.0)
+        logits[:, :, BACKGROUND] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
-        return logits, t_hat.unsqueeze(0)
+        return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
     classes, frames, scores = stitch_piece(torch.zeros(1500, 128), fake_forward, window, border)
     assert len(classes) == 0 and len(frames) == 0 and len(scores) == 0
@@ -117,13 +120,14 @@ def test_downbeat_class_survives_stitching():
     window, border, num_candidates = 400, 20, 40
 
     def fake_forward(fragment):
-        logits = torch.full((1, num_candidates, 3), -10.0)
-        logits[0, 0::4, DOWNBEAT] = 10.0
-        logits[0, 1::4, BEAT] = 10.0
-        logits[0, 2::4, BEAT] = 10.0
-        logits[0, 3::4, BEAT] = 10.0
+        B = fragment.shape[0]
+        logits = torch.full((B, num_candidates, 3), -10.0)
+        logits[:, 0::4, DOWNBEAT] = 10.0
+        logits[:, 1::4, BEAT] = 10.0
+        logits[:, 2::4, BEAT] = 10.0
+        logits[:, 3::4, BEAT] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
-        return logits, t_hat.unsqueeze(0)
+        return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
     classes, frames, _ = stitch_piece(torch.zeros(1500, 128), fake_forward, window, border)
     assert int((classes == DOWNBEAT).sum()) > 0 and int((classes == BEAT).sum()) > 0
