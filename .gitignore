@@ -132,3 +132,6 @@ beat_this.egg-info/
 /checkpoints
 /data
 /lightning_logs
+
+# local-only working material (drafts, papers, notes); never pushed
+/private/

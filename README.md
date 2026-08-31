@@ -11,8 +11,8 @@ candidate times are made strictly increasing by an architectural
 reparameterization, this reduces to choosing *which subset of candidates is
 active*, solved exactly by an O(NM) dynamic program.
 
-See `Beat_DP_matching_new (2).pdf` for the full formulation. Equation and
-algorithm numbers throughout the code refer to it.
+Equation and algorithm numbers throughout the code refer to the paper draft,
+which is kept in `private/` (local-only, not tracked).
 
 ## Layout
 
