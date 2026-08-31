@@ -8,8 +8,7 @@ substitute that row's flag.
 
 ```sh
 export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
-export PYTHONPATH=$PWD/bt_fork:$PWD
-cd bt_fork
+export PYTHONPATH=$PWD
 python -u launch_scripts/train.py \
   --name NAME --head_type subset --gpu G --fold 0 --seed 0 \
   --max-epochs 20 --lr 3e-4 --batch-size 8 --accumulate-grad-batches 8 \

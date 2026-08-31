@@ -3,6 +3,18 @@ import os
 from pathlib import Path
 
 import torch
+
+# Our own checkpoints carry numpy scalars and dtypes in hyper_parameters, and torch
+# >= 2.6 loads with weights_only=True by default, which refuses them. Allowlisting the
+# individual globals is a moving target (scalar, then dtype[float64], ...), so restore
+# the pre-2.6 default for the resume path. Safe here: these are checkpoints this repo
+# wrote. Do NOT copy this into anything that loads third-party checkpoints.
+_torch_load = torch.load
+def _load_trusted(*a, **k):
+    # Lightning passes weights_only=True EXPLICITLY, so setdefault is not enough.
+    k["weights_only"] = False
+    return _torch_load(*a, **k)
+torch.load = _load_trusted
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger

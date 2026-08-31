@@ -16,17 +16,26 @@ algorithm numbers throughout the code refer to it.
 
 ## Layout
 
-| file | what |
+This repository is a fork of [Beat This!](https://github.com/CPJKU/beat_this)
+(Foscarin et al., 2024). Upstream's tree sits at the root unmodified except for
+three files; ours is the `alignbeat/` package it imports.
+
+| path | what |
 | --- | --- |
-| `alignbeat/beat_this_encoder.py` | Beat This! transformer encoder (Section 3) |
-| `alignbeat/progressive_downsample.py` | T -> N patch-merging downsample; N derived from N_min |
 | `alignbeat/subset_head.py` | candidate heads, eq. (1), the DP (Alg. 1), and the losses |
-| `alignbeat/model_module.py` | the three above, wired together |
-| `alignbeat/stitching.py` | overlapping-fragment reassembly at inference (Section 9.3) |
-| `alignbeat/beat_eval.py` | tiled decoding + mir_eval F-measure |
-| `train.py` | training and per-epoch validation |
-| `train_dense_baseline.py` | the Section 12 dense frame-classification baseline |
-| `evaluate_all_datasets.py` | score one checkpoint across every dataset |
+| `alignbeat/progressive_downsample.py` | T → N patch-merging downsample; N derived from N_min |
+| `alignbeat/stitching.py` | reference implementation of §9.3 fragment reassembly |
+| `beat_this/model/beat_tracker.py` | upstream, plus a `SubsetHead` branch |
+| `beat_this/model/pl_module.py` | upstream, plus the subset loss, targets and decode |
+| `launch_scripts/train.py` | upstream, plus `--head_type` and the flags below |
+| `diagnose_bottleneck.py` | attribute a flat F-measure to its component failure |
+
+Everything else — dataset, augmentation, losses, postprocessor, metrics,
+`compute_paper_metrics.py` — is upstream code, untouched. That is deliberate:
+`--head_type dense` reproduces Beat This! exactly, so the A/B against
+`--head_type subset` differs in the head and its loss and in nothing else.
+
+To pull upstream changes: `git merge beat_this/main`.
 
 ## What is implemented
 
@@ -55,15 +64,29 @@ meter/phase head, which the paper does not formalize.
 ## Running
 
 ```sh
-python train.py --spect_root <dir> --spect_annot_root <dir> \
-    --optimizer adamw --lr_schedule cosine_warmup --lr 8e-4
-python -m pytest tests/ -q
+export PYTHONPATH=$PWD
+
+# the alignment head, and the dense baseline it is measured against
+python launch_scripts/train.py --name myrun --head_type subset --fold 0
+python launch_scripts/train.py --name mydense --head_type dense --fold 0
+
+# scoring, and attributing a flat result to its component failure
+python launch_scripts/compute_paper_metrics.py --models "checkpoints/myrun*.ckpt"
+python diagnose_bottleneck.py --checkpoints "checkpoints/myrun*.ckpt"
+
+# tests are plain scripts, not a pytest suite
+for t in tests/test_*.py; do python "$t" || break; done
 ```
 
-`N` is not a free hyperparameter: `train.py` fixes the window at T = 1500 frames
-(30s at 50fps) and derives the candidate count from the physical tempo bound
+Data lives where upstream expects it, under `data/`. Folds are Beat This!'s own
+`8-folds.split`; `--fold N` names the fold held out.
+
+`N` is not a free hyperparameter: the window is fixed at T = 1500 frames (30s at
+50fps) and the candidate count derives from the physical tempo bound
 `N_min = BPM_max * D`, which the downsampling schedule is not free to shrink
 below.
+
+See `docs/ABLATIONS.md` for the measured arms.
 
 ## History
 
@@ -73,3 +96,7 @@ then moved from a WaveBeat backbone to Beat Transformer to Beat This!, and
 finally dropped anchors entirely for the subset-selection formulation above.
 None of the anchor machinery survives here; the original is preserved in its
 own repository.
+
+## License
+
+MIT, matching upstream Beat This!. See `LICENSE`.
