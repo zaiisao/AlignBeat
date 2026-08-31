@@ -4,8 +4,8 @@ Model definitions for the Beat This! beat tracker.
 
 import contextlib
 
-from beat_this.model.progressive_downsample import ProgressiveDownsample
-from beat_this.model.subset_head import SubsetSelectionHead
+from alignbeat.progressive_downsample import ProgressiveDownsample
+from alignbeat.subset_head import SubsetSelectionHead
 from collections import OrderedDict
 
 import torch

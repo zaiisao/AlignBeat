@@ -2059,7 +2059,7 @@ def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.
     # selected BY that label, it also changes the firing set whenever threshold_beat
     # != threshold_downbeat (with the default equal taus it cannot).
     # Default 0.0 keeps the plain argmax; the knob retires itself if omega_DB
-    # returns to 1. KEEP IN SYNC with bt_fork/beat_this/model/subset_head.py.
+    # returns to 1.
     predicted = torch.where(
         log_probabilities[:, DOWNBEAT] - log_probabilities[:, BEAT] > db_margin,
         torch.full_like(event_probability, DOWNBEAT, dtype=torch.long),

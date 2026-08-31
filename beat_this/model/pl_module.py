@@ -16,8 +16,8 @@ from beat_this.inference import split_predict_aggregate
 import numpy as np
 
 from beat_this.model.beat_tracker import BeatThis
-from beat_this.model.subset_head import (BEAT, CLASS_UNKNOWN, DOWNBEAT,
-                                         SubsetCriterion, decode_events)
+from alignbeat.subset_head import (BEAT, CLASS_UNKNOWN, DOWNBEAT,
+                                   SubsetCriterion, decode_events)
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
 
