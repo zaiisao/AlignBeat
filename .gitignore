@@ -118,3 +118,11 @@ downbeat_histogram_*.png
 runs/
 # machine-specific symlink to the corpus
 bt_fork/data
+
+# from upstream Beat This! (bt_fork unpack)
+data/
+checkpoints/
+lightning_logs/
+wandb/
+.vscode/
+beat_this.egg-info/
