@@ -1,18 +1,11 @@
-"""Equivalence harness for SubsetCriterion optimisations.
-
-Any speed work on SubsetCriterion.forward must not change what it computes. This
-compares the criterion's outputs AND gradients before/after an optimisation across
-randomised shapes and every configuration flag combination we actually train with.
-
-Usage as a golden test: run with ALIGNBEAT_RECORD=1 to snapshot current behaviour to
-tests/_criterion_golden.pt, then run without it after refactoring to verify.
-"""
+"""Equivalence harness for SubsetCriterion optimisations."""
 import os, sys, itertools
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from alignbeat.subset_head import SubsetCriterion, DOWNBEAT, BEAT, CLASS_UNKNOWN
+from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
+from alignbeat.criterion import SubsetCriterion
 
 GOLDEN = os.path.join(os.path.dirname(__file__), '_criterion_golden.pt')
 
@@ -64,7 +57,7 @@ def build(seed, batch, N, Ms, mode, device="cpu"):
 def run_case(cfg_kwargs, seed, shape):
     _, batch, N, Ms, mode = shape
     logits, t_hat, targets = build(seed, batch, N, Ms, mode)
-    crit = SubsetCriterion(diagnostic_every=0, **cfg_kwargs)
+    crit = SubsetCriterion(**cfg_kwargs)
     losses, stats = crit(logits, t_hat, targets)
     out = {k: v.detach().clone() for k, v in losses.items() if torch.is_tensor(v)}
     total = losses["total"]

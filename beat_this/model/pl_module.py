@@ -16,8 +16,9 @@ from beat_this.inference import split_predict_aggregate
 import numpy as np
 
 from beat_this.model.beat_tracker import BeatThis
-from alignbeat.subset_head import (BEAT, CLASS_UNKNOWN, DOWNBEAT,
-                                   SubsetCriterion, decode_events)
+from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
+from alignbeat.criterion import SubsetCriterion
+from alignbeat.decode import decode_events
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
 
@@ -45,15 +46,15 @@ class PLBeatThis(LightningModule):
         partial_transformers=True,
         head_type: str = "dense",
         predict_precision: bool = False,
-        pool_init: bool = False,
-        pool_mode: str = "",
         head_lr: float = 0.0,
         quantize_targets: bool = False,
         stitch_border: int = None,
-        # Only used by head_type="subset": T is needed to precompute the downsampling
-        # schedule, and N_min is the physical tempo bound the schedule may not go below.
-        encoder_input_frames: int = 1500,
-        n_min: int = 172,
+        # Only used by head_type="subset": N, the number of candidates the head
+        # emits. Derived once in launch_scripts/train.py; no default here, so the
+        # value can never disagree with the one a run was configured with.
+        num_candidates: int = None,
+        downsample_mode: str = "learned",
+        train_length: int = 1500,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         subset_kwargs: dict = None,
@@ -87,13 +88,12 @@ class PLBeatThis(LightningModule):
             dropout=dropout,
             sum_head=sum_head,
             partial_transformers=partial_transformers,
-            encoder_input_frames=encoder_input_frames,
-            n_min=n_min,
+            num_candidates=num_candidates,
+            downsample_mode=downsample_mode,
+            train_length=train_length,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             predict_precision=predict_precision,
-            pool_init=pool_init,
-            pool_mode=pool_mode,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -141,17 +141,7 @@ class PLBeatThis(LightningModule):
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
     def _subset_decode(self, batch, model_prediction):
-        """Algorithm 5 per excerpt, returned as predicted TIMES in seconds.
-
-        The dense path peak-picks a frame activation; here each candidate already
-        carries a continuous time, so decoding is a per-candidate class decision and a
-        threshold, with no NMS -- eq. (1) forbids crossings structurally. Returning
-        times in seconds means _compute_metrics needs no change at all: it already
-        compares predicted times against truth_orig_*.
-
-        The beat list includes downbeats, matching the convention the ground truth and
-        mir_eval use (a downbeat is also a beat).
-        """
+        """Algorithm 10 per excerpt, returned as predicted TIMES in seconds."""
         num_frames = batch["truth_beat"].shape[-1]
         window_seconds = num_frames / self.fps
         padding_mask = batch.get("padding_mask")
@@ -178,18 +168,7 @@ class PLBeatThis(LightningModule):
         return tuple(beats), tuple(downbeats)
 
     def _subset_targets(self, batch):
-        """Ground-truth events for the alignment head, from this batch's own annotations.
-
-        truth_orig_beat / truth_orig_downbeat are unquantized times in seconds, already
-        cropped and shifted to the excerpt by prepare_annotations, stored as bytes so
-        variable-length arrays survive collation. Times are normalized by the excerpt
-        duration to land on eq. (1)'s (0, 1] axis.
-
-        downbeat_mask is False for datasets with no downbeat annotation (smc, simac).
-        Their events become CLASS_UNKNOWN -- the B* label of Section 2 -- rather than
-        being asserted to be non-downbeats, which is what routes them through the
-        beat-only loss of Section 8 instead of supervising them wrongly.
-        """
+        """Ground-truth events for the alignment head, from this batch's own annotations."""
         num_frames = batch["truth_beat"].shape[-1]
         window_seconds = num_frames / self.fps
         device = batch["spect"].device
@@ -428,20 +407,7 @@ class PLBeatThis(LightningModule):
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
 
     def _subset_predict_piece(self, batch, chunk_size, overlap_mode):
-        """Whole-piece decoding for the alignment head (Section 9.3).
-
-        split_predict_aggregate cannot be reused: it stitches FRAME-WISE activations
-        along a time axis, whereas this head emits N events per chunk whose times are
-        normalised within their own chunk. So the chunking is reproduced exactly --
-        split_piece with the same chunk_size and avoid_short_end, so the A/B sees the
-        same excerpts -- and the aggregation is done on decoded events instead.
-
-        overlap_mode is accepted for signature compatibility with the dense path but no
-        longer selects behaviour: Section 9.3's keep regions partition the timeline, so
-        no event is ever emitted by two fragments and there is nothing to break a tie
-        over. Previously "keep_last" fell through with no filtering at all, duplicating
-        every event in every overlap.
-        """
+        """Whole-piece decoding for the alignment head (Section 9.3)."""
         from beat_this.inference import split_piece
 
         spect = batch["spect"][0]

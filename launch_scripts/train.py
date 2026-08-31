@@ -20,6 +20,8 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 from beat_this.dataset import BeatDataModule
+from alignbeat.downsample import (BPM_MAX, choose_num_candidates,
+                                  n_candidates_from_tempo)
 from beat_this.model.pl_module import PLBeatThis
 
 
@@ -82,6 +84,21 @@ def main(args):
         no_val=not args.val,
         fold=args.fold,
     )
+    if args.num_candidates is None:
+        args.num_candidates = choose_num_candidates(
+            args.train_length, args.fps, args.bpm_max)
+    floor = n_candidates_from_tempo(args.train_length, args.fps, args.bpm_max)
+    if args.num_candidates < floor:
+        # Below the floor an order-preserving injection may not exist, and
+        # SubsetCriterion silently drops those fragments from the loss rather than
+        # training in the wrong direction. Refuse instead of discovering it in a log.
+        parser.error(
+            f"--num_candidates {args.num_candidates} is below the floor {floor} implied "
+            f"by --bpm_max {args.bpm_max:g} over a {args.train_length}-frame window; "
+            f"fragments denser than N would be dropped from the loss.")
+    print(f"[subset] N = {args.num_candidates} candidates "
+          f"(floor {floor} from bpm_max={args.bpm_max:g}, "
+          f"window={args.train_length}f @ {args.fps}fps)")
     if args.dbn and args.head_type == "subset":
         # The DBN postprocessor consumes frame-wise activations; the alignment head
         # emits per-candidate events and never builds them, so use_dbn would be silently
@@ -127,12 +144,12 @@ def main(args):
         partial_transformers=args.partial_transformers,
         head_type=args.head_type,
         predict_precision=args.predict_precision,
-        pool_init=args.pool_init,
-        pool_mode=args.pool_mode,
         head_lr=args.head_lr,
         quantize_targets=args.quantize_targets,
-        encoder_input_frames=args.train_length,
-        n_min=args.n_min,
+        num_candidates=args.num_candidates,
+        stitch_border=args.stitch_border,
+        downsample_mode=args.downsample_mode,
+        train_length=args.train_length,
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
         tau_beat=args.tau_beat,
@@ -332,8 +349,21 @@ if __name__ == "__main__":
                         choices=["dense", "subset"])
     parser.add_argument("--train_length", type=int, default=1500,
                         help="T, the excerpt length in frames; N is derived from it")
-    parser.add_argument("--n_min", type=int, default=172,
-                        help="N_min = BPM_max * D; the schedule may not shrink below it")
+    parser.add_argument("--stitch_border", type=int, default=None,
+                        help="frames discarded either side of a chunk seam at whole-piece "
+                             "inference; defaults to the dense arm's 2*tolerance so both "
+                             "A/B arms decode under the same edge convention")
+    parser.add_argument("--downsample_mode", type=str, default="learned",
+                        choices=["learned", "avg", "max"],
+                        help="how T frames become N candidates: a strided conv "
+                             "(learned, best so far), or parameter-free avg/max pooling")
+    parser.add_argument("--bpm_max", type=float, default=BPM_MAX,
+                        help=f"fastest tempo the corpus contains (default {BPM_MAX:g}); "
+                             "N is derived from it and the window length")
+    parser.add_argument("--num_candidates", type=int, default=None,
+                        help="N, the number of candidates the head emits. Derived from "
+                             "--bpm_max and --train_length when not given; pass it to "
+                             "overgenerate beyond that floor.")
     parser.add_argument("--class_attention_layers", type=int, default=0)
     parser.add_argument("--class_attention_heads", type=int, default=4)
     parser.add_argument("--tau_beat", type=float, default=0.2)
@@ -349,14 +379,6 @@ if __name__ == "__main__":
                         help="flat-bottomed time loss: residuals below this (normalised "
                              "window units) cost nothing and give no gradient. 0.002355 "
                              "= mir_eval's 70ms tolerance over a 29.72s window.")
-    parser.add_argument("--pool_mode", type=str, default="", choices=["", "mean", "max"],
-                        help="use a PARAMETER-FREE frozen pooling downsample (mean or max) "
-                             "instead of the 2.36M learned merge; section 3 sanctions a "
-                             "fixed pooling operator")
-    parser.add_argument("--pool_init", action="store_true",
-                        help="initialise ProgressiveDownsample as strided average pooling "
-                             "(section 3 sanctions such an operator) instead of random "
-                             "projections; the module is the only gradient path to the encoder")
     parser.add_argument("--init_all_from", type=str, default="",
                         help="load the FULL model (encoder+head) from a checkpoint, with a "
                              "fresh optimizer and schedule; for thawing a converged pair")

@@ -1,11 +1,4 @@
-"""Regressions for bugs that have each recurred at least once in this project.
-
-Every one of these was fixed, silently lost to a revert or a partially-applied edit, and
-then cost a full training run before anyone noticed. They are cheap; run them before
-launching arms.
-
-    python -m pytest tests/test_regressions.py     (or just execute this file)
-"""
+"""Regressions for bugs that have each recurred at least once in this project."""
 import itertools
 import os
 import sys
@@ -15,9 +8,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.subset_head import (SubsetCriterion, subset_select_dp,
-                                  subset_select_dp_meter, subset_select_logsumexp,
-                                  subset_posterior_marginals)
+from alignbeat.criterion import SubsetCriterion
+from alignbeat.dp import subset_posterior_marginals, subset_select_dp, subset_select_dp_meter, subset_select_logsumexp
 
 
 def _targets(M=40, seed=0):
@@ -31,15 +23,9 @@ def _targets(M=40, seed=0):
 
 
 def test_marginal_class_term_has_gradient():
-    """-log Z must differentiate into the CLASS logits.
-
-    build_cost is called inside a torch.no_grad() block for the hard path; the marginal
-    path must rebuild it. Reusing the detached matrix leaves the class term with
-    requires_grad=False, the loss still falls via the background term, and the model
-    decodes zero events. Three separate arms died this way.
-    """
+    """-log Z must differentiate into the CLASS logits."""
     logits, t_hat, tg = _targets()
-    losses, _ = SubsetCriterion(diagnostic_every=10**9, marginal=True)(logits, t_hat, tg)
+    losses, _ = SubsetCriterion(marginal=True)(logits, t_hat, tg)
     assert losses['class'].requires_grad, "marginal class term is detached"
     g = torch.autograd.grad(losses['class'], logits, retain_graph=True)[0]
     assert float(g.abs().mean()) > 1e-6, "no gradient reaches the class logits"
@@ -62,16 +48,11 @@ def test_logsumexp_batched_matches_per_fragment():
 
 
 def test_flags_reach_the_criterion():
-    """Four flags have silently failed to arrive at the criterion. Check the plumbing.
-
-    Goes through PLBeatThis rather than the retired alignbeat.model_module: the
-    criterion knobs now reach SubsetCriterion via the subset_kwargs dict that
-    launch_scripts/train.py assembles, so that is the path worth guarding.
-    """
+    """Four flags have silently failed to arrive at the criterion. Check the plumbing."""
     from beat_this.model.pl_module import PLBeatThis
     m = PLBeatThis(
         head_type="subset", transformer_dim=64, n_layers=2,
-        encoder_input_frames=1500, n_min=172,
+        num_candidates=188,
         subset_kwargs=dict(mu_meter=1e5, lambda_r=200.0, cont_weight=0.5,
                            joint_phase=True, meter_length=4, marginal=True))
     c = m.subset_criterion
@@ -80,12 +61,7 @@ def test_flags_reach_the_criterion():
 
 
 def test_meter_dp_matches_brute_force():
-    """Section 4.2's augmented recursion is an EXACT minimizer, not a heuristic.
-
-    The existing reduction/monotonicity test cannot catch an off-by-one in the
-    prev_j/prev_s backtracking, which would still produce a plausible increasing
-    sigma. Enumeration can.
-    """
+    """Section 4.2's augmented recursion is an EXACT minimizer, not a heuristic."""
     rng = np.random.default_rng(7)
     for _ in range(20):
         M, N, L, mu = 5, 9, 2, 30.0
@@ -133,7 +109,7 @@ def test_posterior_matches_brute_force():
 def test_defaults_unchanged():
     """Every new term must be inert at defaults, or old runs are not reproducible."""
     logits, t_hat, tg = _targets()
-    losses, _ = SubsetCriterion(diagnostic_every=10**9)(logits, t_hat, tg)
+    losses, _ = SubsetCriterion()(logits, t_hat, tg)
     for key in ('continuity', 'periodicity'):
         assert float(losses[key]) == 0.0, f"{key} is active at defaults"
 

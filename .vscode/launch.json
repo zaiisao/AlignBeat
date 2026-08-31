@@ -1,71 +1,96 @@
 {
+    // Args are copied verbatim from runs/fsub_fix.sh and runs/frozen_dense.sh, so a
+    // debug session is the real run. The only additions are debugger necessities:
+    //   --compile          (with no values) turns OFF torch.compile, which otherwise
+    //                      defaults to ["frontend","transformer_blocks","task_heads"]
+    //                      and traces away every breakpoint inside the model.
+    //   --num-workers 0    keeps the dataloader in-process so breakpoints there hit.
+    //   --name debug_*     so debug checkpoints do not collide with real runs.
+    // OMP/MKL/OPENBLAS thread caps mirror the run scripts.
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train.py (AlignBeat, Beat This corpus)",
-            "type": "python",
+            "name": "train: subset head (runs/fsub_fix.sh)",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/train.py",
+            "program": "${workspaceFolder}/launch_scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"
+            },
             "args": [
-                "--spect_root", "/disk4/shared/beat_this/data/audio/spectrograms",
-                "--spect_annot_root", "/disk4/shared/beat_this/data/annotations",
-                "--spect_datasets", "asap,ballroom,beatles,candombe,filosax,groove_midi,guitarset,hainsworth,harmonix,hjdb,jaah,rwc,simac,smc,tapcorrect",
-                "--spect_tempo_aug=-20,-16,-12,-8,-4,0,4,8,12,16,20",
-                "--spect_pitch_aug=-5,-4,-3,-2,-1,0,1,2,3,4,5",
-                "--spect_mask_aug",
-                // the corpus is 50 fps (hop 441); mixing frame rates destroys tempo
-                "--audio_downsampling_factor", "441", "--validation_fold", "0",
-                // beat_this's own recipe, so a comparison isolates the head
-                "--optimizer", "adamw", "--lr", "0.0008", "--lr_schedule", "cosine_warmup", "--warmup_steps", "200",
-                "--accumulate_grad_batches", "8", "--batch_size", "8", "--epochs", "100",
-                "--class_attention_layers", "1", "--class_attention_heads", "4",
-                "--gpu", "1",
-                "--checkpoint_dir", "./checkpoints_alignbeat",
-                "--log_file", "./train_alignbeat.log"
+                "--name", "debug_fsub_fix", "--head_type", "subset",
+                "--gpu", "1", "--fold", "0", "--seed", "0",
+                "--max-epochs", "20", "--lr", "0.0003",
+                "--batch-size", "8", "--accumulate-grad-batches", "8",
+                "--num-workers", "0", "--logger", "none",
+                "--val-frequency", "10000", "--snapshot_every", "3",
+                "--num_candidates", "188",
+                "--class_attention_layers", "1", "--omega_db", "4", "--learn_b",
+                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt",
+                "--freeze_encoder",
+                "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train.py (joint phase, sections 8.3 / 8.5)",
-            "type": "python",
+            "name": "train: dense head (runs/frozen_dense.sh)",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/train.py",
+            "program": "${workspaceFolder}/launch_scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"
+            },
             "args": [
-                "--spect_root", "/disk4/shared/beat_this/data/audio/spectrograms",
-                "--spect_annot_root", "/disk4/shared/beat_this/data/annotations",
-                "--audio_downsampling_factor", "441", "--validation_fold", "0",
-                "--optimizer", "adamw", "--lr", "0.0008", "--lr_schedule", "cosine_warmup",
-                "--accumulate_grad_batches", "8", "--batch_size", "8", "--epochs", "100",
-                // (sigma, phi_0) inferred together rather than in sequence; needs a meter
-                "--joint_phase", "--meter_L", "4",
-                "--gpu", "1",
-                "--checkpoint_dir", "./checkpoints_joint_phase",
-                "--log_file", "./train_joint_phase.log"
+                "--name", "debug_frozen_dense", "--head_type", "dense",
+                "--gpu", "0", "--fold", "0", "--seed", "0",
+                "--max-epochs", "20", "--lr", "0.0003",
+                "--batch-size", "8", "--accumulate-grad-batches", "8",
+                "--num-workers", "0", "--logger", "none",
+                "--val-frequency", "10000", "--snapshot_every", "5",
+                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt",
+                "--freeze_encoder",
+                "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train_dense_baseline.py (section 12)",
-            "type": "python",
+            "name": "diagnose_bottleneck (attribute a flat F)",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/train_dense_baseline.py",
+            "program": "${workspaceFolder}/diagnose_bottleneck.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
             "args": [
-                "--spect_root", "/disk4/shared/beat_this/data/audio/spectrograms",
-                "--spect_annot_root", "/disk4/shared/beat_this/data/annotations",
-                "--gpu", "1",
-                "--checkpoint_dir", "./checkpoints_dense_baseline",
-                "--log_file", "./train_dense_baseline.log"
+                "--checkpoints", "checkpoints/debug_fsub_fix*.ckpt",
+                "--songs", "16", "--num-workers", "0", "--gpu", "1"
             ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "compute_paper_metrics (score a checkpoint)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/compute_paper_metrics.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
+            "args": ["--models", "checkpoints/debug_fsub_fix*.ckpt", "--gpu", "1"],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
             "name": "Python: Current File",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
             "console": "integratedTerminal",
             "justMyCode": false
         }

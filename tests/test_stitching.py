@@ -1,8 +1,4 @@
-"""Tests for piece-level stitching (Algorithm 4).
-
-The property that matters: keep regions must partition the piece exactly, so a planted
-event is reported once and only once regardless of where fragment boundaries fall.
-"""
+"""Tests for piece-level stitching (Algorithm 4)."""
 import os
 import sys
 
@@ -11,12 +7,11 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alignbeat.stitching import fragment_offsets, stitch_piece  # noqa: E402
-from alignbeat.subset_head import BACKGROUND, BEAT, DOWNBEAT  # noqa: E402
+from alignbeat.classes import BACKGROUND, BEAT, DOWNBEAT
 
 
 def test_keep_regions_partition_exactly():
-    """No gap, no overlap, full coverage - for many piece lengths including ones that
-    do not divide evenly by the stride."""
+    """Keep regions partition the piece exactly: no gap, no overlap."""
     for total in (1280, 1281, 2000, 4096, 4097, 5000, 12345):
         for window, border in ((1280, 8), (1280, 64), (500, 10)):
             if total < window:
@@ -43,13 +38,7 @@ def test_border_must_be_under_half_window():
 
 
 def test_every_event_reported_exactly_once():
-    """Plant one detection per fragment at a known absolute position via a fake model,
-    and check the stitched output recovers each exactly once.
-
-    The fake model reports a detection at every candidate slot, so each fragment emits
-    N detections spread across its own window; after trimming, the union over fragments
-    must contain each absolute position once.
-    """
+    """Every planted detection is reported exactly once."""
     window, border, num_candidates = 400, 20, 40
     total = 1500
 

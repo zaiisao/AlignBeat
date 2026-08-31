@@ -4,8 +4,8 @@ Model definitions for the Beat This! beat tracker.
 
 import contextlib
 
-from alignbeat.progressive_downsample import ProgressiveDownsample
-from alignbeat.subset_head import SubsetSelectionHead
+from alignbeat.downsample import Downsample
+from alignbeat.head import SubsetSelectionHead
 from collections import OrderedDict
 
 import torch
@@ -19,45 +19,7 @@ from beat_this.utils import replace_state_dict_key
 
 
 class BeatThis(nn.Module):
-    """
-    A neural network model for beat tracking. It is composed of three main components:
-    - a frontend that processes the input spectrogram,
-    - a series of transformer blocks that process the output of the frontend,
-    - a head that produces the final beat and downbeat predictions.
-
-    Args:
-        spect_dim (int): The dimension of the input spectrogram (default: 128).
-        transformer_dim (int): The dimension of the main transformer blocks (default: 512).
-        ff_mult (int): The multiplier for the feed-forward dimension in the transformer blocks (default: 4).
-        n_layers (int): The number of transformer blocks (default: 6).
-        head_dim (int): The dimension of each attention head for the partial transformers in the frontend and the transformer blocks (default: 32).
-        stem_dim (int): The out dimension of the stem convolutional layer (default: 32).
-        dropout (dict): A dictionary specifying the dropout rates for different parts of the model
-            (default: {"frontend": 0.1, "transformer": 0.2}).
-        sum_head (bool): Whether to use a SumHead for the final predictions (default: True) or plain independent projections.
-        partial_transformers (bool): Whether to include partial frequency- and time-transformers in the frontend (default: True)
-        head_type (str): "dense" for upstream's frame-wise head, "subset" for the
-            order-preserving alignment head (default: "dense").
-
-    The remaining arguments configure the subset head only and are ignored when
-    head_type is "dense". They are flat rather than bundled into one dict because
-    PLBeatThis.save_hyperparameters() writes them into every checkpoint, and flat
-    arguments with defaults stay loadable when the set changes -- checkpoints predating
-    pool_init/pool_mode still load today for exactly that reason.
-
-        encoder_input_frames (int): T, the training window in frames; fixes the
-            downsampling schedule (default: 1500).
-        n_min (int): N_min, the physical tempo bound the schedule may not shrink below
-            (default: 172).
-        class_attention_layers (int): §10.2 candidate self-attention layers for the
-            class branch, eq. (35); 0 disables it (default: 0).
-        class_attention_heads (int): attention heads for the above (default: 4).
-        predict_precision (bool): §4.1.2 per-candidate precision u_j, which the
-            criterion turns into b_j (default: False).
-        pool_init (bool): initialise the downsample as parameter-free pooling
-            (default: False).
-        pool_mode (str): "mean" or "max" when pool_init is set (default: "").
-    """
+    """A neural network model for beat tracking. It is composed of three main components:"""
 
     def __init__(
         self,
@@ -71,13 +33,12 @@ class BeatThis(nn.Module):
         sum_head: bool = True,
         partial_transformers: bool = True,
         head_type: str = "dense",
-        encoder_input_frames: int = 1500,
-        n_min: int = 172,
+        num_candidates: int = None,
+        downsample_mode: str = "learned",
+        train_length: int = 1500,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         predict_precision: bool = False,
-        pool_init: bool = False,
-        pool_mode: str = "",
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -130,17 +91,17 @@ class BeatThis(nn.Module):
 
         # create the output heads
         if head_type == "subset":
-            # Order-preserving alignment head: the transformer's (B, T, dim) output is
-            # downsampled to N candidates, each emitting a 3-way class distribution and
-            # a raw scalar that eq. (1) turns into a strictly increasing time. Everything
-            # before this line is untouched, which is the point -- the A/B against the
-            # dense head differs in the head and its loss and in nothing else.
+            if num_candidates is None:
+                raise ValueError(
+                    "head_type='subset' needs num_candidates; launch_scripts/train.py "
+                    "derives it from --bpm_max and --train_length")
+            # JA: This is the bridge to our AlignBeat architecture
             self.task_heads = SubsetHead(
-                transformer_dim, encoder_input_frames=encoder_input_frames,
-                n_min=n_min, class_attention_layers=class_attention_layers,
+                transformer_dim, num_candidates=num_candidates,
+                downsample_mode=downsample_mode, train_length=train_length,
+                class_attention_layers=class_attention_layers,
                 class_attention_heads=class_attention_heads,
-                predict_precision=predict_precision, pool_init=pool_init,
-                pool_mode=pool_mode)
+                predict_precision=predict_precision)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -346,31 +307,27 @@ class PartialFTTransformer(nn.Module):
 
 
 class SubsetHead(nn.Module):
-    """Progressive downsample T -> N, then the order-preserving alignment head.
+    """Progressive downsample T -> N, then the order-preserving alignment head."""
 
-    Returns {"class_logits": (B, N, 3), "t_hat": (B, N)} rather than the dense head's
-    per-frame {"beat", "downbeat"} logits. pl_module branches on the presence of
-    "class_logits" to pick the matching loss and decode path.
-    """
-
-    def __init__(self, input_dim, encoder_input_frames=1500, n_min=172,
-                 class_attention_layers=0, class_attention_heads=4,
-                 predict_precision=False, pool_init=False, pool_mode=""):
+    def __init__(self, input_dim, num_candidates, downsample_mode="learned",
+                 train_length=1500, class_attention_layers=0, class_attention_heads=4,
+                 predict_precision=False):
         super().__init__()
-        self.downsample = ProgressiveDownsample(
-            d_model=input_dim, T=encoder_input_frames, N_min=n_min,
-            init_as_pooling=pool_init, pool_mode=pool_mode)
-        self.num_candidates = self.downsample.N
-        # No FPN here, so a single level whose stride is 1: the length is already N.
+
+        self.downsample = Downsample(input_dim, num_candidates, downsample_mode,
+                                     window_frames=train_length)
+
+        self.num_candidates = num_candidates
+
         self.head = SubsetSelectionHead(
-            feature_size=input_dim, num_candidates=self.num_candidates,
-            level_strides=(1,), class_attention_layers=class_attention_layers,
+            feature_size=input_dim,
+            class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             predict_precision=predict_precision)
 
-    def forward(self, x):                      # x: (B, T, dim)
-        z = self.downsample(x)                 # (B, N, dim)
-        out = self.head([z.transpose(1, 2)])   # the head wants channel-first levels
+    def forward(self, x):
+        z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
+        out = self.head(z.transpose(1, 2))     # the head wants channel-first
         result = {"class_logits": out[0], "t_hat": out[1]}
         if len(out) > 2:
             # Section 4.1.2's raw per-candidate precision output u_j; the criterion

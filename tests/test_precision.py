@@ -1,18 +1,4 @@
-"""Section 4.1.3: the mitigations that make per-candidate precision safe to enable.
-
-Section 4.1.2 establishes that predicting b_j per candidate reopens two failure modes
-the shared global b closes, in opposite directions: INFLATION on hard candidates
-(raising b_j is a cheaper way to cut the loss than localising correctly, and it is
-self-reinforcing because the residual gradient scales as 1/b_j) and COLLAPSE on easy
-ones (as the residual goes to zero, log(2 b_j) is unbounded below as b_j -> 0).
-
-Each test below pins one mitigation. They are worth having as tests rather than as
-comments because every one of them is invisible in a training curve: a run with the
-stop-gradient silently removed still trains, still reports a falling loss, and simply
-learns worse localisation.
-
-Run: python tests/test_precision.py
-"""
+"""Section 4.1.3: the mitigations that make per-candidate precision safe to enable."""
 import os
 import sys
 
@@ -20,13 +6,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.subset_head import (  # noqa: E402
-    SubsetCriterion, SubsetSelectionHead,
-)
+from alignbeat.criterion import SubsetCriterion
+from alignbeat.head import SubsetSelectionHead
 
 
 def criterion(**kw):
-    kw.setdefault('diagnostic_every', 10 ** 9)
     kw.setdefault('precision_warmup', 0)
     return SubsetCriterion(**kw)
 
@@ -43,11 +27,7 @@ def test_floor_holds_by_construction():
 
 
 def test_stop_gradient_decouples_the_two_roles():
-    """Mitigation 3: one step cannot both widen b_j and leave t_hat_j unimproved.
-
-    t_hat must see b_j only as a constant, while b_j still gets its own gradient --
-    dropping either half would be wrong, so both are checked.
-    """
+    """Mitigation 3: one step cannot both widen b_j and leave t_hat_j unimproved."""
     c = criterion()
     residual = torch.tensor([0.30, 0.05], requires_grad=True)
     raw = torch.tensor([0.5, -0.5], requires_grad=True)
@@ -90,12 +70,7 @@ def test_warmup_defers_the_precision_head():
 
 
 def test_selection_cost_is_insulated_from_b_j():
-    """Section 4.1.3's closing point: the DP's cost must use the SHARED b.
-
-    L_match is not only a loss term, it is the cost the selection minimises, formed
-    before any gradient exists. An inflated b_j would make a badly localised candidate
-    look artificially cheap and corrupt sigma itself, not merely the loss after it.
-    """
+    """Section 4.1.3's closing point: the DP's cost must use the SHARED b."""
     c = criterion(b_scale=0.01)
     log_probabilities = torch.log_softmax(torch.randn(6, 3), dim=-1)
     t_hat = torch.sort(torch.rand(6)).values
@@ -112,10 +87,10 @@ def test_selection_cost_is_insulated_from_b_j():
 
 
 def test_head_emits_precision_only_when_asked():
-    head_off = SubsetSelectionHead(feature_size=16, num_candidates=8, level_strides=(1,))
-    head_on = SubsetSelectionHead(feature_size=16, num_candidates=8, level_strides=(1,),
+    head_off = SubsetSelectionHead(feature_size=16)
+    head_on = SubsetSelectionHead(feature_size=16,
                                   predict_precision=True)
-    features = [torch.randn(2, 16, 8)]
+    features = torch.randn(2, 16, 8)
     assert len(head_off(features)) == 2
     out = head_on(features)
     assert len(out) == 3 and out[2].shape == (2, 8)

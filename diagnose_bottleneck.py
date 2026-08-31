@@ -1,42 +1,4 @@
-"""Where is the error? Decompose validation performance into its component failures.
-
-A joint F-measure tells you the model is bad, not which part is bad. This splits it
-into the four things that have to go right for one ground-truth event to be scored
-correct, so a flat F can be attributed rather than guessed at:
-
-  A. structural ceiling  - is there ANY candidate within the +-70 ms tolerance?
-                           If this is low, N or the window is wrong.
-  B. localisation        - does the candidate the order-preserving match actually
-                           assigns land within 70 ms? A large A-to-B gap means the
-                           candidate times cannot be put in one-to-one correspondence
-                           with the events even though individually they are close.
-  C. firing              - does that matched candidate predict anything but background?
-  D. class               - given it fired, is it the right one of B/DB?
-
-and two checks on the time branch specifically:
-
-  t_hat spread across songs  - how much t_hat moves when the INPUT changes. Near zero
-                               means the regression head is input-independent: it has
-                               learned a fixed grid, not event positions.
-  |t_hat - uniform|          - how far t_hat has travelled from its initialisation.
-
-Run over several checkpoints to see trends; a component that is flat across epochs is
-not "still warming up", it is stuck.
-
-One warning, learned the hard way. The ground truth MUST come from the same conversion
-the training loss uses -- here PLBeatThis._subset_targets, which reads the unquantized
-truth_orig_beat / truth_orig_downbeat annotations. Do NOT reconstruct it from raw
-annotation rows: in the older array format those were two concatenated interval chains
-(every downbeat interval, then every beat interval), so reading column 0 directly gave
-a list that ascends, restarts, and ascends again. Feeding that to an order-preserving
-DP pins B at a fixed value (72% at the time) no matter what the model does, which is
-indistinguishable from a genuinely frozen component and led to exactly that wrong
-diagnosis before it was caught. The rule generalises past the format that caused it:
-if the diagnostic and the loss disagree about what the targets are, the diagnostic is
-measuring itself.
-
-    python diagnose_bottleneck.py --checkpoints "checkpoints/myrun*.ckpt"
-"""
+"""Where is the error? Decompose validation performance into its component failures."""
 import argparse
 import glob
 import os
@@ -45,7 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from alignbeat.subset_head import BACKGROUND, DOWNBEAT, subset_select_dp
+from alignbeat.classes import BACKGROUND, DOWNBEAT
+from alignbeat.dp import subset_select_dp
 from beat_this.dataset import BeatDataModule
 from beat_this.model.pl_module import PLBeatThis
 
@@ -87,7 +50,7 @@ n_songs = sum(len(b['spect']) for b in batches)
 print(f"[diagnose] {n_songs} validation excerpts, fold {dm_hparams.get('fold')}")
 
 model = model.cuda().eval()
-WIN = first['hyper_parameters'].get('encoder_input_frames', 1500)
+WIN = dm_hparams.get('train_length', 1500)
 FPS = first['hyper_parameters'].get('fps', 50)
 window_seconds = WIN / FPS
 # t_hat and the targets both live on eq. (1)'s normalised (0, 1] axis, so the tolerance
@@ -96,12 +59,7 @@ TOL = (args.tolerance_ms / 1000.0) / window_seconds
 to_ms = window_seconds * 1000.0
 
 def label(path):
-    """Show the END of the name, not the start.
-
-    These filenames share a long prefix (run, seed, fold, loss, dims) and differ only
-    in the trailing epoch, so a head truncation prints the same string on every row --
-    which defeats the point of running over several checkpoints to see a trend.
-    """
+    """Show the END of the name, not the start."""
     return os.path.basename(path).replace('.ckpt', '')[-22:]
 
 

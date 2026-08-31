@@ -1,4 +1,9 @@
 {
+    // analyze-smc (Python 3.10) is the environment every runs/*.sh uses. Pin it, or
+    // VSCode picks an arbitrary conda env -- beatfcos is Python 3.9 and lacks the deps.
+    "python.defaultInterpreterPath": "/disk4/anaconda3/envs/analyze-smc/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.extraPaths": ["${workspaceFolder}"],
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

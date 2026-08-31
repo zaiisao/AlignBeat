@@ -1,12 +1,4 @@
-"""Correctness tests for the order-constrained subset selection head.
-
-Run: python -m pytest tests/test_subset_head.py -q
-(or plain `python tests/test_subset_head.py` for a pytest-free run)
-
-The load-bearing test is test_dp_matches_brute_force: Algorithm 1 is checked against
-exhaustive enumeration of every order-preserving injection, which is what Proposition
-1 claims it computes.
-"""
+"""Correctness tests for the order-constrained subset selection head."""
 import itertools
 import sys
 import os
@@ -16,12 +8,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.subset_head import (  # noqa: E402
-    BACKGROUND, BEAT, DOWNBEAT,
-    SubsetCriterion, SubsetSelectionHead,
-    decode_events, intervals_to_events, monotonic_times,
-    subset_select_dp, subset_select_logsumexp, targets_to_events,
-)
+from alignbeat.classes import BACKGROUND, BEAT, DOWNBEAT
+from alignbeat.criterion import SubsetCriterion
+from alignbeat.decode import decode_events, intervals_to_events, targets_to_events
+from alignbeat.dp import subset_select_dp, subset_select_logsumexp
+from alignbeat.head import SubsetSelectionHead, monotonic_times
 
 
 def brute_force_select(cost):
@@ -64,13 +55,7 @@ def test_dp_prefers_obvious_diagonal():
 
 
 def test_background_correction_is_selection_invariant_under_uniform_shift():
-    """Adding the same constant to every g_j must not change sigma.
-
-    L' = L - gamma*g. Shifting all g by c changes every candidate's corrected cost by
-    -gamma*c, and since exactly M pairs are always selected the total shifts by
-    -gamma*c*M for *every* sigma. The argmin is therefore unchanged - a sanity check
-    that the correction is applied per candidate and not, say, per pair index.
-    """
+    """Adding the same constant to every g_j must not change sigma."""
     rng = np.random.default_rng(1)
     M, N = 5, 14
     base = rng.normal(size=(M, N))
@@ -105,9 +90,7 @@ def test_infeasible_raises():
 
 
 def test_monotonicity_invariant():
-    """Equation (1) must be strictly increasing at any realistic parameter scale, and
-    non-decreasing (= non-crossing, which is what the no-NMS argument needs) even at
-    pathological ones where the float32 cumulative sum loses tiny increments."""
+    """Equation (1) is strictly increasing at any realistic parameter scale."""
     torch.manual_seed(0)
     # The relative floor makes strictness hold even at absurd parameter scales, where
     # a plain softplus cumsum ties in float32 (measured: 46/159 ties at scale 20).
@@ -134,8 +117,7 @@ def test_monotonicity_invariant():
 
 
 def test_logsumexp_dp_bounds_the_min():
-    """log Z >= -min_cost: the marginalised objective must upper-bound the single best
-    injection's probability mass (equation 13 vs equation 7)."""
+    """log Z >= -min_cost: the marginalised objective must upper-bound the single best"""
     rng = np.random.default_rng(2)
     for _ in range(20):
         N = int(rng.integers(2, 8))
@@ -171,9 +153,7 @@ def test_targets_to_events_class_exclusivity():
 
 
 def test_intervals_to_events_is_the_real_data_path():
-    """BeatDataset returns make_intervals() output, not the frame grid: (M, 3) rows of
-    [start, end, class] with 0 = downbeat-to-downbeat and 1 = beat-to-beat, padded with
-    -1 by collater. Events must be recovered exactly, endpoints included."""
+    """The real data path is make_intervals() output, not the frame grid."""
     T = 1280
     # downbeats at 100/200/300, beats at 100/140/180/220 (every downbeat is a beat too)
     rows = [[100., 200., 0.], [200., 300., 0.],
@@ -219,8 +199,7 @@ def test_intervals_to_events_matches_grid_conversion():
 
 
 def test_criterion_rewards_a_perfect_prediction():
-    """A model that puts a confident, exactly-located candidate on every event and
-    calls everything else background must score far below a random one."""
+    """A perfect prediction drives every loss term to its floor."""
     torch.manual_seed(0)
     N = 32
     # times chosen to land exactly on the uniform candidate grid t_hat[k] = (k+1)/N,
@@ -268,9 +247,7 @@ def test_criterion_handles_empty_and_infeasible_fragments():
 
 
 def test_criterion_gradients_flow_only_where_expected():
-    """sigma is detached, so gradient must reach the class logits of every candidate
-    (matched via the class term, unmatched via the background term) and the regression
-    outputs of matched candidates only."""
+    """sigma is detached, so gradient must reach the class logits of every candidate"""
     N = 16
     torch.manual_seed(0)
     r = torch.randn(1, N, requires_grad=True)
@@ -287,9 +264,8 @@ def test_criterion_gradients_flow_only_where_expected():
 
 
 def test_head_shapes_and_monotonicity_end_to_end():
-    head = SubsetSelectionHead(feature_size=32, num_candidates=160, level_strides=(8, 4, 2))
-    features = [torch.randn(2, 32, 1280), torch.randn(2, 32, 640), torch.randn(2, 32, 320)]
-    logits, t_hat = head(features)
+    head = SubsetSelectionHead(feature_size=32)
+    logits, t_hat = head(torch.randn(2, 32, 160))
     assert logits.shape == (2, 160, 3)
     assert t_hat.shape == (2, 160)
     assert torch.all(t_hat[:, 1:] > t_hat[:, :-1])
@@ -298,17 +274,36 @@ def test_head_shapes_and_monotonicity_end_to_end():
     print("ok: head shapes correct, uniform grid at init")
 
 
-def test_head_rejects_wrong_length():
-    """A strided conv on 1281 frames still emits 160 candidates while silently
-    dropping the last frame, so the head must validate the INPUT length."""
-    head = SubsetSelectionHead(feature_size=8, num_candidates=160, level_strides=(8, 4, 2))
-    try:
-        head([torch.randn(1, 8, 1281), torch.randn(1, 8, 641), torch.randn(1, 8, 321)])
-    except ValueError as exc:
-        assert "truncate" in str(exc) or "expected" in str(exc)
-        print("ok: silently-truncating input length is rejected loudly")
-        return
-    raise AssertionError("expected ValueError for a non-divisible input length")
+def test_downsample_reaches_n_exactly():
+    """Whatever the window length, the downsample must emit exactly N candidates."""
+    from alignbeat.downsample import Downsample
+    for mode in ("learned", "avg", "max"):
+        for T in (1440, 1281, 160):
+            z = Downsample(8, 160, mode, window_frames=T)(torch.randn(1, T, 8))
+            assert z.shape == (1, 160, 8), f"{mode} at T={T} gave {tuple(z.shape)}"
+    print("ok: every downsample mode emits exactly N candidates")
+
+
+def test_decode_matches_algorithm_10_literally():
+    """The shipped decode must be Algorithm 10, transcribed from the pseudocode."""
+    torch.manual_seed(0)
+    for _ in range(50):
+        N, tau = 64, 0.2
+        logits = torch.randn(N, 3) * 2.0
+        t_hat = monotonic_times(torch.randn(N))
+
+        p = torch.softmax(logits, dim=-1)
+        want_c, want_t = [], []
+        for j in range(N):                                    # lines 3-8
+            c = int(p[j].argmax())
+            if c != BACKGROUND and float(p[j, c]) >= tau:
+                want_c.append(c); want_t.append(float(t_hat[j]))
+
+        got_c, got_t, _ = decode_events(logits, t_hat, tau, tau)
+        assert [int(c) for c in got_c] == want_c
+        assert torch.allclose(got_t, torch.tensor(want_t), atol=0) if want_t else got_t.numel() == 0
+        assert torch.all(got_t[1:] > got_t[:-1]) if got_t.numel() > 1 else True
+    print("ok: decode is Algorithm 10 line for line, ascending, no NMS")
 
 
 def test_decode_no_duplicates_and_sorted():
@@ -328,13 +323,11 @@ def test_decode_no_duplicates_and_sorted():
 # --------------------------------------------------------------------------------
 
 def test_beat_only_events_use_the_marginal_not_a_fabricated_label():
-    """A CLASS_UNKNOWN event must be scored by -log(p(B)+p(DB)), never by pretending
-    it is a downbeat. The dataloader hardcodes beat=1 for SMC, which would otherwise
-    make every SMC beat a downbeat - actively wrong supervision."""
-    from alignbeat.subset_head import CLASS_UNKNOWN
+    """A CLASS_UNKNOWN event must be scored by -log(p(B)+p(DB)), never by pretending"""
+    from alignbeat.classes import CLASS_UNKNOWN
     N = 8
     log_p = torch.log(torch.tensor([[0.25, 0.6, 0.15]]).repeat(N, 1))
-    crit = SubsetCriterion(diagnostic_every=0)
+    crit = SubsetCriterion()
     unknown = crit.class_nll(log_p, torch.tensor([CLASS_UNKNOWN]))
     expected = -np.log(0.25 + 0.6)
     assert np.isclose(float(unknown[0, 0]), expected, atol=1e-5), (float(unknown[0, 0]), expected)
@@ -345,10 +338,9 @@ def test_beat_only_events_use_the_marginal_not_a_fabricated_label():
 
 
 def test_marginal_is_invariant_to_b_db_split():
-    """Equation (9) depends only on p(B)+p(DB) - the paper's stated zero-gradient
-    property. Two distributions with the same active mass must score identically."""
-    from alignbeat.subset_head import CLASS_UNKNOWN
-    crit = SubsetCriterion(diagnostic_every=0)
+    """Equation (9) depends only on p(B)+p(DB) - the paper's stated zero-gradient"""
+    from alignbeat.classes import CLASS_UNKNOWN
+    crit = SubsetCriterion()
     a = torch.log(torch.tensor([[0.10, 0.75, 0.15]]))
     b = torch.log(torch.tensor([[0.75, 0.10, 0.15]]))
     ca = crit.class_nll(a, torch.tensor([CLASS_UNKNOWN]))
@@ -358,14 +350,14 @@ def test_marginal_is_invariant_to_b_db_split():
 
 
 def test_beat_only_end_to_end_trains_without_crashing():
-    from alignbeat.subset_head import CLASS_UNKNOWN
+    from alignbeat.classes import CLASS_UNKNOWN
     N = 32
     torch.manual_seed(0)
     logits = torch.randn(1, N, 3, requires_grad=True)
     r = torch.randn(1, N, requires_grad=True)
     targets = [{'classes': torch.full((6,), CLASS_UNKNOWN, dtype=torch.long),
                 'times': torch.linspace(0.1, 0.9, 6)}]
-    crit = SubsetCriterion(b_scale=0.05, diagnostic_every=0, beat_only_warmup=0)
+    crit = SubsetCriterion(b_scale=0.05, beat_only_warmup=0)
     losses, stats = crit(logits, monotonic_times(r), targets)
     losses['total'].backward()
     assert torch.isfinite(losses['total'])
@@ -375,15 +367,14 @@ def test_beat_only_end_to_end_trains_without_crashing():
 
 
 def test_log_prob_floor_keeps_dp_cost_finite():
-    """A confident model underflows p(background) to 0; the section 7.2 correction then
-    subtracts gamma*inf and the DP cannot backtrack. Observed live 2x in 11,200 iters."""
+    """A confident model underflows p(background) to 0; the section 7.2 correction then"""
     N = 16
     logits = torch.zeros(1, N, 3)
     logits[0, :, BEAT] = 400.0          # p(background) underflows to exactly 0
     logits[0, :, BACKGROUND] = -400.0
     t_hat = monotonic_times(torch.zeros(1, N))
     targets = [{'classes': torch.tensor([BEAT, BEAT]), 'times': torch.tensor([0.25, 0.75])}]
-    losses, stats = SubsetCriterion(diagnostic_every=0)(logits, t_hat, targets)
+    losses, stats = SubsetCriterion()(logits, t_hat, targets)
     assert torch.isfinite(losses['total']), "clamping must keep the loss finite"
     assert stats['infeasible'] == 0, "must not lose the batch"
     print("ok: extreme logits no longer produce a non-finite DP cost")
@@ -391,10 +382,7 @@ def test_log_prob_floor_keeps_dp_cost_finite():
 
 
 def test_monotonic_times_survives_overflow_scale_r():
-    """softplus(r) ~ r, so an unbounded r overflows the cumulative sum to inf and the
-    normalisation returns inf/inf = NaN. That NaN reaches the DP cost through the time
-    term (which LOG_PROB_FLOOR does not cover) and killed a real run: training stopped
-    at epoch ~74 after 9,749 consecutive skipped batches."""
+    """Equation (1) stays finite and ordered at overflow-scale r."""
     for v in (1e30, -1e30, 1e38):
         t = monotonic_times(torch.full((1, 160), v))
         assert torch.isfinite(t).all(), f"non-finite t_hat at r={v}"
@@ -405,10 +393,8 @@ def test_monotonic_times_survives_overflow_scale_r():
     print("ok: equation (1) stays finite and ordered at overflow-scale r")
 
 
-def test_criterion_skips_non_finite_fragment_without_raising():
-    """One bad fragment must not take the whole batch down. subset_select_dp raises on a
-    non-finite cost, that propagated to train.py which skipped the entire batch, and once
-    it happened every batch the run froze while still reporting scores."""
+def test_non_finite_cost_raises_rather_than_masking():
+    """NaN must surface, not be absorbed: a skipped fragment hides its own cause."""
     N = 32
     torch.manual_seed(0)
     logits = torch.randn(2, N, 3, requires_grad=True)
@@ -416,34 +402,31 @@ def test_criterion_skips_non_finite_fragment_without_raising():
     t_hat[0, 5] = float('nan')
     targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
                 'times': torch.tensor([0.3, 0.7])}] * 2
-    losses, stats = SubsetCriterion(b_scale=0.005, diagnostic_every=0)(logits, t_hat, targets)
-    losses['total'].backward()
-    assert stats['non_finite'] == 1, stats
-    assert torch.isfinite(losses['total'])
-    assert torch.isfinite(logits.grad).all()
-    print("ok: a non-finite fragment is skipped and counted, batch survives")
+    try:
+        SubsetCriterion(b_scale=0.005)(logits, t_hat, targets)
+    except FloatingPointError as exc:
+        assert "NaN/Inf" in str(exc)
+        print("ok: a non-finite matching cost raises instead of being skipped")
+        return
+    raise AssertionError("expected FloatingPointError for a non-finite cost")
 
 
-
-def test_all_fragments_non_finite_still_backprops():
-    """If EVERY fragment in a batch is skipped, the loss must still carry a grad_fn.
-
-    The first version of this guard appended the background term inside the
-    torch.no_grad() block, so the term was detached; with every fragment skipped the
-    total had no grad_fn and backward() raised "element 0 of tensors does not require
-    grad". That killed a run within 195 iterations."""
-    crit = SubsetCriterion(b_scale=0.005, diagnostic_every=0)
-    logits = torch.randn(2, 32, 3, requires_grad=True)
-    t_hat = monotonic_times(torch.randn(2, 32)).clone()
-    t_hat[:, 5] = float('nan')                      # every fragment non-finite
+def test_non_finite_logits_also_raise():
+    """The same holds when the class logits, not t_hat, are non-finite."""
+    N = 32
+    torch.manual_seed(0)
+    logits = torch.randn(2, N, 3)
+    logits[0, 3, 1] = float('inf')
+    logits.requires_grad_(True)
+    t_hat = monotonic_times(torch.randn(2, N))
     targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
                 'times': torch.tensor([0.3, 0.7])}] * 2
-    losses, stats = crit(logits, t_hat, targets)
-    assert stats['non_finite'] == 2, stats
-    assert losses['total'].grad_fn is not None, "loss must remain differentiable"
-    losses['total'].backward()
-    assert torch.isfinite(logits.grad).all()
-    print("ok: an all-skipped batch stays differentiable instead of raising")
+    try:
+        SubsetCriterion(b_scale=0.005)(logits, t_hat, targets)
+    except FloatingPointError:
+        print("ok: non-finite class logits raise too")
+        return
+    raise AssertionError("expected FloatingPointError for non-finite logits")
 
 
 if __name__ == '__main__':

@@ -1,13 +1,4 @@
-"""Brute-force verification of the phase constructions (sections 8, 8.1, 8.3, 8.5, 8.6).
-
-Run: python tests/test_phase.py
-
-The paper states that eq. (19), (25), (26)-(29) and (32)-(34) were each checked
-against brute-force enumeration on a minimal case. These are those checks. They are
-the load-bearing tests for this file: every one of the constructions below is a
-claim that some cheap recursion equals an exponentially large sum or minimum, and
-enumeration is the only way to confirm that rather than assume it.
-"""
+"""Brute-force verification of the phase constructions (sections 8, 8.1, 8.3, 8.5, 8.6)."""
 import itertools
 import os
 import sys
@@ -17,21 +8,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.subset_head import (  # noqa: E402
-    BEAT, DOWNBEAT, SubsetCriterion,
-    downbeat_marginal_from_phase_posterior,
-    downbeat_marginal_over_meters,
-    event_is_downbeat_under,
-    joint_phase_log_partition,
-    joint_phase_matching_marginals,
-    joint_phase_posterior,
-    meter_joint_log_partition,
-    meter_posterior,
-    phase_class_nll,
-    phase_star,
-    subset_select_dp_joint_phase,
-    subset_select_dp_phase_segments,
-)
+from alignbeat.classes import BEAT, DOWNBEAT
+from alignbeat.criterion import SubsetCriterion
+from alignbeat.dp import downbeat_marginal_from_phase_posterior, downbeat_marginal_over_meters, event_is_downbeat_under, joint_phase_log_partition, joint_phase_matching_marginals, joint_phase_posterior, meter_joint_log_partition, meter_posterior, phase_class_nll, phase_star, subset_select_dp_joint_phase, subset_select_dp_phase_segments
 
 torch.manual_seed(0)
 
@@ -264,19 +243,11 @@ def test_meter_marginalization_matches_brute_force():
 
 
 def test_em_posterior_matches_brute_force_and_couples_events():
-    """Equations (12)/(14), and the property that makes them worth having.
-
-    The single-event marginal (9) has exactly zero gradient along a B-versus-DB
-    redistribution, so the only thing that can teach the distinction is coupling
-    across the fragment. It is not enough that r_i be computed correctly: perturbing
-    ONE event's prediction must move the OTHER events' r_i, or the construction has
-    silently degenerated back into the per-candidate estimator (9) already was.
-    """
-    from alignbeat.subset_head import SubsetCriterion
+    """Equations (12)/(14), and the property that makes them worth having."""
+    from alignbeat.criterion import SubsetCriterion
 
     for L, M in [(2, 6), (3, 7), (4, 9)]:
-        criterion = SubsetCriterion(meter_length=L, diagnostic_every=10 ** 9,
-                                    beat_only_warmup=0)
+        criterion = SubsetCriterion(meter_length=L, beat_only_warmup=0)
         torch.manual_seed(L)
         matched_log = torch.log_softmax(torch.randn(M, 3, dtype=torch.float64) * 2, dim=-1)
         got, got_valid = criterion._phase_posterior_marginal(matched_log)
@@ -301,11 +272,10 @@ def test_em_posterior_matches_brute_force_and_couples_events():
 
 def test_segment_posteriors_use_only_their_own_events():
     """Equation (17): each segment's posterior sees its own events and nothing else."""
-    from alignbeat.subset_head import SubsetCriterion
+    from alignbeat.criterion import SubsetCriterion
 
     def criterion(meter):
-        return SubsetCriterion(meter_length=meter, diagnostic_every=10 ** 9,
-                               beat_only_warmup=0)
+        return SubsetCriterion(meter_length=meter, beat_only_warmup=0)
 
     torch.manual_seed(0)
     matched_log = torch.log_softmax(torch.randn(7, 3, dtype=torch.float64) * 2, dim=-1)
@@ -346,16 +316,9 @@ if __name__ == "__main__":
 
 
 def test_degenerate_segment_falls_back_to_eq9_not_a_confident_beat():
-    """A segment with no usable meter must NOT be force-fitted to "beat".
-
-    Regression: the segment loop skipped meter <= 1, leaving r = 0 for those events.
-    The confidence gate reads max(r, 1-r) = 1 >= threshold, so r = 0 was indistinguishable
-    from a CONFIDENT downbeat-probability-zero pseudo-label, asserting exactly what an
-    absent meter means we do not know. Those events must fall back to eq. (9) instead.
-    """
+    """A segment with no usable meter must NOT be force-fitted to "beat"."""
     torch.manual_seed(0)
-    crit = SubsetCriterion(meter_length=4, beat_only_warmup=0, beat_only_confidence=0.7,
-                           diagnostic_every=0)
+    crit = SubsetCriterion(meter_length=4, beat_only_warmup=0, beat_only_confidence=0.7)
     matched_log = torch.log_softmax(torch.randn(6, 3), dim=-1)
     # segment 0 has a degenerate meter (1), segment 1 is a normal 3
     r, valid = crit._phase_posterior_marginal(matched_log, segments=[(0, 1), (3, 3)])
