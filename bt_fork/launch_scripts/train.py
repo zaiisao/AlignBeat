@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import torch
@@ -114,6 +115,9 @@ def main(args):
         partial_transformers=args.partial_transformers,
         head_type=args.head_type,
         predict_precision=args.predict_precision,
+        pool_init=args.pool_init,
+        pool_mode=args.pool_mode,
+        head_lr=args.head_lr,
         quantize_targets=args.quantize_targets,
         encoder_input_frames=args.train_length,
         n_min=args.n_min,
@@ -139,8 +143,61 @@ def main(args):
             "mu_meter": args.mu_meter,
             "lambda_r": args.lambda_r,
             "cont_weight": args.cont_weight,
+            "tol_flat": args.tol_flat,
         },
     )
+    # --- frozen-encoder head swap -------------------------------------------------
+    # Isolates "is the encoder good enough" from "is the head lossy". Both arms share
+    # the identical frontend + transformer_blocks and differ only in task_heads, so
+    # loading a converged encoder and training ONLY the head answers whether the
+    # candidate representation can express what the dense per-frame one can.
+    if args.init_encoder_from:
+        blob = torch.load(args.init_encoder_from, map_location="cpu", weights_only=False)
+        src = blob["state_dict"]
+        loaded, skipped = 0, 0
+        own = pl_model.state_dict()
+        transfer = {}
+        for k, v in src.items():
+            if not (k.startswith("model.frontend") or k.startswith("model.transformer_blocks")):
+                continue
+            if k in own and own[k].shape == v.shape:
+                transfer[k] = v; loaded += 1
+            else:
+                skipped += 1
+        assert loaded > 0, f"no encoder weights matched from {args.init_encoder_from}"
+        assert skipped == 0, f"{skipped} encoder tensors did not match shape; wrong config?"
+        missing, unexpected = pl_model.load_state_dict(transfer, strict=False)
+        print(f"[encoder-init] loaded {loaded} tensors from "
+              f"{os.path.basename(args.init_encoder_from)} (epoch {blob.get('epoch')})",
+              flush=True)
+    if args.init_all_from:
+        # Full-model init (encoder AND head), no optimizer/epoch state: start a FRESH
+        # schedule from an already-converged system. Used for the thaw experiment --
+        # take the frozen-encoder run (vanilla encoder + head trained on top of it, a
+        # converged pair) and release the encoder underneath a head that already works.
+        # This separates a TRANSIENT cause of the end-to-end inversion (a random head
+        # damages a good encoder early) from a STEADY-STATE one (the loss degrades
+        # encoders no matter what).
+        blob = torch.load(args.init_all_from, map_location="cpu", weights_only=False)
+        missing, unexpected = pl_model.load_state_dict(blob["state_dict"], strict=False)
+        crit = [k for k in missing if "frontend" in k or "transformer_blocks" in k or "task_heads" in k]
+        assert not crit, f"init_all_from missing core weights: {crit[:4]}"
+        print(f"[init-all] loaded full model from {os.path.basename(args.init_all_from)} "
+              f"(epoch {blob.get('epoch')}); {len(missing)} missing, {len(unexpected)} unexpected",
+              flush=True)
+
+    if args.freeze_encoder:
+        n = 0
+        for mod in (pl_model.model.frontend, pl_model.model.transformer_blocks):
+            for prm in mod.parameters():
+                prm.requires_grad_(False); n += 1
+        pl_model.model.frontend.eval()
+        pl_model.model.transformer_blocks.eval()
+        trainable = sum(p.numel() for p in pl_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in pl_model.parameters())
+        print(f"[freeze] froze {n} encoder tensors; trainable {trainable/1e6:.2f}M "
+              f"of {total/1e6:.2f}M params", flush=True)
+
     for part in args.compile:
         if hasattr(pl_model.model, part):
             setattr(pl_model.model, part, torch.compile(getattr(pl_model.model, part)))
@@ -269,6 +326,30 @@ if __name__ == "__main__":
     parser.add_argument("--class_attention_heads", type=int, default=4)
     parser.add_argument("--tau_beat", type=float, default=0.2)
     parser.add_argument("--tau_downbeat", type=float, default=0.2)
+    parser.add_argument("--init_encoder_from", type=str, default="",
+                        help="checkpoint to copy frontend+transformer_blocks from; "
+                             "the head is always freshly initialised")
+    parser.add_argument("--head_lr", type=float, default=0.0,
+                        help="separate lr for the head (task_heads + criterion); 0 = use --lr "
+                             "for everything. Lets the encoder train at the rate that suits "
+                             "it while the head keeps a rate it is stable at.")
+    parser.add_argument("--tol_flat", type=float, default=0.0,
+                        help="flat-bottomed time loss: residuals below this (normalised "
+                             "window units) cost nothing and give no gradient. 0.002355 "
+                             "= mir_eval's 70ms tolerance over a 29.72s window.")
+    parser.add_argument("--pool_mode", type=str, default="", choices=["", "mean", "max"],
+                        help="use a PARAMETER-FREE frozen pooling downsample (mean or max) "
+                             "instead of the 2.36M learned merge; section 3 sanctions a "
+                             "fixed pooling operator")
+    parser.add_argument("--pool_init", action="store_true",
+                        help="initialise ProgressiveDownsample as strided average pooling "
+                             "(section 3 sanctions such an operator) instead of random "
+                             "projections; the module is the only gradient path to the encoder")
+    parser.add_argument("--init_all_from", type=str, default="",
+                        help="load the FULL model (encoder+head) from a checkpoint, with a "
+                             "fresh optimizer and schedule; for thawing a converged pair")
+    parser.add_argument("--freeze_encoder", action="store_true",
+                        help="train only task_heads, with the encoder held fixed")
     parser.add_argument("--db_margin", type=float, default=0.0,
                         help="B-vs-DB decode margin: call DOWNBEAT only if "
                              "log p(DB) - log p(B) exceeds this. log(omega_db) "

@@ -55,6 +55,8 @@ class BeatThis(nn.Module):
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         predict_precision: bool = False,
+        pool_init: bool = False,
+        pool_mode: str = "",
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -116,7 +118,8 @@ class BeatThis(nn.Module):
                 transformer_dim, encoder_input_frames=encoder_input_frames,
                 n_min=n_min, class_attention_layers=class_attention_layers,
                 class_attention_heads=class_attention_heads,
-                predict_precision=predict_precision)
+                predict_precision=predict_precision, pool_init=pool_init,
+                pool_mode=pool_mode)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -331,10 +334,11 @@ class SubsetHead(nn.Module):
 
     def __init__(self, input_dim, encoder_input_frames=1500, n_min=172,
                  class_attention_layers=0, class_attention_heads=4,
-                 predict_precision=False):
+                 predict_precision=False, pool_init=False, pool_mode=""):
         super().__init__()
         self.downsample = ProgressiveDownsample(
-            d_model=input_dim, T=encoder_input_frames, N_min=n_min)
+            d_model=input_dim, T=encoder_input_frames, N_min=n_min,
+            init_as_pooling=pool_init, pool_mode=pool_mode)
         self.num_candidates = self.downsample.N
         # No FPN here, so a single level whose stride is 1: the length is already N.
         self.head = SubsetSelectionHead(

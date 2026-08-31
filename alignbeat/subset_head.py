@@ -885,6 +885,7 @@ class SubsetCriterion(nn.Module):
 
     def __init__(self, b_scale=0.005, gamma=0.5, omega_downbeat=2.0, omega_beat=1.0,
                  learn_b=False, b_momentum=0.9, b_min=1e-4, normalize_by_events=True,
+                 tol_flat=0.0,
                  diagnostic_every=200, beat_only_warmup=2000, beat_only_confidence=0.7,
                  cont_weight=0.0, cont_windows=8, lambda_r=0.0, meter_length=0,
                  marginal=False, marginal_background=True, fragment_seconds=29.7215,
@@ -1003,6 +1004,18 @@ class SubsetCriterion(nn.Module):
         self.b_momentum = b_momentum
         self.b_min = b_min
         self.normalize_by_events = normalize_by_events
+        # Flat-bottomed time loss: residuals below tol_flat (in NORMALISED window units)
+        # cost nothing and produce NO gradient.
+        #
+        # Why: d|x|/dx = sign(x) is scale-free, so the time channel pushes with constant
+        # magnitude however small the error -- it never converges, it dithers. Measured:
+        # the N=T memorisation probe reached F 0.974 at step 1000 then fell back to 0.883
+        # with the loss RISING (0.141 -> 0.382), while N=188 variants held at ~1.000.
+        # Meanwhile the evaluation metric is flat within +/-70 ms, so every unit of
+        # gradient spent below that tolerance is spent in a direction where the true risk
+        # has zero derivative. Setting tol_flat to the tolerance aligns the surrogate's
+        # curvature with the risk it stands in for.
+        self.tol_flat = tol_flat
         # buffer so it round-trips through checkpoints with the model
         self.register_buffer('b', torch.tensor(float(b_scale)))
 
@@ -1083,9 +1096,14 @@ class SubsetCriterion(nn.Module):
 
         Returns the corrected cost (M, N) plus the two raw terms for diagnostics.
         """
-        class_cost = self.class_nll(log_probabilities, event_classes)          # (M, N)
+        # The DP needs a FINITE cost to backtrack, so the floor lives here rather than on
+        # the log-probabilities used by the loss (clamping there zeroes the gradient of
+        # any confidently-wrong candidate). Floored only for selection; the loss sees the
+        # ungated values.
+        floored = log_probabilities.clamp(min=LOG_PROB_FLOOR)
+        class_cost = self.class_nll(floored, event_classes)                     # (M, N)
         time_cost = self.lambda_l1 * (event_times[:, None] - t_hat[None, :]).abs()
-        background = -log_probabilities[:, BACKGROUND]                          # (N,)
+        background = -floored[:, BACKGROUND]                                    # (N,)
         corrected = class_cost + time_cost - self.gamma * background[None, :]
         return corrected, class_cost, time_cost
 
@@ -1171,7 +1189,13 @@ class SubsetCriterion(nn.Module):
         losses per iteration and logs each one.
         """
         batch_size, num_candidates, _ = class_logits.shape
-        log_probabilities = F.log_softmax(class_logits, dim=-1).clamp(min=LOG_PROB_FLOOR)
+        # Ungated log-probabilities: the loss must receive the full cross-entropy
+        # gradient. clamp(min=LOG_PROB_FLOOR) has ZERO gradient below the floor, so a
+        # confidently WRONG candidate received exactly no class gradient instead of the
+        # maximal one -- the opposite of what (8) prescribes. The floor exists for the
+        # DP cost's numerical stability (a non-finite cost makes the DP unable to
+        # backtrack), so it is applied there, in build_cost, and not here.
+        log_probabilities = F.log_softmax(class_logits, dim=-1)
         # Section 4.1.3's closing recommendation: even when the training loss uses a
         # per-candidate b_j, the cost driving the SELECTION uses the shared, globally
         # updated b. build_cost reads self.lambda_l1 = 1/b, so that holds by
@@ -1418,12 +1442,22 @@ class SubsetCriterion(nn.Module):
             class_terms.append((omega * per_event).sum() / denominator)
 
             residual = (event_times - t_hat[b][sigma]).abs()
+            if self.tol_flat > 0.0:
+                residual = (residual - self.tol_flat).clamp(min=0.0)
+            # Eq. (8) brackets omega_{c_i} around BOTH the class and the time term:
+            #   sum_i omega_{c_i} [ -log p_hat(c_i) + lambda_L1 |t_i - t_hat| ] + gamma sum g_j
+            # This previously weighted the class term only. The prose calls omega "a
+            # class-specific weight on the matched classification term", which is why the
+            # narrower reading was defensible, but the displayed equation is the
+            # specification and it scopes omega over the bracket.
             if precision_scales is None:
-                time_terms.append(self.lambda_l1 * residual.sum() / denominator)
+                time_terms.append(
+                    (omega * self.lambda_l1 * residual).sum() / denominator)
             else:
                 b_j = precision_scales[b][sigma]
                 time_terms.append(
-                    self._per_candidate_time_term(residual, b_j).sum() / denominator)
+                    (omega * self._per_candidate_time_term(residual, b_j)).sum()
+                    / denominator)
                 precision_terms.append(self._precision_prior(b_j) / denominator)
             matched_residuals.append(residual.detach())
 

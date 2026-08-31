@@ -51,6 +51,40 @@ def compute_schedule(T: int, N_min: int, r: float = 0.5):
     return schedule 
 
 
+class FixedPoolStep(nn.Module):
+    """Parameter-free downsample step: merge each adjacent pair by mean or max.
+
+    Section 3 permits "any fixed downsampling operator ... for instance a strided
+    convolution or a strided average-pooling layer", so a parameter-free operator is
+    fully faithful -- and it removes 2.36M of the head's 3.29M parameters, which is 72%
+    of a head whose actual decision layers are only 1,028 parameters (dense's are 1,026).
+
+    mean vs max is not a neutral choice for this task. Beats are SPARSE salient events:
+    averaging 8 frames dilutes a sharp onset by ~8x, while max preserves it. Against
+    that, channel-wise max takes each of the 512 dimensions' argmax independently, so
+    the pooled vector need not correspond to any single time position. Both are worth
+    measuring rather than assuming.
+
+    (Note this is NOT the same operation as Beat This's max-pooling, which is stride-1
+    and length-preserving -- used for shift tolerance in the loss and for peak-picking
+    at decode, not for reducing sequence length.)
+    """
+
+    def __init__(self, mode: str):
+        super().__init__()
+        assert mode in ("mean", "max")
+        self.mode = mode
+
+    def forward(self, x):
+        B, T_prev, D = x.shape
+        n = T_prev // 2
+        pair = x[:, : 2 * n, :].reshape(B, n, 2, D)
+        merged = pair.mean(2) if self.mode == "mean" else pair.max(2).values
+        if T_prev % 2 == 1:                      # lone tail element passes through
+            merged = torch.cat([merged, x[:, -1:, :]], dim=1)
+        return merged
+
+
 class DownsampleStep(nn.Module):
     """eq.(3): merges two adjacent positions into one via concat + linear
     projection. If the input length is odd, the last leftover position is
@@ -73,10 +107,30 @@ class DownsampleStep(nn.Module):
     This handling makes the resulting length exactly match eq.(1)'s schedule.
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, init_as_pooling: bool = False):
         super().__init__()
         self.merge = nn.Linear(2 * d_model, d_model)  # W_s, b_s: learnable params that merge a pair into one
         self.odd_proj = nn.Linear(d_model, d_model)   # W'_s, b'_s (only used when odd): separate params for the odd leftover
+        if init_as_pooling:
+            # Start this step as strided average pooling: merge([g_a ; g_b]) = (g_a+g_b)/2
+            # and odd_proj(g) = g. Section 3 names "a strided average-pooling layer" as an
+            # acceptable Downsample, so this initialises the learned operator AT one of the
+            # operators the document sanctions, and lets training depart from it.
+            #
+            # Why it may matter: this module is 2.36M of the head's 3.29M parameters and
+            # sits on the ONLY gradient path from the loss to the encoder. Left at default
+            # init it is three stacked random projections, so at step 0 the classifier reads
+            # a scrambled view of the encoder and back-propagates scrambled gradient into it.
+            # Measured context: the subset arm delivers 5.4x MORE per-parameter gradient to
+            # the encoder than the dense arm and yet produces a WORSE encoder (end-to-end
+            # 0.842 downbeat vs 0.895 with the encoder frozen) -- a large, mis-directed
+            # signal, which is the shape a random bottleneck would produce.
+            with torch.no_grad():
+                eye = torch.eye(d_model)
+                self.merge.weight.copy_(torch.cat([eye, eye], dim=1) * 0.5)
+                self.merge.bias.zero_()
+                self.odd_proj.weight.copy_(eye)
+                self.odd_proj.bias.zero_()
 
     def forward(self, x):
         # x: (B, T_prev, d_model)
@@ -106,16 +160,29 @@ class ProgressiveDownsample(nn.Module):
     that shrinks T down to N.
     """
 
-    def __init__(self, d_model: int, T: int, N_min: int, r: float = 0.5):
+    def __init__(self, d_model: int, T: int, N_min: int, r: float = 0.5,
+                 init_as_pooling: bool = False, pool_mode: str = ""):
         super().__init__()
         self.schedule = compute_schedule(T, N_min, r) # precompute the schedule via eq.(1) -> [750, 375, 188]
         if not self.schedule:
-            # if T is already below N_min there are no steps to take -- error
-            raise ValueError(f"T={T} is already below N_min={N_min}; no downsampling steps possible")
-        # the last value of the schedule is the final N
-        self.N = self.schedule[-1]
+            # N_min >= ceil(T/2): eq.(1)'s schedule is empty, so there is NO downsampling
+            # step and z = h by identity, N = T. This is a legitimate configuration of the
+            # formulation, not a degenerate one -- nothing in the correspondence problem,
+            # the DP, or the loss requires N < T. It is also the only configuration in
+            # which section 3's orthogonality claim holds vacuously: with no operator to
+            # choose, no choice can matter. It isolates the formulation's actual thesis --
+            # DP matching to exactly M events, with eq.(1) continuous times -- against
+            # per-frame BCE at identical architecture and identical resolution.
+            self.N = T
+        else:
+            # the last value of the schedule is the final N
+            self.N = self.schedule[-1]
         # create one independent DownsampleStep per schedule entry (S=3)
-        self.steps = nn.ModuleList([DownsampleStep(d_model) for _ in self.schedule])
+        if pool_mode:      # parameter-free: frozen mean/max pooling, 0 params
+            self.steps = nn.ModuleList([FixedPoolStep(pool_mode) for _ in self.schedule])
+        else:
+            self.steps = nn.ModuleList([DownsampleStep(d_model, init_as_pooling)
+                                        for _ in self.schedule])
 
     def forward(self, x):
         for step in self.steps:

@@ -45,6 +45,9 @@ class PLBeatThis(LightningModule):
         partial_transformers=True,
         head_type: str = "dense",
         predict_precision: bool = False,
+        pool_init: bool = False,
+        pool_mode: str = "",
+        head_lr: float = 0.0,
         quantize_targets: bool = False,
         stitch_border: int = None,
         # Only used by head_type="subset": T is needed to precompute the downsampling
@@ -65,6 +68,7 @@ class PLBeatThis(LightningModule):
         self.fps = fps
         self.quantize_targets = quantize_targets
         self.stitch_border = stitch_border
+        self.head_lr = head_lr
         self.tau_beat = tau_beat
         self.tau_downbeat = tau_downbeat
         # Decode-time Bayes correction for omega_DB-weighted training; see
@@ -88,6 +92,8 @@ class PLBeatThis(LightningModule):
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             predict_precision=predict_precision,
+            pool_init=pool_init,
+            pool_mode=pool_mode,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -506,20 +512,32 @@ class PLBeatThis(LightningModule):
         optimizer = torch.optim.AdamW
         # only decay 2+-dimensional tensors, to exclude biases and norms
         # (filtering on dimensionality idea taken from Kaparthy's nano-GPT)
-        params = [
-            {
-                "params": (
-                    p for p in self.parameters() if p.requires_grad and p.ndim >= 2
-                ),
-                "weight_decay": self.weight_decay,
-            },
-            {
-                "params": (
-                    p for p in self.parameters() if p.requires_grad and p.ndim <= 1
-                ),
-                "weight_decay": 0,
-            },
-        ]
+        # Discriminative learning rates. The encoder and the head have different
+        # stability requirements and there is no reason they must share an lr: the dense
+        # baseline reaches its best at 8e-4, but the subset head collapses there (0.617
+        # at ep4 -> 0.545 at ep9, measured), which forced every subset arm to 3e-4. That
+        # costs the ENCODER real quality -- the dense control loses 0.025 joint at 3e-4
+        # versus 8e-4 (0.894 vs 0.919). head_lr lets the encoder train at the rate that
+        # suits it while the head keeps the rate that keeps it stable.
+        def _is_head(name):
+            return name.startswith("model.task_heads") or name.startswith("subset_criterion")
+        head_lr = self.head_lr if self.head_lr > 0 else self.lr
+        groups, seen = [], set()
+        for tag, pred, lr in (("encoder", lambda n: not _is_head(n), self.lr),
+                              ("head",    _is_head,                  head_lr)):
+            for decay, keep in (("decay", lambda p: p.ndim >= 2), ("nodecay", lambda p: p.ndim <= 1)):
+                ps = [p for n, p in self.named_parameters()
+                      if p.requires_grad and pred(n) and keep(p) and id(p) not in seen]
+                for p in ps: seen.add(id(p))
+                if ps:
+                    groups.append({"params": ps, "lr": lr,
+                                   "weight_decay": self.weight_decay if decay == "decay" else 0.0,
+                                   "name": f"{tag}.{decay}"})
+        if head_lr != self.lr:
+            print(f"[optim] discriminative lr: encoder {self.lr:g}, head {head_lr:g} "
+                  f"({sum(len(g['params']) for g in groups if g['name'].startswith('head'))} head tensors)",
+                  flush=True)
+        params = groups
 
         optimizer = optimizer(params, lr=self.lr)
 
