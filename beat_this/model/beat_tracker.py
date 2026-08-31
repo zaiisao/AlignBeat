@@ -36,6 +36,27 @@ class BeatThis(nn.Module):
             (default: {"frontend": 0.1, "transformer": 0.2}).
         sum_head (bool): Whether to use a SumHead for the final predictions (default: True) or plain independent projections.
         partial_transformers (bool): Whether to include partial frequency- and time-transformers in the frontend (default: True)
+        head_type (str): "dense" for upstream's frame-wise head, "subset" for the
+            order-preserving alignment head (default: "dense").
+
+    The remaining arguments configure the subset head only and are ignored when
+    head_type is "dense". They are flat rather than bundled into one dict because
+    PLBeatThis.save_hyperparameters() writes them into every checkpoint, and flat
+    arguments with defaults stay loadable when the set changes -- checkpoints predating
+    pool_init/pool_mode still load today for exactly that reason.
+
+        encoder_input_frames (int): T, the training window in frames; fixes the
+            downsampling schedule (default: 1500).
+        n_min (int): N_min, the physical tempo bound the schedule may not shrink below
+            (default: 172).
+        class_attention_layers (int): §10.2 candidate self-attention layers for the
+            class branch, eq. (35); 0 disables it (default: 0).
+        class_attention_heads (int): attention heads for the above (default: 4).
+        predict_precision (bool): §4.1.2 per-candidate precision u_j, which the
+            criterion turns into b_j (default: False).
+        pool_init (bool): initialise the downsample as parameter-free pooling
+            (default: False).
+        pool_mode (str): "mean" or "max" when pool_init is set (default: "").
     """
 
     def __init__(
