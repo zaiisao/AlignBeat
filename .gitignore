@@ -126,3 +126,9 @@ lightning_logs/
 wandb/
 .vscode/
 beat_this.egg-info/
+
+# runtime dirs may be symlinks to shared storage; the trailing-slash forms
+# above match directories only, so list them again without it
+/checkpoints
+/data
+/lightning_logs
