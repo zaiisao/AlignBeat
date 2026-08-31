@@ -62,14 +62,18 @@ def test_logsumexp_batched_matches_per_fragment():
 
 
 def test_flags_reach_the_criterion():
-    """Four flags have silently failed to arrive at the criterion. Check the plumbing."""
-    from alignbeat import model_module
-    m = model_module.create_alignbeat_model(
-        args=None, audio_downsampling_factor=512, audio_sample_rate=22050,
+    """Four flags have silently failed to arrive at the criterion. Check the plumbing.
+
+    Goes through PLBeatThis rather than the retired alignbeat.model_module: the
+    criterion knobs now reach SubsetCriterion via the subset_kwargs dict that
+    launch_scripts/train.py assembles, so that is the path worth guarding.
+    """
+    from beat_this.model.pl_module import PLBeatThis
+    m = PLBeatThis(
+        head_type="subset", transformer_dim=64, n_layers=2,
         encoder_input_frames=1500, n_min=172,
-        dropout={"frontend": 0.1, "transformer": 0.2},
-        mu_meter=1e5, lambda_r=200.0, cont_weight=0.5,
-        joint_phase=True, meter_length=4, marginal=True)
+        subset_kwargs=dict(mu_meter=1e5, lambda_r=200.0, cont_weight=0.5,
+                           joint_phase=True, meter_length=4, marginal=True))
     c = m.subset_criterion
     assert c.mu_meter == 1e5 and c.lambda_r == 200.0 and c.cont_weight == 0.5
     assert c.joint_phase and c.meter_length == 4 and c.marginal
