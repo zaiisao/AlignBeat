@@ -1516,7 +1516,12 @@ class SubsetCriterion(nn.Module):
         losses['total'] = (losses['class'] + losses['time'] + losses['background']
                            + losses['continuity'] + losses['periodicity'])
 
-        if self.learn_b and matched_residuals:
+        # training-only: forward() is also reached from validation_step and test_step
+        # (pl_module lines 352 and 375 both route through _compute_loss), and _update_b
+        # writes the b buffer in place, so without this guard the Laplace scale -- and
+        # therefore lambda_L1 = 1/b, which weights the time term and the DP cost -- was
+        # being estimated partly from data the model is not training on.
+        if self.training and self.learn_b and matched_residuals:
             self._update_b(torch.cat(matched_residuals))
 
         stats = {
@@ -1557,7 +1562,11 @@ class SubsetCriterion(nn.Module):
             for _k in self._diag_cache:
                 if _k in stats:
                     self._diag_cache[_k] = stats[_k]
-        self._call_count += 1
+        # Same reason: this counter gates precision_warmup and beat_only_warmup, so
+        # counting validation forwards made both warm-ups expire early by whatever
+        # fraction of forwards were validation.
+        if self.training:
+            self._call_count += 1
         if self.diagnostic_every and self._call_count % self.diagnostic_every == 1:
             # The scale warning light. If cost_time dwarfs cost_class the DP has become
             # nearest-in-time matching and the class term no longer influences which
