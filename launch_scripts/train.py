@@ -149,6 +149,7 @@ def main(args):
         stitch_border=args.stitch_border,
         downsample_mode=args.downsample_mode,
         train_length=args.train_length,
+        downsample_stages=args.downsample_stages,
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
         tau_beat=args.tau_beat,
@@ -351,6 +352,10 @@ if __name__ == "__main__":
                         help="frames discarded either side of a chunk seam at whole-piece "
                              "inference; defaults to the dense arm's 2*tolerance so both "
                              "A/B arms decode under the same edge convention")
+    parser.add_argument("--downsample_stages", type=int, default=None,
+                        help="Strict halving: N is derived as ceil(T / 2**stages) "
+                             "(1500 -> 750 -> 375 -> 188 for 3) instead of factorising "
+                             "T/num_candidates. Overrides --num_candidates.")
     parser.add_argument("--downsample_mode", type=str, default="learned",
                         choices=["learned", "avg", "max"],
                         help="how T frames become N candidates: a strided conv "

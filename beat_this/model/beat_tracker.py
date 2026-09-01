@@ -37,6 +37,7 @@ class BeatThis(nn.Module):
         downsample_mode: str = "learned",
         train_length: int = 1500,
         fps: int = 50,
+        downsample_stages: int = None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
     ):
@@ -99,6 +100,7 @@ class BeatThis(nn.Module):
             self.task_heads = SubsetHead(
                 transformer_dim, num_candidates=num_candidates,
                 downsample_mode=downsample_mode, train_length=train_length, fps=fps,
+                downsample_stages=downsample_stages,
                 class_attention_layers=class_attention_layers,
                 class_attention_heads=class_attention_heads)
         elif sum_head:
@@ -315,14 +317,20 @@ class SubsetHead(nn.Module):
     """Progressive downsample T -> N, then the order-preserving alignment head."""
 
     def __init__(self, input_dim, num_candidates, downsample_mode="learned",
-                 train_length=1500, fps=50, class_attention_layers=0,
-                 class_attention_heads=4):
+                 train_length=1500, fps=50, downsample_stages=None,
+                 class_attention_layers=0, class_attention_heads=4):
         super().__init__()
 
         self.downsample = Downsample(input_dim, num_candidates, downsample_mode,
-                                     window_frames=train_length)
+                                     window_frames=train_length,
+                                     stages=downsample_stages)
 
-        self.num_candidates = num_candidates
+        # With strict halving N is derived from the window, not requested; the criterion
+        # reads N from the logits' shape, so the derived value is what takes effect.
+        self.num_candidates = self.downsample.num_candidates
+        if self.num_candidates != num_candidates:
+            print(f"[subset] downsample_stages={downsample_stages} derives "
+                  f"N={self.num_candidates} (requested {num_candidates})", flush=True)
 
         self.head = SubsetSelectionHead(
             feature_size=input_dim,
@@ -333,9 +341,14 @@ class SubsetHead(nn.Module):
     def forward(self, x):
         z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
         out = self.head(z.transpose(1, 2))     # the head wants channel-first
+        # The candidate grid spans padded_length frames, so on a short input t_hat is
+        # relative to the padding rather than to x. Rescale so callers can keep reading
+        # it as a fraction of what they passed in; candidates past 1.0 sit in the pad.
+        scale = self.downsample.time_scale(x.shape[1])
         # b_hat is softplus(u_j) from the precision head; the criterion adds b_min to
         # get the Laplace scale b_j.
-        return {"class_logits": out[0], "t_hat": out[1], "b_hat": out[2]}
+        t_hat = out[1] if scale == 1.0 else out[1] * scale
+        return {"class_logits": out[0], "t_hat": t_hat, "b_hat": out[2]}
 
 
 class SumHead(nn.Module):

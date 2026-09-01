@@ -54,6 +54,7 @@ class PLBeatThis(LightningModule):
         num_candidates: int = None,
         downsample_mode: str = "learned",
         train_length: int = 1500,
+        downsample_stages: int = None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         subset_kwargs: dict = None,
@@ -91,6 +92,7 @@ class PLBeatThis(LightningModule):
             downsample_mode=downsample_mode,
             train_length=train_length,
             fps=fps,
+            downsample_stages=downsample_stages,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
         )
@@ -322,7 +324,13 @@ class PLBeatThis(LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.subset_criterion is not None:
-            train_precision = batch_idx > self.max_epochs * 0.3
+            # Frozen for the first 30% of the RUN, then thawed: batch_idx counts
+            # batches within an epoch, so comparing it against an epoch count froze the
+            # head for the first 30 batches of every epoch and never for a 1-epoch run.
+            # The bias stays frozen for the whole run either way (see SubsetHead), so
+            # only the weights move -- the head can redistribute precision across
+            # candidates but not shift its overall scale.
+            train_precision = self.current_epoch >= self.max_epochs * 0.3
             self.model.task_heads.head.precision_head.weight.requires_grad_(train_precision)
 
         # run the model
