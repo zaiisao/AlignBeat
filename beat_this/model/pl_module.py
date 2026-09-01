@@ -8,6 +8,8 @@ from typing import Any
 
 import mir_eval
 import numpy as np
+import inspect
+
 import torch
 from pytorch_lightning import LightningModule
 
@@ -55,6 +57,7 @@ class PLBeatThis(LightningModule):
         downsample_mode: str = "learned",
         train_length: int = 1500,
         downsample_stages: int = None,
+        class_prior=None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         subset_kwargs: dict = None,
@@ -93,6 +96,7 @@ class PLBeatThis(LightningModule):
             train_length=train_length,
             fps=fps,
             downsample_stages=downsample_stages,
+            class_prior=class_prior,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
         )
@@ -105,7 +109,17 @@ class PLBeatThis(LightningModule):
         # selection. Nothing frame-wise applies, so the BCE variants below are skipped.
         self.subset_criterion = None
         if head_type == "subset":
-            self.subset_criterion = SubsetCriterion(**(subset_kwargs or {}))
+            # Checkpoints written before a knob was retired still carry it in their
+            # saved hyper_parameters, so drop anything the criterion no longer takes
+            # rather than refusing to load the run.
+            kwargs = dict(subset_kwargs or {})
+            accepted = set(inspect.signature(SubsetCriterion.__init__).parameters)
+            dropped = sorted(k for k in kwargs if k not in accepted)
+            if dropped:
+                print(f"[subset] ignoring retired criterion arguments from this "
+                      f"checkpoint: {', '.join(dropped)}", flush=True)
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+            self.subset_criterion = SubsetCriterion(**kwargs)
         elif loss_type == "shift_tolerant_weighted_bce":
             self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
                 pos_weight=pos_weights["beat"]

@@ -470,6 +470,51 @@ class BeatDataModule(pl.LightningDataModule):
             self.predict_dataset, batch_size=1, num_workers=self.num_workers
         )
 
+    def subset_class_prior(self, num_candidates, window_seconds,
+                           omega_downbeat=1.0, gamma=1.0):
+        """(p_DB, p_B, p_background) for the alignment head's classifier bias.
+
+        Measured on THIS FOLD'S TRAINING ITEMS ONLY -- the validation and test splits are
+        never touched, so the initialisation carries no information about them.
+
+        A candidate is a downbeat with probability E[M] * E[1/L] / N, a beat with
+        E[M] * (1 - E[1/L]) / N, and background otherwise, where E[M] is the expected
+        number of beats in a window. The weights then tilt it: a weighted cross-entropy
+        is minimised at q_c ~ omega_c * p_c, so folding omega and gamma in puts the
+        initial logits at the loss's own stationary point rather than at the raw
+        frequencies, which the loss would immediately pull away from.
+        """
+        items = self.train_dataset.items
+        beats = spanned = 0.0
+        downbeats = labelled_beats = 0
+        for item in items:
+            times = item["beat_time"]
+            if len(times) < 4:
+                continue
+            beats += len(times)
+            spanned += float(times[-1] - times[0])
+            if item["downbeat_mask"]:
+                labelled_beats += len(times)
+                downbeats += int((item["beat_value"] == 1).sum())
+        if spanned <= 0 or labelled_beats == 0:
+            raise ValueError("cannot measure a class prior from this training split")
+
+        expected_events = (beats / spanned) * window_seconds
+        downbeat_share = downbeats / labelled_beats
+        p_db = expected_events * downbeat_share / num_candidates
+        p_b = expected_events * (1.0 - downbeat_share) / num_candidates
+        p_bg = max(1.0 - p_db - p_b, 1e-6)
+
+        weighted = (omega_downbeat * p_db, p_b, gamma * p_bg)
+        total = sum(weighted)
+        prior = tuple(w / total for w in weighted)
+        print(f"[subset] class prior from {len(items)} training items: "
+              f"{beats / spanned * 60:.1f} BPM, downbeat share {downbeat_share:.3f} "
+              f"(mean meter {1 / downbeat_share:.2f}), N={num_candidates} -> "
+              f"raw ({p_db:.4f}, {p_b:.4f}, {p_bg:.4f}) -> "
+              f"weighted ({prior[0]:.4f}, {prior[1]:.4f}, {prior[2]:.4f})", flush=True)
+        return prior
+
     def get_train_positive_weights(self, widen_target_mask=3):
         """
         Computes the relation of negative targets to positive targets.

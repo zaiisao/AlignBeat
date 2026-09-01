@@ -38,6 +38,7 @@ class BeatThis(nn.Module):
         train_length: int = 1500,
         fps: int = 50,
         downsample_stages: int = None,
+        class_prior=None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
     ):
@@ -100,7 +101,7 @@ class BeatThis(nn.Module):
             self.task_heads = SubsetHead(
                 transformer_dim, num_candidates=num_candidates,
                 downsample_mode=downsample_mode, train_length=train_length, fps=fps,
-                downsample_stages=downsample_stages,
+                downsample_stages=downsample_stages, class_prior=class_prior,
                 class_attention_layers=class_attention_layers,
                 class_attention_heads=class_attention_heads)
         elif sum_head:
@@ -317,7 +318,7 @@ class SubsetHead(nn.Module):
     """Progressive downsample T -> N, then the order-preserving alignment head."""
 
     def __init__(self, input_dim, num_candidates, downsample_mode="learned",
-                 train_length=1500, fps=50, downsample_stages=None,
+                 train_length=1500, fps=50, downsample_stages=None, class_prior=None,
                  class_attention_layers=0, class_attention_heads=4):
         super().__init__()
 
@@ -332,9 +333,11 @@ class SubsetHead(nn.Module):
             print(f"[subset] downsample_stages={downsample_stages} derives "
                   f"N={self.num_candidates} (requested {num_candidates})", flush=True)
 
+        head_kwargs = {} if class_prior is None else {"class_prior": tuple(class_prior)}
         self.head = SubsetSelectionHead(
             feature_size=input_dim,
             window_seconds=train_length / float(fps),
+            **head_kwargs,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads)
 

@@ -64,12 +64,13 @@ def label(path):
 
 
 print(f"\n{'ckpt':>22} | {'A any':>6} {'B loc':>6} {'C fire':>6} {'D cls':>6} | "
-      f"{'DB ok':>6} {'DB->bg':>6} | {'spread':>7} {'|-unif|':>7}")
-print("-" * 96)
+      f"{'DB rec':>6} {'DB pre':>6} {'DB F1':>6} {'DB->bg':>6} | {'spread':>7} {'|-unif|':>7}")
+print("-" * 112)
 for path in paths:
     state = torch.load(path, map_location='cpu', weights_only=False)
     model.load_state_dict(state['state_dict'], strict=False)
     n = reach = loc = fired = right = db_n = db_ok = db_bg = 0
+    db_claimed = db_true = 0
     times = []
     for batch in batches:
         # The datamodule yields float16 spectrograms because training runs under
@@ -107,18 +108,27 @@ for path in paths:
             db_n += int(downbeat.sum())
             db_ok += int((predicted[downbeat] == DOWNBEAT).sum())
             db_bg += int((predicted[downbeat] == BACKGROUND).sum())
+            # ...and how many of the DOWNBEATS IT CLAIMS are real: raising omega_DB buys
+            # recall by calling more things downbeats, so recall alone cannot say whether
+            # it helped.
+            claimed = predicted == DOWNBEAT
+            db_claimed += int(claimed.sum())
+            db_true += int((gt_c[claimed] == DOWNBEAT).sum())
 
     stacked = np.stack(times)
     uniform = np.arange(1, stacked.shape[1] + 1) / stacked.shape[1]
     spread = stacked.std(axis=0).mean() * to_ms
     drift = np.abs(stacked - uniform).mean() * to_ms
     pct = lambda a, b: 100 * a / max(b, 1)
+    recall, precision = pct(db_ok, db_n), pct(db_true, db_claimed)
+    f1 = 2 * recall * precision / max(recall + precision, 1e-9)
     print(f"{label(path):>22} | {pct(reach,n):5.1f}% {pct(loc,n):5.1f}% "
           f"{pct(fired,n):5.1f}% {pct(right,fired):5.1f}% | "
-          f"{pct(db_ok,db_n):5.1f}% {pct(db_bg,db_n):5.1f}% | "
+          f"{recall:5.1f}% {precision:5.1f}% {f1:5.1f}% {pct(db_bg,db_n):5.1f}% | "
           f"{spread:6.1f}ms {drift:6.1f}ms")
 
-print("\nA = some candidate within tolerance   B = the MATCHED one is within tolerance")
+print("\nDB rec = of true downbeats, called downbeat   DB pre = of claimed downbeats, real")
+print("A = some candidate within tolerance   B = the MATCHED one is within tolerance")
 print("C = matched candidate is not background   D = its class is right, given it fired")
 print("spread = how much t_hat moves when the input changes (near 0 = input-independent)")
 print("|-unif| = how far t_hat has moved from its uniform initialisation")

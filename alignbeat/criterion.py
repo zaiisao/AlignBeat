@@ -1,4 +1,5 @@
 """The training loss (equation 8) and its EM dispatch (Algorithms 3-9)."""
+import math
 from typing import NamedTuple
 
 import numpy as np
@@ -7,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from alignbeat.classes import (BACKGROUND, BEAT, CLASS_UNKNOWN, DOWNBEAT,
-                               F_MEASURE_TOLERANCE)
+                               F_MEASURE_TOLERANCE, METER_PRIOR)
 from alignbeat.dp import (event_is_downbeat_under, phase_class_nll, phase_star,
                           subset_select_dp, subset_select_dp_joint_phase,
                           subset_select_dp_meter)
@@ -43,17 +44,13 @@ class SubsetCriterion(nn.Module):
     """Per-pair cost (3), the selection DP, and the training loss (8)."""
 
     def __init__(self,
-                 # loss (8): downbeat weight, and the weight on unmatched candidates
                  omega_downbeat=2.0, gamma=0.5,
                  normalize_by_events=NORMALIZE_BY_EVENTS,
-                 # per-candidate precision b_j
                  b_min=B_MIN,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
-                 # meter and phase: a fixed L, or latent over a candidate set
                  meter_length=0, meter_candidates=(), meter_prior=None,
                  joint_phase=False, mu_meter=0.0,
-                 # beat-only (B*) supervision
                  beat_only_warmup=BEAT_ONLY_WARMUP,
                  beat_only_confidence=BEAT_ONLY_CONFIDENCE):
         super(SubsetCriterion, self).__init__()
@@ -67,7 +64,18 @@ class SubsetCriterion(nn.Module):
 
         self.meter_length = meter_length
         self.meter_candidates = tuple(meter_candidates)
-        self.meter_prior = meter_prior
+        # log P(L, phi_0) = log P(L) - log L: the hypotheses are (L, phi_0) pairs and
+        # phase is uniform within a meter, so without the -log L a meter of L gets L
+        # times its share and the posterior drifts toward large meters.
+        self.meter_prior = None
+        if meter_prior is not None:
+            table = METER_PRIOR if meter_prior == "corpus" else dict(meter_prior)
+            keys = tuple(meter_candidates) or tuple(table)
+            total = sum(table.get(L, 0.0) for L in keys)
+            if total <= 0.0:
+                raise ValueError(f"meter_prior has no mass on candidates {keys}")
+            self.meter_prior = {int(L): math.log(table.get(L, 0.0) / total) - math.log(L)
+                                for L in keys if table.get(L, 0.0) > 0.0}
         self.joint_phase = joint_phase
         self.mu_meter = mu_meter
 
@@ -427,7 +435,9 @@ class SubsetCriterion(nn.Module):
                 continue
             allowed = range(meter) if phases is None else [
                 p for p in phases if 0 <= p < meter]
-            log_prior = 0.0 if self.meter_prior is None else float(self.meter_prior.get(meter, 0.0))
+            # Uniform over (L, phi_0) when no prior is given: -log L, not 0.
+            log_prior = (-math.log(meter) if self.meter_prior is None
+                         else self.meter_prior.get(meter, -float('inf')))
             for p in allowed:
                 score = torch.where(event_is_downbeat_under(M, meter, p, device),
                                     span[:, DOWNBEAT], span[:, BEAT]).sum() + log_prior

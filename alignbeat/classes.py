@@ -12,3 +12,8 @@ CLASS_UNKNOWN = -1
 # the precision head's initial scale, the loss's dead zone -- is this same quantity,
 # converted into whatever units that consumer works in. Nothing should hardcode it twice.
 F_MEASURE_TOLERANCE = 0.07
+
+# Meter distribution of the corpus, from docs/METER_DISTRIBUTION.md ("% of tracks with
+# downbeats", i.e. P(L | L was annotated) -- which is what the latent-meter posterior is
+# estimating for the beat-only sets). Renormalised over whichever candidates are offered.
+METER_PRIOR = {2: 0.0447, 3: 0.0838, 4: 0.8612, 6: 0.0068}

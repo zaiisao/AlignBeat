@@ -20,7 +20,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 from beat_this.dataset import BeatDataModule
-from alignbeat.downsample import (BPM_MAX, choose_num_candidates,
+from alignbeat.downsample import (BPM_MAX, choose_num_candidates, halved_candidates,
                                   n_candidates_from_tempo)
 from beat_this.model.pl_module import PLBeatThis
 
@@ -84,6 +84,12 @@ def main(args):
         no_val=not args.val,
         fold=args.fold,
     )
+    # The classifier's initial bias is measured from this fold's training items only --
+    # never validation or test -- so it leaks nothing about what it is scored on. It
+    # needs N, which is settled just below, so the datamodule is set up first.
+    args.class_prior = (tuple(float(v) for v in args.class_prior.split(","))
+                        if args.class_prior else None)
+
     if args.num_candidates is None:
         args.num_candidates = choose_num_candidates(
             args.train_length, args.fps, args.bpm_max)
@@ -115,6 +121,16 @@ def main(args):
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
+    if args.class_prior is None:
+        datamodule.setup("fit")
+        window_seconds = args.train_length / float(args.fps)
+        n_effective = args.num_candidates
+        if args.downsample_stages is not None:
+            n_effective = halved_candidates(args.train_length, args.downsample_stages)
+        args.class_prior = datamodule.subset_class_prior(
+            n_effective, window_seconds,
+            omega_downbeat=args.omega_db, gamma=args.gamma)
+
     pl_model = PLBeatThis(
         spect_dim=128,
         fps=50,
@@ -142,6 +158,7 @@ def main(args):
         downsample_mode=args.downsample_mode,
         train_length=args.train_length,
         downsample_stages=args.downsample_stages,
+        class_prior=args.class_prior,
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
         tau_beat=args.tau_beat,
@@ -156,6 +173,9 @@ def main(args):
             "omega_downbeat": args.omega_db,
             "joint_phase": args.joint_phase,
             "meter_length": args.meter_L,
+            "meter_candidates": (tuple(int(v) for v in args.meter_candidates.split(","))
+                                 if args.meter_candidates else ()),
+            "meter_prior": args.meter_prior or None,
             "mu_meter": args.mu_meter,
         },
     )
@@ -337,6 +357,15 @@ if __name__ == "__main__":
                         help="frames discarded either side of a chunk seam at whole-piece "
                              "inference; defaults to the dense arm's 2*tolerance so both "
                              "A/B arms decode under the same edge convention")
+    parser.add_argument("--class_prior", type=str, default="",
+                        help="classifier bias init, e.g. 0.1,0.3,0.6. Empty measures it "
+                             "from this fold's TRAINING split, weighted by --omega_db "
+                             "and --gamma so the init sits at the loss's own optimum.")
+    parser.add_argument("--meter_candidates", type=str, default="",
+                        help="latent meter: e.g. 2,3,4,6. Empty keeps L fixed at --meter_L")
+    parser.add_argument("--meter_prior", type=str, default="",
+                        help="'corpus' uses the measured meter distribution from "
+                             "docs/METER_DISTRIBUTION.md; empty is uniform over (L, phi_0)")
     parser.add_argument("--downsample_stages", type=int, default=None,
                         help="Strict halving: N is derived as ceil(T / 2**stages) "
                              "(1500 -> 750 -> 375 -> 188 for 3) instead of factorising "
