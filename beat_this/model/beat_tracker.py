@@ -36,9 +36,9 @@ class BeatThis(nn.Module):
         num_candidates: int = None,
         downsample_mode: str = "learned",
         train_length: int = 1500,
+        fps: int = 50,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
-        predict_precision: bool = False,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -98,10 +98,9 @@ class BeatThis(nn.Module):
             # JA: This is the bridge to our AlignBeat architecture
             self.task_heads = SubsetHead(
                 transformer_dim, num_candidates=num_candidates,
-                downsample_mode=downsample_mode, train_length=train_length,
+                downsample_mode=downsample_mode, train_length=train_length, fps=fps,
                 class_attention_layers=class_attention_layers,
-                class_attention_heads=class_attention_heads,
-                predict_precision=predict_precision)
+                class_attention_heads=class_attention_heads)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -109,6 +108,12 @@ class BeatThis(nn.Module):
 
         # init all weights
         self.apply(self._init_weights)
+
+        # ...then restore the subset head's own initialisation, which the generic pass
+        # above would otherwise overwrite: the class prior on the classifier bias, the
+        # zeroed regression/class/precision weights, and the precision head's scale.
+        if isinstance(self.task_heads, SubsetHead):
+            self.task_heads.head._initialize_weights()
 
     @staticmethod
     def make_stem(spect_dim: int, stem_dim: int) -> nn.Module:
@@ -310,8 +315,8 @@ class SubsetHead(nn.Module):
     """Progressive downsample T -> N, then the order-preserving alignment head."""
 
     def __init__(self, input_dim, num_candidates, downsample_mode="learned",
-                 train_length=1500, class_attention_layers=0, class_attention_heads=4,
-                 predict_precision=False):
+                 train_length=1500, fps=50, class_attention_layers=0,
+                 class_attention_heads=4):
         super().__init__()
 
         self.downsample = Downsample(input_dim, num_candidates, downsample_mode,
@@ -321,21 +326,16 @@ class SubsetHead(nn.Module):
 
         self.head = SubsetSelectionHead(
             feature_size=input_dim,
+            window_seconds=train_length / float(fps),
             class_attention_layers=class_attention_layers,
-            class_attention_heads=class_attention_heads,
-            predict_precision=predict_precision)
+            class_attention_heads=class_attention_heads)
 
     def forward(self, x):
         z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
         out = self.head(z.transpose(1, 2))     # the head wants channel-first
-        result = {"class_logits": out[0], "t_hat": out[1]}
-        if len(out) > 2:
-            # Section 4.1.2's raw per-candidate precision output u_j; the criterion
-            # applies b_j = b_min + softplus(u_j). Only present when the head was built
-            # with predict_precision, so its absence is how the criterion knows to fall
-            # back to the shared global b.
-            result["raw_precision"] = out[2]
-        return result
+        # b_hat is softplus(u_j) from the precision head; the criterion adds b_min to
+        # get the Laplace scale b_j.
+        return {"class_logits": out[0], "t_hat": out[1], "b_hat": out[2]}
 
 
 class SumHead(nn.Module):

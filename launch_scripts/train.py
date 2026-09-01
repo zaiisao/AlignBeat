@@ -143,7 +143,6 @@ def main(args):
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
         head_type=args.head_type,
-        predict_precision=args.predict_precision,
         head_lr=args.head_lr,
         quantize_targets=args.quantize_targets,
         num_candidates=args.num_candidates,
@@ -163,7 +162,6 @@ def main(args):
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
             "b_scale": args.b_scale,
-            "learn_b": args.learn_b,
             "joint_phase": args.joint_phase,
             "marginal": args.marginal,
             "marginal_background": not args.literal_eq23,
@@ -400,14 +398,10 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_r", type=float, default=0.0,
                         help="Section 10.4 eqs. (36)-(37): downbeat periodicity regularizer")
     parser.add_argument("--cont_weight", type=float, default=0.0)
-    parser.add_argument("--learn_b", action="store_true", default=False,
-                        help="Section 4.1 eq. (5): estimate the Laplace scale b by MLE")
     parser.add_argument("--literal_eq23", action="store_true", default=False,
                         help="use eq. (23) literally (-log Z alone); unbounded below")
     parser.add_argument("--marginal_meters", type=str, default="",
                         help="Section 8.6: e.g. 2-12 or 3,4,6; empty keeps L fixed")
-    parser.add_argument("--predict_precision", action="store_true", default=False,
-                        help="Section 4.1.2/4.1.3: per-candidate Laplace precision b_j")
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")

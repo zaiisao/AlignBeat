@@ -1,86 +1,123 @@
 {
-    // Args are copied verbatim from runs/fsub_fix.sh and runs/frozen_dense.sh, so a
-    // debug session is the real run. The only additions are debugger necessities:
-    //   --compile          (with no values) turns OFF torch.compile, which otherwise
-    //                      defaults to ["frontend","transformer_blocks","task_heads"]
-    //                      and traces away every breakpoint inside the model.
-    //   --num-workers 0    keeps the dataloader in-process so breakpoints there hit.
-    //   --name debug_*     so debug checkpoints do not collide with real runs.
-    // OMP/MKL/OPENBLAS thread caps mirror the run scripts.
+    // Args mirror the runs in runs/*.sh, so a debug session is the real run. Additions
+    // are debugger necessities only:
+    //   --compile        (no values) turns OFF torch.compile, which otherwise defaults to
+    //                    ["frontend","transformer_blocks","task_heads"] and traces away
+    //                    every breakpoint inside the model.
+    //   --num-workers 0  keeps the dataloader in-process so breakpoints there hit.
+    //   --name debug_*   so debug checkpoints do not collide with real runs.
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train: subset head (runs/fsub_fix.sh)",
+            "name": "train: subset, N=250 derived (runs/new250.sh)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
             "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}",
-                "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"
-            },
+            "env": {"PYTHONPATH": "${workspaceFolder}",
+                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
             "args": [
-                "--name", "debug_fsub_fix", "--head_type", "subset",
-                "--gpu", "1", "--fold", "0", "--seed", "0",
+                "--name", "debug_new250", "--gpu", "3", "--fold", "0", "--seed", "0",
                 "--max-epochs", "20", "--lr", "0.0003",
                 "--batch-size", "8", "--accumulate-grad-batches", "8",
                 "--num-workers", "0", "--logger", "none",
                 "--val-frequency", "10000", "--snapshot_every", "3",
-                "--num_candidates", "188",
-                "--class_attention_layers", "1", "--omega_db", "4", "--learn_b",
-                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt",
-                "--freeze_encoder",
+                // N omitted: derived from --bpm_max 340 and --train_length 1500 -> 250
+                "--head_type", "subset", "--downsample_mode", "learned",
+                "--class_attention_layers", "1", "--omega_db", "4",
+                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt", "--freeze_encoder",
                 "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train: dense head (runs/frozen_dense.sh)",
+            "name": "train: subset, N=188 explicit (runs/new188.sh)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
             "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}",
-                "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"
-            },
+            "env": {"PYTHONPATH": "${workspaceFolder}",
+                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
             "args": [
-                "--name", "debug_frozen_dense", "--head_type", "dense",
-                "--gpu", "0", "--fold", "0", "--seed", "0",
+                "--name", "debug_new188", "--gpu", "3", "--fold", "0", "--seed", "0",
                 "--max-epochs", "20", "--lr", "0.0003",
                 "--batch-size", "8", "--accumulate-grad-batches", "8",
                 "--num-workers", "0", "--logger", "none",
-                "--val-frequency", "10000", "--snapshot_every", "5",
-                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt",
-                "--freeze_encoder",
+                "--val-frequency", "10000", "--snapshot_every", "3",
+                "--head_type", "subset", "--downsample_mode", "learned",
+                "--num_candidates", "188",
+                "--class_attention_layers", "1", "--omega_db", "4", "--learn_b",
+                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt", "--freeze_encoder",
                 "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "diagnose_bottleneck (attribute a flat F)",
+            "name": "train: dense control (runs/newdense.sh)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/diagnose_bottleneck.py",
+            "program": "${workspaceFolder}/launch_scripts/train.py",
             "cwd": "${workspaceFolder}",
-            "env": {"PYTHONPATH": "${workspaceFolder}"},
+            "env": {"PYTHONPATH": "${workspaceFolder}",
+                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
             "args": [
-                "--checkpoints", "checkpoints/debug_fsub_fix*.ckpt",
-                "--songs", "16", "--num-workers", "0", "--gpu", "1"
+                "--name", "debug_newdense", "--gpu", "3", "--fold", "0", "--seed", "0",
+                "--max-epochs", "20", "--lr", "0.0003",
+                "--batch-size", "8", "--accumulate-grad-batches", "8",
+                "--num-workers", "0", "--logger", "none",
+                "--val-frequency", "10000", "--snapshot_every", "3",
+                "--head_type", "dense",
+                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt", "--freeze_encoder",
+                "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "compute_paper_metrics (score a checkpoint)",
+            "name": "train: thaw the encoder (runs/thaw3e5.sh)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}",
+                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
+            "args": [
+                "--name", "debug_thaw", "--gpu", "3", "--fold", "0", "--seed", "0",
+                "--head_type", "subset", "--downsample_mode", "learned",
+                "--num_candidates", "188",
+                "--class_attention_layers", "1", "--omega_db", "4", "--learn_b",
+                // encoder slow, head fast -- no --freeze_encoder here
+                "--max-epochs", "12", "--lr", "0.00003", "--head_lr", "0.0003",
+                "--batch-size", "8", "--accumulate-grad-batches", "8",
+                "--num-workers", "0", "--logger", "none",
+                "--val-frequency", "10000", "--snapshot_every", "2",
+                "--init_all_from", "${workspaceFolder}/checkpoints/new188 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=017.ckpt",
+                "--compile"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "score: compute_paper_metrics (val, whole-piece)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/compute_paper_metrics.py",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"},
-            "args": ["--models", "checkpoints/debug_fsub_fix*.ckpt", "--gpu", "1"],
+            "args": ["--models", "${workspaceFolder}/checkpoints/new188 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=017.ckpt", "--gpu", "3", "--num_workers", "0", "--datasplit", "val"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "diagnose_bottleneck (A/B/C/D breakdown)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diagnose_bottleneck.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
+            "args": ["--checkpoints", "${workspaceFolder}/checkpoints/new188 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=017.ckpt", "--songs", "16", "--num-workers", "0", "--gpu", "3"],
             "console": "integratedTerminal",
             "justMyCode": false
         },

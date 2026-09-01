@@ -5,6 +5,18 @@ from pathlib import Path
 import numpy as np
 from pytorch_lightning import Trainer, seed_everything
 
+# Same shim as launch_scripts/train.py: our checkpoints carry numpy scalars, dtypes
+# and PosixPaths in hyper_parameters, and torch >= 2.6 loads with weights_only=True by
+# default, which refuses them. Allowlisting the individual globals is a moving target,
+# so restore the pre-2.6 default for this path. Safe here: these are checkpoints this
+# repo wrote. Do NOT copy this into anything that loads third-party checkpoints.
+import torch
+_torch_load = torch.load
+def _load_trusted(*a, **k):
+    k["weights_only"] = False
+    return _torch_load(*a, **k)
+torch.load = _load_trusted
+
 from beat_this.dataset import BeatDataModule
 from beat_this.inference import load_checkpoint
 from beat_this.model.pl_module import PLBeatThis

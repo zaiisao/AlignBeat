@@ -45,7 +45,6 @@ class PLBeatThis(LightningModule):
         sum_head=True,
         partial_transformers=True,
         head_type: str = "dense",
-        predict_precision: bool = False,
         head_lr: float = 0.0,
         quantize_targets: bool = False,
         stitch_border: int = None,
@@ -91,9 +90,9 @@ class PLBeatThis(LightningModule):
             num_candidates=num_candidates,
             downsample_mode=downsample_mode,
             train_length=train_length,
+            fps=fps,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
-            predict_precision=predict_precision,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -206,12 +205,12 @@ class PLBeatThis(LightningModule):
 
     def _compute_loss(self, batch, model_prediction):
         if self.subset_criterion is not None:
-            raw_precision = model_prediction.get("raw_precision")
             losses, _stats = self.subset_criterion(
                 model_prediction["class_logits"].float(),
                 model_prediction["t_hat"].float(),
-                self._subset_targets(batch),
-                None if raw_precision is None else raw_precision.float())
+                model_prediction["b_hat"].float(),
+                self._subset_targets(batch))
+
             # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
             # are unchanged; they carry the class and timing terms of loss (8).
             return {"beat": losses["class"], "downbeat": losses["time"],
@@ -316,9 +315,19 @@ class PLBeatThis(LightningModule):
                 sync_dist=True,
             )
 
+    def on_fit_start(self):
+        # The criterion's warm-up is a fraction of the run, so it needs the run's length.
+        if self.subset_criterion is not None:
+            self.subset_criterion.set_total_steps(self.trainer.estimated_stepping_batches)
+
     def training_step(self, batch, batch_idx):
+        if self.subset_criterion is not None:
+            train_precision = batch_idx > self.max_epochs * 0.3
+            self.model.task_heads.head.precision_head.weight.requires_grad_(train_precision)
+
         # run the model
         model_prediction = self.model(batch["spect"])
+
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
         self.log_losses(losses, len(batch["spect"]), "train")

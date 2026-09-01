@@ -39,10 +39,19 @@ class Downsample(nn.Module):
                 raise ValueError("mode='learned' needs window_frames (T) to size the "
                                  "stride; avg/max are adaptive and do not")
 
-            self.kernel = math.ceil(window_frames / num_candidates)
-            self.padded_length = self.kernel * num_candidates
-            self.conv = nn.Conv1d(d_model, d_model,
-                                  kernel_size=self.kernel, stride=self.kernel)
+            # Halve the length once per layer (1500 -> 750 -> 375) instead of
+            # collapsing T/N frames in a single stride: the same receptive field is
+            # reached with fewer parameters and a nonlinearity in between.
+            self.num_stages = max(1, round(math.log2(window_frames / num_candidates)))
+            self.kernel = 2
+            self.padded_length = num_candidates * 2 ** self.num_stages
+
+            layers = []
+            for i in range(self.num_stages):
+                if i > 0:
+                    layers.append(nn.GELU())
+                layers.append(nn.Conv1d(d_model, d_model, kernel_size=2, stride=2))
+            self.conv = nn.Sequential(*layers)
 
     def forward(self, x):
         x = x.transpose(1, 2) # (B, T, d) -> (B, d, T)
@@ -51,7 +60,7 @@ class Downsample(nn.Module):
             z = F.adaptive_avg_pool1d(x, self.num_candidates)
         elif self.mode == "max":
             z = F.adaptive_max_pool1d(x, self.num_candidates)
-        else:
+        elif self.mode == "learned":
             if x.shape[-1] != self.padded_length:
                 if x.shape[-1] < self.padded_length:
                     x = F.pad(x, (0, self.padded_length - x.shape[-1]))
@@ -59,6 +68,8 @@ class Downsample(nn.Module):
                     x = x[..., :self.padded_length]
 
             z = self.conv(x)
+        else:
+            raise NotImplementedError
 
         return z.transpose(1, 2)                 # (B, N, d)
 

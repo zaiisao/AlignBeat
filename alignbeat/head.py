@@ -1,22 +1,31 @@
 """Prediction architecture (section 3): candidates, and equation (1)."""
+import math
+
 import torch
 import torch.nn as nn
 
-from alignbeat.classes import NUM_CLASSES
+from alignbeat.classes import F_MEASURE_TOLERANCE, NUM_CLASSES
 
 
 # ---------------------------------------------------------------------------
 # Prediction architecture (section 3)
 # ---------------------------------------------------------------------------
 
+def softplus_inverse(y):
+    """The u with softplus(u) = y. The head emits u; the criterion uses b = softplus(u)."""
+    return math.log(math.expm1(y))
+
+
 class SubsetSelectionHead(nn.Module):
     """Encoder features -> N candidates -> (class logits, monotone times)."""
 
     def __init__(self, feature_size=256, hidden_size=256,
-                 class_prior=(0.10, 0.30, 0.60),
-                 class_attention_layers=0, class_attention_heads=4,
-                 predict_precision=False):
+                 class_prior=(0.10, 0.30, 0.60), window_seconds=30.0,
+                 class_attention_layers=0, class_attention_heads=4):
         super(SubsetSelectionHead, self).__init__()
+
+        self.window_seconds = float(window_seconds)
+        self.class_prior = class_prior
 
         self.input_norm = nn.LayerNorm(feature_size)
         self.trunk = nn.Linear(feature_size, hidden_size)
@@ -31,11 +40,13 @@ class SubsetSelectionHead(nn.Module):
 
         self.class_head = nn.Linear(hidden_size, 3) # JA: 3 classes: downbeat, beat, background
         self.regression_head = nn.Linear(hidden_size, 1)
-        self.precision_head = nn.Linear(hidden_size, 1) if predict_precision else None
+        self.precision_head = nn.Linear(hidden_size, 1)
 
-        self._initialize_weights(class_prior)
+        self._initialize_weights()
 
-    def _initialize_weights(self, class_prior):
+    def _initialize_weights(self):
+        """Re-runnable: BeatThis applies a generic init after building the heads, which
+        would otherwise overwrite every deliberate choice below."""
         attention_modules = set()
         if self.candidate_attention is not None:
             attention_modules = {id(m) for m in self.candidate_attention.modules()}
@@ -55,9 +66,20 @@ class SubsetSelectionHead(nn.Module):
         nn.init.zeros_(self.regression_head.weight)
         nn.init.zeros_(self.regression_head.bias)
         nn.init.zeros_(self.class_head.weight)
+        nn.init.zeros_(self.precision_head.weight)
 
-        prior = torch.tensor(class_prior, dtype=torch.float32)
-        self.class_head.bias.data = torch.log(prior / prior.sum())
+        prior = torch.tensor(self.class_prior, dtype=torch.float32)
+        with torch.no_grad():
+            self.class_head.bias.copy_(torch.log(prior / prior.sum()))
+
+        # t_hat and the targets live on (0, 1] over the window, so the tolerance has to
+        # cross into that unit before it can be a scale: 0.07 s of a 30 s window is
+        # 0.00233. The head emits u and the criterion takes softplus(u), so invert it.
+        b_initial = F_MEASURE_TOLERANCE / self.window_seconds
+        nn.init.constant_(self.precision_head.bias, softplus_inverse(b_initial))
+        # Frozen for the whole run: only the weights thaw, so the head can redistribute
+        # precision across candidates but never shift its overall scale.
+        self.precision_head.bias.requires_grad_(False)
 
     def forward(self, x):
         """x: (B, C, N) candidate features from Downsample, one token per candidate."""
@@ -72,11 +94,11 @@ class SubsetSelectionHead(nn.Module):
         z_class = z if self.candidate_attention is None else self.candidate_attention(z)
         class_logits = self.class_head(z_class)         # (B, N, 3)
 
-        if self.precision_head is None:
-            return class_logits, t_hat
+        b_hat_logit = self.precision_head(z).squeeze(dim=2)
+        b_hat = nn.functional.softplus(b_hat_logit)
 
         # Raw output u_j; the criterion applies b_j = b_min + softplus(u_j).
-        return class_logits, t_hat, self.precision_head(z).squeeze(dim=2)
+        return class_logits, t_hat, b_hat
 
 
 def monotonic_times(r, alpha=1e-3):

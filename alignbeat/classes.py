@@ -1,4 +1,4 @@
-"""Class labels and the shared log-probability floor."""
+"""Class labels, the beat tolerance, and the shared log-probability floor."""
 
 DOWNBEAT = 0
 BEAT = 1
@@ -8,6 +8,7 @@ NUM_CLASSES = 3
 # Beat-only annotations: "some beat occurred", B/DB unresolved (the B* label).
 CLASS_UNKNOWN = -1
 
-# -log p is clamped here before entering the DP, so one confident wrong candidate
-# cannot dominate the matching cost.
-LOG_PROB_FLOOR = -60.0
+# The standard beat-tracking F-measure tolerance, in SECONDS. Everything downstream --
+# the precision head's initial scale, the loss's dead zone -- is this same quantity,
+# converted into whatever units that consumer works in. Nothing should hardcode it twice.
+F_MEASURE_TOLERANCE = 0.07

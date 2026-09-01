@@ -54,6 +54,7 @@ def subset_select_dp(cost, return_cost=False):
     M, N = cost.shape
     if M == 0:
         return np.empty(0, dtype=np.int64)
+
     if M > N:
         raise ValueError(
             f"infeasible correspondence: {M} ground-truth events but only {N} "
@@ -61,6 +62,8 @@ def subset_select_dp(cost, return_cost=False):
 
     if _HAVE_NUMBA:
         choice = np.zeros((M + 1, N + 1), dtype=np.int32)
+
+        # JA: final means the total cost of the transition stored in D[N, M]
         final = _dp_kernel(np.ascontiguousarray(cost), choice)
         sigma = np.empty(M, dtype=np.int64)
         j = N

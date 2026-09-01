@@ -271,7 +271,9 @@ def test_em_posterior_matches_brute_force_and_couples_events():
 
 
 def test_segment_posteriors_use_only_their_own_events():
-    """Equation (17): each segment's posterior sees its own events and nothing else."""
+    """Equation (17): each segment's posterior sees its own events and nothing else, and
+    only the first segment's phase is free -- a later segment begins where the time
+    signature changes, which is a bar line, so its phi_0 is 0 by construction."""
     from alignbeat.criterion import SubsetCriterion
 
     def criterion(meter):
@@ -281,9 +283,17 @@ def test_segment_posteriors_use_only_their_own_events():
     matched_log = torch.log_softmax(torch.randn(7, 3, dtype=torch.float64) * 2, dim=-1)
     mixed, mixed_valid = criterion(0)._phase_posterior_marginal(matched_log, segments=[(0, 2), (3, 3)])
     assert bool(mixed_valid.all())
+    # First segment: the window crop lands anywhere in a bar, so every phase is open and
+    # the result matches the standalone posterior over the same events.
     assert torch.allclose(mixed[:3], criterion(2)._phase_posterior_marginal(matched_log[:3])[0])
-    assert torch.allclose(mixed[3:], criterion(3)._phase_posterior_marginal(matched_log[3:])[0])
-    print("ok: mixed-meter segment posteriors (17) factor across segments")
+    # Later segment: phi_0 = 0 is the only hypothesis, so r is the deterministic pattern.
+    assert torch.allclose(mixed[3:], event_is_downbeat_under(4, 3, 0, None).to(mixed.dtype))
+    # ...and it still depends on nothing outside its own events.
+    shifted = matched_log.clone()
+    shifted[:3] = torch.log_softmax(torch.randn(3, 3, dtype=torch.float64) * 2, dim=-1)
+    again, _ = criterion(0)._phase_posterior_marginal(shifted, segments=[(0, 2), (3, 3)])
+    assert torch.allclose(again[3:], mixed[3:])
+    print("ok: mixed-meter segment posteriors (17) factor across segments, phi_0=0 after the first")
 
 
 def test_joint_loss_is_differentiable():
