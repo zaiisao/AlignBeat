@@ -10,16 +10,15 @@ from alignbeat.criterion import SubsetCriterion
 GOLDEN = os.path.join(os.path.dirname(__file__), '_criterion_golden.pt')
 
 # (label, criterion kwargs) -- the flag combinations that actually get trained
+# v1 ships class + time + background. learn_b, the marginal objective (Alg. 4), the
+# periodicity term and the continuity term are all retired; git history has them.
 CONFIGS = [
     ("default",        dict(gamma=0.5, omega_downbeat=2.0)),
     ("omega4",         dict(gamma=0.5, omega_downbeat=4.0)),
-    ("learn_b",        dict(gamma=0.5, omega_downbeat=4.0, learn_b=True)),
     ("beat_only_em",   dict(gamma=0.5, meter_length=4, beat_only_warmup=0)),
     ("joint_phase",    dict(gamma=0.5, meter_length=4, joint_phase=True, beat_only_warmup=0)),
-    ("marginal",       dict(gamma=0.5, marginal=True)),
+    ("latent_meter",   dict(gamma=0.5, meter_candidates=(2, 3, 4, 6), beat_only_warmup=0)),
     ("no_normalize",   dict(gamma=0.5, normalize_by_events=False)),
-    ("periodicity",    dict(gamma=0.5, meter_length=4, lambda_r=0.1)),
-    ("continuity",     dict(gamma=0.5, cont_weight=0.1)),
 ]
 
 # (label, batch, N, list of per-fragment M, label mode) -- includes the edge cases
@@ -58,7 +57,7 @@ def run_case(cfg_kwargs, seed, shape):
     _, batch, N, Ms, mode = shape
     logits, t_hat, targets = build(seed, batch, N, Ms, mode)
     crit = SubsetCriterion(**cfg_kwargs)
-    losses, stats = crit(logits, t_hat, targets)
+    losses, stats = crit(logits, t_hat, torch.full_like(t_hat, 0.00233), targets)
     out = {k: v.detach().clone() for k, v in losses.items() if torch.is_tensor(v)}
     total = losses["total"]
     grad = torch.zeros_like(logits)

@@ -317,11 +317,6 @@ class PLBeatThis(LightningModule):
                 sync_dist=True,
             )
 
-    def on_fit_start(self):
-        # The criterion's warm-up is a fraction of the run, so it needs the run's length.
-        if self.subset_criterion is not None:
-            self.subset_criterion.set_total_steps(self.trainer.estimated_stepping_batches)
-
     def training_step(self, batch, batch_idx):
         if self.subset_criterion is not None:
             # Frozen for the first 30% of the RUN, then thawed: batch_idx counts

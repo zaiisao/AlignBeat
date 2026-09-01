@@ -115,14 +115,6 @@ def main(args):
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
-    if args.marginal_meters:
-        text = args.marginal_meters
-        args.marginal_meters = (tuple(range(int(text.split('-')[0]), int(text.split('-')[1]) + 1))
-                                if '-' in text else tuple(int(v) for v in text.split(',')))
-        args.marginal = True
-    else:
-        args.marginal_meters = ()
-
     pl_model = PLBeatThis(
         spect_dim=128,
         fps=50,
@@ -158,20 +150,13 @@ def main(args):
         # Every SubsetCriterion knob is passed explicitly. A construction that is
         # implemented but has no path from the CLI is worse than one that is absent:
         # an ablation of it shows no difference and reads as "the idea does not help",
-        # when in fact it never ran. --lambda_r was exactly that until now.
+        # when in fact it never ran.
         subset_kwargs={
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
-            "b_scale": args.b_scale,
             "joint_phase": args.joint_phase,
-            "marginal": args.marginal,
-            "marginal_background": not args.literal_eq23,
-            "marginal_meters": args.marginal_meters,
             "meter_length": args.meter_L,
             "mu_meter": args.mu_meter,
-            "lambda_r": args.lambda_r,
-            "cont_weight": args.cont_weight,
-            "tol_flat": args.tol_flat,
         },
     )
     # --- frozen-encoder head swap -------------------------------------------------
@@ -378,10 +363,6 @@ if __name__ == "__main__":
                         help="separate lr for the head (task_heads + criterion); 0 = use --lr "
                              "for everything. Lets the encoder train at the rate that suits "
                              "it while the head keeps a rate it is stable at.")
-    parser.add_argument("--tol_flat", type=float, default=0.0,
-                        help="flat-bottomed time loss: residuals below this (normalised "
-                             "window units) cost nothing and give no gradient. 0.002355 "
-                             "= mir_eval's 70ms tolerance over a 29.72s window.")
     parser.add_argument("--init_all_from", type=str, default="",
                         help="load the FULL model (encoder+head) from a checkpoint, with a "
                              "fresh optimizer and schedule; for thawing a converged pair")
@@ -394,19 +375,10 @@ if __name__ == "__main__":
                              "Algorithm 10's plain argmax. See decode_events.")
     parser.add_argument("--gamma", type=float, default=0.5)
     parser.add_argument("--omega_db", type=float, default=2.0)
-    parser.add_argument("--b_scale", type=float, default=0.005)
     parser.add_argument("--joint_phase", action="store_true", default=False)
-    parser.add_argument("--marginal", action="store_true", default=False)
     parser.add_argument("--meter_L", type=int, default=0)
     parser.add_argument("--mu_meter", type=float, default=0.0,
                         help="Section 4.2 eq. (6): known-meter spacing inside the selection")
-    parser.add_argument("--lambda_r", type=float, default=0.0,
-                        help="Section 10.4 eqs. (36)-(37): downbeat periodicity regularizer")
-    parser.add_argument("--cont_weight", type=float, default=0.0)
-    parser.add_argument("--literal_eq23", action="store_true", default=False,
-                        help="use eq. (23) literally (-log Z alone); unbounded below")
-    parser.add_argument("--marginal_meters", type=str, default="",
-                        help="Section 8.6: e.g. 2-12 or 3,4,6; empty keeps L fixed")
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")

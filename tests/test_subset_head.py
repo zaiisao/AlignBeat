@@ -8,11 +8,21 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.classes import BACKGROUND, BEAT, DOWNBEAT
+from alignbeat.classes import F_MEASURE_TOLERANCE, BACKGROUND, BEAT, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
 from alignbeat.decode import decode_events, intervals_to_events, targets_to_events
 from alignbeat.dp import subset_select_dp, subset_select_logsumexp
 from alignbeat.head import SubsetSelectionHead, monotonic_times
+
+
+def b_hat_like(t_hat):
+    """The precision head's raw output for a fixed scale.
+
+    SubsetCriterion.forward now takes b_hat between t_hat and the targets, and applies
+    b_j = b_min + b_hat. These tests predate the per-candidate scale and assume one
+    fixed b, so hand it a constant; 0.07 s of a 30 s window is the head's own init.
+    """
+    return torch.full_like(t_hat, F_MEASURE_TOLERANCE / 30.0)
 
 
 def brute_force_select(cost):
@@ -208,7 +218,7 @@ def test_criterion_rewards_a_perfect_prediction():
     classes = torch.tensor([DOWNBEAT, BEAT, BEAT, BEAT])
     targets = [{'classes': classes, 'times': times}]
 
-    criterion = SubsetCriterion(b_scale=0.05, gamma=0.5)
+    criterion = SubsetCriterion(gamma=0.5)
 
     # Perfect: uniform grid t_hat = j/N puts candidates exactly on 0.1/0.2/0.3/0.4
     # (indices 2, 5, 8, 11 with N=32 -> 3/32... so instead force r to place them).
@@ -220,8 +230,8 @@ def test_criterion_rewards_a_perfect_prediction():
         logits[0, slot, BACKGROUND] = -6.0
         logits[0, slot, int(cls)] = 6.0
 
-    good, good_stats = criterion(logits, t_hat, targets)
-    bad, _ = criterion(torch.zeros(1, N, 3), t_hat, targets)
+    good, good_stats = criterion(logits, t_hat, b_hat_like(t_hat), targets)
+    bad, _ = criterion(torch.zeros(1, N, 3), t_hat, b_hat_like(t_hat), targets)
     good_loss, bad_loss = float(good['total']), float(bad['total'])
     assert good_loss < bad_loss, (good_loss, bad_loss)
     assert torch.allclose(good['total'], good['class'] + good['time'] + good['background'])
@@ -240,7 +250,7 @@ def test_criterion_handles_empty_and_infeasible_fragments():
          'times': torch.linspace(0, 1, N + 5)},
     ]
     criterion = SubsetCriterion()
-    losses, stats = criterion(logits, t_hat, targets)
+    losses, stats = criterion(logits, t_hat, b_hat_like(t_hat), targets)
     assert torch.isfinite(losses['total'])
     assert stats['infeasible'] == 1
     print("ok: empty and over-dense fragments do not crash")
@@ -255,7 +265,7 @@ def test_criterion_gradients_flow_only_where_expected():
     t_hat = monotonic_times(r)
     targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
                 'times': torch.tensor([0.25, 0.75])}]
-    losses, _ = SubsetCriterion(b_scale=0.05)(logits, t_hat, targets)
+    losses, _ = SubsetCriterion()(logits, t_hat, b_hat_like(t_hat), targets)
     losses['total'].backward()
     assert logits.grad is not None and torch.any(logits.grad != 0)
     assert r.grad is not None and torch.any(r.grad != 0)
@@ -265,7 +275,7 @@ def test_criterion_gradients_flow_only_where_expected():
 
 def test_head_shapes_and_monotonicity_end_to_end():
     head = SubsetSelectionHead(feature_size=32)
-    logits, t_hat = head(torch.randn(2, 32, 160))
+    logits, t_hat, b_hat = head(torch.randn(2, 32, 160))
     assert logits.shape == (2, 160, 3)
     assert t_hat.shape == (2, 160)
     assert torch.all(t_hat[:, 1:] > t_hat[:, :-1])
@@ -357,8 +367,9 @@ def test_beat_only_end_to_end_trains_without_crashing():
     r = torch.randn(1, N, requires_grad=True)
     targets = [{'classes': torch.full((6,), CLASS_UNKNOWN, dtype=torch.long),
                 'times': torch.linspace(0.1, 0.9, 6)}]
-    crit = SubsetCriterion(b_scale=0.05, beat_only_warmup=0)
-    losses, stats = crit(logits, monotonic_times(r), targets)
+    crit = SubsetCriterion(beat_only_warmup=0)
+    t_hat_r = monotonic_times(r)
+    losses, stats = crit(logits, t_hat_r, b_hat_like(t_hat_r), targets)
     losses['total'].backward()
     assert torch.isfinite(losses['total'])
     assert stats['unlabelled_events'] == 6
@@ -374,7 +385,7 @@ def test_log_prob_floor_keeps_dp_cost_finite():
     logits[0, :, BACKGROUND] = -400.0
     t_hat = monotonic_times(torch.zeros(1, N))
     targets = [{'classes': torch.tensor([BEAT, BEAT]), 'times': torch.tensor([0.25, 0.75])}]
-    losses, stats = SubsetCriterion()(logits, t_hat, targets)
+    losses, stats = SubsetCriterion()(logits, t_hat, b_hat_like(t_hat), targets)
     assert torch.isfinite(losses['total']), "clamping must keep the loss finite"
     assert stats['infeasible'] == 0, "must not lose the batch"
     print("ok: extreme logits no longer produce a non-finite DP cost")
@@ -403,7 +414,7 @@ def test_non_finite_cost_raises_rather_than_masking():
     targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
                 'times': torch.tensor([0.3, 0.7])}] * 2
     try:
-        SubsetCriterion(b_scale=0.005)(logits, t_hat, targets)
+        SubsetCriterion()(logits, t_hat, b_hat_like(t_hat), targets)
     except FloatingPointError as exc:
         assert "NaN/Inf" in str(exc)
         print("ok: a non-finite matching cost raises instead of being skipped")
@@ -422,7 +433,7 @@ def test_non_finite_logits_also_raise():
     targets = [{'classes': torch.tensor([BEAT, DOWNBEAT]),
                 'times': torch.tensor([0.3, 0.7])}] * 2
     try:
-        SubsetCriterion(b_scale=0.005)(logits, t_hat, targets)
+        SubsetCriterion()(logits, t_hat, b_hat_like(t_hat), targets)
     except FloatingPointError:
         print("ok: non-finite class logits raise too")
         return

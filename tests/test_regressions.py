@@ -22,11 +22,11 @@ def _targets(M=40, seed=0):
     return logits, t_hat, tg
 
 
-def test_marginal_class_term_has_gradient():
-    """-log Z must differentiate into the CLASS logits."""
+def test_class_term_has_gradient():
+    """The class term must differentiate into the CLASS logits."""
     logits, t_hat, tg = _targets()
-    losses, _ = SubsetCriterion(marginal=True)(logits, t_hat, tg)
-    assert losses['class'].requires_grad, "marginal class term is detached"
+    losses, _ = SubsetCriterion()(logits, t_hat, torch.full_like(t_hat, 0.00233), tg)
+    assert losses['class'].requires_grad, "class term is detached"
     g = torch.autograd.grad(losses['class'], logits, retain_graph=True)[0]
     assert float(g.abs().mean()) > 1e-6, "no gradient reaches the class logits"
 
@@ -48,16 +48,18 @@ def test_logsumexp_batched_matches_per_fragment():
 
 
 def test_flags_reach_the_criterion():
-    """Four flags have silently failed to arrive at the criterion. Check the plumbing."""
+    """Flags have silently failed to arrive at the criterion before. Check the plumbing."""
     from beat_this.model.pl_module import PLBeatThis
     m = PLBeatThis(
         head_type="subset", transformer_dim=64, n_layers=2,
         num_candidates=188,
-        subset_kwargs=dict(mu_meter=1e5, lambda_r=200.0, cont_weight=0.5,
-                           joint_phase=True, meter_length=4, marginal=True))
+        subset_kwargs=dict(mu_meter=1e5, joint_phase=True, meter_length=4,
+                           meter_candidates=(2, 3, 4, 6), omega_downbeat=4.0,
+                           beat_only_confidence=0.9))
     c = m.subset_criterion
-    assert c.mu_meter == 1e5 and c.lambda_r == 200.0 and c.cont_weight == 0.5
-    assert c.joint_phase and c.meter_length == 4 and c.marginal
+    assert c.mu_meter == 1e5 and c.joint_phase and c.meter_length == 4
+    assert c.meter_candidates == (2, 3, 4, 6)
+    assert c.omega_downbeat == 4.0 and c.beat_only_confidence == 0.9
 
 
 def test_meter_dp_matches_brute_force():
@@ -106,12 +108,13 @@ def test_posterior_matches_brute_force():
     assert torch.allclose(subset_posterior_marginals(cost), w / Z, atol=1e-7)
 
 
-def test_defaults_unchanged():
-    """Every new term must be inert at defaults, or old runs are not reproducible."""
+def test_defaults_are_the_three_shipped_terms():
+    """v1 ships class + time + background and nothing else; continuity and periodicity
+    are retired, so their absence is the property to hold, not their being zero."""
     logits, t_hat, tg = _targets()
-    losses, _ = SubsetCriterion()(logits, t_hat, tg)
-    for key in ('continuity', 'periodicity'):
-        assert float(losses[key]) == 0.0, f"{key} is active at defaults"
+    losses, _ = SubsetCriterion()(logits, t_hat, torch.full_like(t_hat, 0.00233), tg)
+    assert set(losses) == {'class', 'time', 'background', 'total'}, sorted(losses)
+    assert all(torch.isfinite(v) for v in losses.values())
 
 
 if __name__ == "__main__":

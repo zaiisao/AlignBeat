@@ -8,16 +8,13 @@ import torch.nn.functional as F
 
 from alignbeat.classes import (BACKGROUND, BEAT, CLASS_UNKNOWN, DOWNBEAT,
                                F_MEASURE_TOLERANCE)
-from alignbeat.dp import (event_is_downbeat_under, joint_phase_log_partition,
-                          meter_joint_log_partition, phase_class_nll, phase_star,
+from alignbeat.dp import (event_is_downbeat_under, phase_class_nll, phase_star,
                           subset_select_dp, subset_select_dp_joint_phase,
-                          subset_select_dp_meter, subset_select_logsumexp)
+                          subset_select_dp_meter)
 
 
 # Nothing -- no CLI flag, no test -- ever sets these, so they are constants.
 OMEGA_BEAT = 1.0              # eq. (8); only omega_DB is swept
-B_MOMENTUM = 0.9              # EMA rate for the shared b of eq. (5)
-CONT_WINDOWS = 8
 FRAGMENT_SECONDS = 30.0       # 1500 frames at 50 fps; diagnostic display only.
                               # Also the unit t_hat lives in: eps below is this many
                               # seconds' worth of the (0, 1] window.
@@ -28,11 +25,9 @@ NORMALIZE_BY_EVENTS = True
 DIAGNOSTIC_EVERY = 200
 BEAT_ONLY_WARMUP = 2000
 BEAT_ONLY_CONFIDENCE = 0.7
-# Fraction of training during which b is held at its initial value and the
-# per-candidate precision head stays inert. Set from the trainer's step count
-# via set_total_steps(); WARMUP_STEPS_FALLBACK applies if that never happens.
-WARMUP_FRACTION = 0.3
-WARMUP_STEPS_FALLBACK = 2000
+# The tolerance in the units t_hat lives in: a fraction of the window.
+EPS = F_MEASURE_TOLERANCE / FRAGMENT_SECONDS
+
 PRECISION_PRIOR_ALPHA = 2.0
 PRECISION_PRIOR_BETA = None
 
@@ -47,106 +42,53 @@ class Match(NamedTuple):
 class SubsetCriterion(nn.Module):
     """Per-pair cost (3), the selection DP, and the training loss (8)."""
 
-    def __init__(self, b_scale=0.005, gamma=0.5, omega_downbeat=2.0,
-                 b_min=B_MIN, normalize_by_events=NORMALIZE_BY_EVENTS, tol_flat=0.0,
-                 beat_only_warmup=BEAT_ONLY_WARMUP,
-                 beat_only_confidence=BEAT_ONLY_CONFIDENCE, cont_weight=0.0,
-                 lambda_r=0.0, meter_length=0, marginal=False,
-                 marginal_background=True, mu_meter=0.0, joint_phase=False,
-                 marginal_meters=(), meter_candidates=(), meter_prior=None,
-                 warmup_steps=WARMUP_STEPS_FALLBACK,
+    def __init__(self,
+                 # loss (8): downbeat weight, and the weight on unmatched candidates
+                 omega_downbeat=2.0, gamma=0.5,
+                 normalize_by_events=NORMALIZE_BY_EVENTS,
+                 # per-candidate precision b_j
+                 b_min=B_MIN,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
-                 precision_prior_beta=PRECISION_PRIOR_BETA):
+                 precision_prior_beta=PRECISION_PRIOR_BETA,
+                 # meter and phase: a fixed L, or latent over a candidate set
+                 meter_length=0, meter_candidates=(), meter_prior=None,
+                 joint_phase=False, mu_meter=0.0,
+                 # beat-only (B*) supervision
+                 beat_only_warmup=BEAT_ONLY_WARMUP,
+                 beat_only_confidence=BEAT_ONLY_CONFIDENCE):
         super(SubsetCriterion, self).__init__()
+        self.omega_downbeat = omega_downbeat
         self.gamma = gamma
-        self.cont_weight = cont_weight
-        self.cont_windows = CONT_WINDOWS
-        self.lambda_r = lambda_r
-        self.meter_length = meter_length
-        self.marginal = marginal
-        self.marginal_background = marginal_background
-        self.mu_meter = mu_meter
-        self.joint_phase = joint_phase
-        self.meter_candidates = tuple(meter_candidates)
-        self.meter_prior = meter_prior
-        self.marginal_meters = tuple(marginal_meters)
-        self.warmup_steps = warmup_steps
+        self.normalize_by_events = normalize_by_events
+
+        self.b_min = b_min
         self.precision_prior_alpha = precision_prior_alpha
         self.precision_prior_beta = precision_prior_beta
-        self._call_count = 0
+
+        self.meter_length = meter_length
+        self.meter_candidates = tuple(meter_candidates)
+        self.meter_prior = meter_prior
+        self.joint_phase = joint_phase
+        self.mu_meter = mu_meter
+
         self.beat_only_warmup = beat_only_warmup
         self.beat_only_confidence = beat_only_confidence
-        self.omega_downbeat = omega_downbeat
-        self.omega_beat = OMEGA_BEAT
-        self.b_momentum = B_MOMENTUM
-        self.b_min = b_min
-        self.normalize_by_events = normalize_by_events
-        self.tol_flat = tol_flat
-        # Shared Laplace scale, EMA-updated from the matched residuals. A buffer so it
-        # moves with .to(device) and survives checkpointing.
-        self.register_buffer('b', torch.tensor(float(b_scale)))
+        self._call_count = 0
 
-        print(f"[subset-criterion] gamma={self.gamma} omega_db={self.omega_downbeat} "
-              f"warmup={self.warmup_steps} marginal={self.marginal} "
-              f"marginal_bg={self.marginal_background} lambda_r={self.lambda_r} "
-              f"cont_weight={self.cont_weight} mu_meter={self.mu_meter} "
-              f"joint_phase={self.joint_phase} "
-              f"marginal_meters={self.marginal_meters or 'off'} "
+        print(f"[subset-criterion] omega_db={self.omega_downbeat} gamma={self.gamma} "
+              f"meter_L={self.meter_length} "
+              f"meter_candidates={self.meter_candidates or 'off'} "
+              f"joint_phase={self.joint_phase} mu_meter={self.mu_meter} "
+              f"beat_only_warmup={self.beat_only_warmup} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
-
-    def set_total_steps(self, total_steps):
-        """Warm-up length as a fraction of the run, once the trainer knows its length."""
-        self.warmup_steps = int(WARMUP_FRACTION * total_steps)
-
-    @property
-    def lambda_l1(self):
-        """1/b, read fresh so it tracks the EMA rather than freezing at construction."""
-        return 1.0 / float(self.b)
-
-    @property
-    def _warmed_up(self):
-        """b is frozen and the precision head inert until the warm-up has elapsed."""
-        return self._call_count >= self.warmup_steps
-
-    def _periodicity_term(self, matched_times, event_classes):
-        """Equation (17). matched_times = t_hat[sigma] in event order, (M,)."""
-        if matched_times.numel() < 3:
-            return None
-        downbeat_positions = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
-        if downbeat_positions.numel() < 2:
-            return None                                  # no consecutive downbeat pair
-        delta_bar = (matched_times[1:] - matched_times[:-1]).mean()
-        if self.meter_length > 0:
-            L = float(self.meter_length)
-        else:
-            gaps = (downbeat_positions[1:] - downbeat_positions[:-1]).float()
-            if not bool((gaps >= 1.0).all()):
-                return None
-            L = gaps
-        predicted = matched_times[downbeat_positions]
-        L_vec = L if torch.is_tensor(L) else torch.full_like(predicted[1:], float(L))
-        residual = (predicted[1:] - predicted[:-1]) - L_vec * delta_bar
-        return (residual ** 2).sum()
-
-    def _continuity_term(self, log_probabilities_b, t_hat_b):
-        """Var_w( log sum_{j in w} q_j ), q_j = 1 - p_j(background)."""
-        q = 1.0 - log_probabilities_b[:, BACKGROUND].exp()
-        span_end = float(t_hat_b.detach().max())
-        if not (span_end > 0.0):
-            return q.sum() * 0.0
-        W = int(self.cont_windows)
-        index = (t_hat_b.detach() / span_end * W).long().clamp(0, W - 1)
-        counts = torch.zeros(W, device=q.device, dtype=q.dtype).index_add_(0, index, q)
-        log_counts = torch.log(counts + 1e-3)
-        return ((log_counts - log_counts.mean()) ** 2).mean()
 
     def eps_l1(self, t_hat, t_target, laplace_scale, eps=None):
         """eps-insensitive L1: exactly zero within eps of the annotation."""
         # eps is a tolerance in seconds; t_hat is a fraction of the window, so it has
         # to cross into the same unit as the residual it is subtracted from.
         if eps is None:
-            eps = F_MEASURE_TOLERANCE / FRAGMENT_SECONDS
+            eps = EPS
         return (t_hat - t_target).abs().sub(eps).clamp(min=0.0) / laplace_scale
 
     def build_cost(self, log_probabilities, t_hat, laplace_scale, event_classes,
@@ -238,38 +180,6 @@ class SubsetCriterion(nn.Module):
 
             return Match(sigma_np, None, fragment_meter)
 
-    def _marginal_log_partition(self, log_probabilities_b, t_hat_b, laplace_scale,
-                                event_classes, event_times, fragment_meter):
-        """log Z for the marginal objective, over whichever latents are marginalised."""
-        if self.marginal_meters and fragment_meter != 0:
-            return meter_joint_log_partition(
-                lambda meter, p: self.build_phase_cost(
-                    log_probabilities_b, t_hat_b, laplace_scale, event_classes,
-                    event_times, meter, p),
-                self.marginal_meters)[0]
-        if self.joint_phase and fragment_meter > 1:
-            phase_costs = torch.stack([
-                self.build_phase_cost(log_probabilities_b, t_hat_b, laplace_scale,
-                                      event_classes, event_times, fragment_meter, p)
-                for p in range(fragment_meter)])
-            return joint_phase_log_partition(phase_costs)[0]
-        corrected = self.build_cost(
-            log_probabilities_b, t_hat_b, laplace_scale, event_classes, event_times)
-        return subset_select_logsumexp(corrected)
-
-    def _extra_terms(self, log_probabilities_b, t_hat_b, sigma, event_classes,
-                     denominator):
-        """Sections 10.4 and the continuity term, both optional and shared by both M-steps."""
-        periodicity = None
-        if self.lambda_r > 0.0 and sigma is not None:
-            r_term = self._periodicity_term(t_hat_b[sigma], event_classes)
-            if r_term is not None:
-                periodicity = r_term / denominator
-        continuity = None
-        if self.cont_weight > 0.0:
-            continuity = self._continuity_term(log_probabilities_b, t_hat_b)
-        return periodicity, continuity
-
     def _class_term(self, matched_log, event_classes, target, match):
         """Loss (8)'s first bracket: -log p_sigma(i)(c_i), or section 8's marginal for B*."""
         unknown = event_classes == CLASS_UNKNOWN
@@ -298,40 +208,11 @@ class SubsetCriterion(nn.Module):
         it -- is not scaled by the downbeat weight.
         """
         if laplace_scale is None:
-            return (self.lambda_l1 * residual).sum() / denominator, None
+            raise ValueError("laplace_scale is required: the head's per-candidate b_j is "
+                             "the only scale there is")
         b_j = laplace_scale[sigma]
         return (self._per_candidate_time_term(residual, b_j).sum() / denominator,
                 self._precision_prior(b_j) / denominator)
-
-    def _m_step_marginal(self, match, log_probabilities, t_hat_b, target,
-                         laplace_scale):
-        """Algorithm 4's M-step: -log Z over every sigma, in place of the loss at one."""
-        event_classes, event_times = target['classes'], target['times']
-        background_nll = -log_probabilities[:, BACKGROUND]
-        M = int(event_classes.numel())
-        denominator = float(M) if self.normalize_by_events else 1.0
-        log_z = self._marginal_log_partition(
-            log_probabilities, t_hat_b, laplace_scale, event_classes, event_times,
-            match.meter)
-
-        sigma = (torch.from_numpy(match.sigma).to(log_probabilities.device)
-                 if match.sigma is not None else None)
-        periodicity, continuity = self._extra_terms(
-            log_probabilities, t_hat_b, sigma, event_classes, denominator)
-
-        return {
-            'class': -log_z / denominator,
-            # no separate time term: timing enters through log Z, which is built from
-            # a cost that already contains lambda_L1 |t_i - t_hat_j|.
-            'time': None,
-            'background': (background_nll.sum() / denominator
-                           if self.marginal_background else None),
-            'residual': None,
-            'precision': None,
-            'periodicity': periodicity,
-            'continuity': continuity,
-            'unlabelled': 0,
-        }
 
     def _m_step(self, match, log_probabilities, t_hat, target, laplace_scale):
         """Algorithm 3 lines 10-15: sigma held fixed, loss (8) built from p and t.
@@ -361,9 +242,10 @@ class SubsetCriterion(nn.Module):
         # eps-insensitive residual, but eq. (5)'s b and the ms diagnostic want the true
         # error -- clamping those would drive b toward b_min and report 0 ms while the
         # model is still tens of ms out.
-        matched_residual = (event_times - t_hat[sigma]).abs()            # (M,)
-        time_term = self.eps_l1(t_hat[sigma], event_times,
-                                laplace_scale[sigma]).sum() / denominator
+        matched_residual = (event_times - t_hat[sigma]).abs()            # (M,), raw
+        residual = matched_residual.sub(EPS).clamp(min=0.0)              # eps-insensitive
+        time_term, precision_term = self._time_term(
+            residual, laplace_scale, sigma, denominator)
 
         # line 13, third sum: the candidates sigma did not match
         unmatched = torch.ones(num_candidates, dtype=torch.bool, device=device)
@@ -373,6 +255,7 @@ class SubsetCriterion(nn.Module):
             'class': (omega * per_event).sum() / denominator,
             'time': time_term,
             'background': background_nll[unmatched].sum() / denominator,
+            'precision': precision_term,
             'residual': matched_residual.detach(),
             'unlabelled': unlabelled,
         }
@@ -418,14 +301,12 @@ class SubsetCriterion(nn.Module):
             match = self._e_step(log_probabilities[i], t_hat[i], laplace_scale[i],
                                  event_classes, event_times)
 
-            # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15), or
-            # marginalized over every sigma instead (Alg. 4).
-            m_step = self._m_step_marginal if self.marginal else self._m_step
-
-            terms = m_step(match, log_probabilities[i], t_hat[i], targets[i], laplace_scale[i])
+            # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15).
+            terms = self._m_step(match, log_probabilities[i], t_hat[i], targets[i], laplace_scale[i])
 
             for key, bucket in (('class', class_terms), ('time', time_terms),
-                                ('background', background_terms)):
+                                ('background', background_terms),
+                                ('precision', precision_terms)):
                 if terms[key] is not None:
                     bucket.append(terms[key])
 
@@ -440,13 +321,14 @@ class SubsetCriterion(nn.Module):
             class_logits, class_terms, time_terms, background_terms,
             precision_terms, num_contributing)
 
-        if self.training and self._warmed_up and matched_residuals:
-            self._update_b(torch.cat(matched_residuals))
-
-        stats = self._make_stats(
-            losses, t_hat, num_candidates, matched_residuals,
-            counts=dict(num_events=num_events, infeasible=num_infeasible,
-                        unlabelled_events=num_unlabelled))
+        with torch.no_grad():
+            stats = self._make_stats(
+                losses, t_hat, num_candidates, matched_residuals,
+                counts=dict(num_events=num_events, infeasible=num_infeasible,
+                            unlabelled_events=num_unlabelled),
+                b_hat_mean=float(laplace_scale.mean()),
+                b_hat_min=float(laplace_scale.min()),
+                b_hat_max=float(laplace_scale.max()))
 
         if self.training:
             self._call_count += 1
@@ -472,13 +354,14 @@ class SubsetCriterion(nn.Module):
                               ('class', 'time', 'background'))
         return losses
 
-    def _make_stats(self, losses, t_hat, num_candidates, matched_residuals, counts):
+    def _make_stats(self, losses, t_hat, num_candidates, matched_residuals, counts,
+                    b_hat_mean=float('nan'), b_hat_min=float('nan'),
+                    b_hat_max=float('nan')):
         """Logging floats, refreshed on a diagnostic step and cached otherwise."""
         stats = {
             'cls': float(losses['class']), 'time': float(losses['time']),
             'bg': float(losses['background']), 'total': float(losses['total']),
-            'b': float(self.b), 'lambda_l1': self.lambda_l1,
-            'slot_time_cost': self.lambda_l1 / num_candidates,
+            'b_hat_mean': b_hat_mean, 'b_hat_min': b_hat_min, 'b_hat_max': b_hat_max,
             **counts,
         }
         if matched_residuals:
@@ -490,9 +373,9 @@ class SubsetCriterion(nn.Module):
         return stats
 
     def _log_diagnostic(self, stats, num_candidates):
-        slot_cost = stats['lambda_l1'] / num_candidates
-        print(f"[subset] b={stats['b']:.5f} lambda_L1={stats['lambda_l1']:.1f} | "
-              f"one-slot time cost={slot_cost:.3f} | "
+        print(f"[subset] b_hat={stats['b_hat_mean']:.5f} "
+              f"[{stats['b_hat_min']:.5f}, {stats['b_hat_max']:.5f}] "
+              f"({stats['b_hat_mean'] * FRAGMENT_SECONDS * 1000:.0f}ms) | "
               f"residual={stats.get('residual_mean', float('nan')):.5f} "
               f"({stats.get('residual_mean', 0.0) * FRAGMENT_SECONDS * 1000:.0f}ms) "
               f"min_gap={stats['min_gap']:.2e} events={stats['num_events']} "
@@ -594,20 +477,21 @@ class SubsetCriterion(nn.Module):
                 valid[start:end] = True
         return r, valid
 
-    def _per_candidate_time_term(self, residual, b_j):
-        """The time channel under per-candidate precision, with the 4.1.3 stop-gradient."""
-        localisation = residual / b_j.detach()
-        precision = residual.detach() / b_j + torch.log(2.0 * b_j)
+    def _per_candidate_time_term(self, residual, b_j, eps=EPS):
+        """-log p(r | b_j) for the uniform-core / Laplace-tail density, split per 4.1.3.
+
+        residual is already eps-insensitive, so log(2 eps + 2 b_j) is the normaliser that
+        makes this a likelihood in b_j: without it b_j -> inf minimises the loss and the
+        timing channel switches itself off.
+        """
+        localisation = residual / b_j.detach()                       # gradient to t_hat
+        precision = residual.detach() / b_j + torch.log(2.0 * eps + 2.0 * b_j)  # to b_j
         return localisation + precision
 
     def _precision_prior(self, b_j):
         """Mitigation two: a Gamma prior on the precision 1/b_j, as a MAP term."""
         alpha = self.precision_prior_alpha
         beta = (self.precision_prior_beta if self.precision_prior_beta is not None
-                else float(self.b) * max(alpha - 1.0, 1e-6))
+                else float(F_MEASURE_TOLERANCE / FRAGMENT_SECONDS) * max(alpha - 1.0, 1e-6))
         return ((alpha - 1.0) * torch.log(b_j) + beta / b_j).sum()
 
-    def _update_b(self, residuals):
-        """Equation (5): EMA of the mean absolute residual over matched pairs."""
-        batch_estimate = residuals.mean().clamp(min=self.b_min)
-        self.b.mul_(self.b_momentum).add_((1.0 - self.b_momentum) * batch_estimate)
