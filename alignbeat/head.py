@@ -28,8 +28,36 @@ class SubsetSelectionHead(nn.Module):
 
         self.window_seconds = float(window_seconds)
 
+        # Both norms are load-bearing, not decoration, and dropping the trunk's cost a
+        # from-scratch run dearly -- see the measurement below.
+        #
+        # input_norm: the encoder emits unnormalised features with |max| ~40. Without
+        # it the final Linears see large activations and produce a gradient norm of
+        # ~130 while the whole backbone contributes ~0 (measured); clipping then scales
+        # everything by 1/130 and the encoder never trains.
+        #
+        # The trunk's LayerNorm + GELU: without them the head is a pure linear map
+        # (LayerNorm -> Linear -> Linear collapses to one Linear), nothing bounds the
+        # representation the class and regression heads read, and the encoder is free
+        # to inflate its activations at no cost to the loss. It does. Measured max of
+        # frontend.blocks.*.norm.running_var after 100 from-scratch epochs:
+        #
+        #     dense baseline (vanilla)      24.0
+        #     with these layers             2.8   (final100_subset)
+        #     without them                  47.8  (L3_seed1), 2933 (L1_base)
+        #     without them, 2026-09-02      1.4e5 / 1.6e7  (F3 / F1, by epoch 19)
+        #
+        # The runaway is invisible in training loss, which uses batch statistics, and
+        # only surfaces at eval, which uses the running ones -- F1 scored 0.03 while
+        # its train loss looked healthy. Warm-started runs inherit the dense model's
+        # statistics and 20 epochs is not long enough to drift, which is why this went
+        # unnoticed: every run between 3fb106e and now was warm-started.
         self.input_norm = nn.LayerNorm(feature_size)
-        self.trunk = nn.Linear(feature_size, hidden_size)
+        self.trunk = nn.Sequential(
+            nn.Linear(feature_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+        )
 
         self.candidate_attention = None
         if class_attention_layers > 0:
