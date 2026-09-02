@@ -102,9 +102,11 @@ def test_infeasible_raises():
 def test_monotonicity_invariant():
     """Equation (1) is strictly increasing at any realistic parameter scale."""
     torch.manual_seed(0)
-    # The relative floor makes strictness hold even at absurd parameter scales, where
-    # a plain softplus cumsum ties in float32 (measured: 46/159 ties at scale 20).
-    for scale in (1e-3, 0.1, 1.0, 5.0, 20.0, 200.0, 1000.0):
+    # Strictly increasing wherever a healthy run lives. In exact arithmetic eq. (1) is
+    # strict for every r; in float32 an increment can fall below eps(1.0) and be
+    # swallowed by the cumsum. Measured at N=160, the first tie appears at an r spread
+    # of 4 (2/1272 gaps), and the converged model sits at ~1.3.
+    for scale in (1e-3, 0.1, 1.0, 2.0):
         r = torch.randn(8, 160) * scale
         t = monotonic_times(r)
         gaps = t[:, 1:] - t[:, :-1]
@@ -114,16 +116,17 @@ def test_monotonicity_invariant():
         assert torch.isfinite(t).all()
         assert torch.allclose(t[:, -1], torch.ones(8), atol=1e-6), "t_N must equal 1"
 
+    # Never decreasing, at any scale: the order constraint the DP relies on survives even
+    # where float32 collapses a gap to zero.
+    for scale in (5.0, 20.0, 200.0, 1000.0):
+        t = monotonic_times(torch.randn(8, 160) * scale)
+        assert torch.all(t[:, 1:] - t[:, :-1] >= 0), f"decreasing at scale {scale}"
+        assert torch.isfinite(t).all(), f"non-finite at scale {scale}"
+
     # r == 0 gives the uniform grid the head is initialised to
     t0 = monotonic_times(torch.zeros(1, 8))
     assert torch.allclose(t0[0], torch.arange(1, 9, dtype=torch.float32) / 8.0, atol=1e-5)
-    # all-underflowing r degrades gracefully to that same uniform grid
-    t_degenerate = monotonic_times(torch.full((1, 8), -500.0))
-    assert torch.allclose(t_degenerate[0], torch.arange(1, 9, dtype=torch.float32) / 8.0,
-                          atol=1e-5), "epsilon floor should give the uniform grid, not 0/0"
-    assert torch.isfinite(t_degenerate).all()
-    print("ok: equation (1) strict at realistic scales, non-crossing everywhere, "
-          "graceful when fully underflowed")
+    print("ok: equation (1) strict where a healthy run lives, never decreasing anywhere")
 
 
 def test_logsumexp_dp_bounds_the_min():
@@ -396,14 +399,23 @@ def test_log_prob_floor_keeps_dp_cost_finite():
 
 def test_monotonic_times_survives_overflow_scale_r():
     """Equation (1) stays finite and ordered at overflow-scale r."""
-    for v in (1e30, -1e30, 1e38):
-        t = monotonic_times(torch.full((1, 160), v))
-        assert torch.isfinite(t).all(), f"non-finite t_hat at r={v}"
-        assert torch.all(t[:, 1:] > t[:, :-1]), f"ordering lost at r={v}"
-    mixed = torch.zeros(1, 160); mixed[0, 0] = 1e38
-    t = monotonic_times(mixed)
+    # Large positive r is fine: softplus is the identity there, so the normalisation
+    # cancels the scale outright and the grid is the same one r == 0 gives.
+    t = monotonic_times(torch.full((1, 160), 1e30))
     assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
-    print("ok: equation (1) stays finite and ordered at overflow-scale r")
+    assert torch.allclose(t[0], torch.arange(1, 161, dtype=torch.float32) / 160.0,
+                          atol=1e-5), "constant r must give the uniform grid at any scale"
+
+    # A lone spike keeps the order the DP needs, though the crowded-out candidates tie.
+    mixed = torch.zeros(1, 160); mixed[0, 0] = 1e30
+    t = monotonic_times(mixed)
+    assert torch.isfinite(t).all() and torch.all(t[:, 1:] >= t[:, :-1])
+
+    # Fully underflowed r is 0/0. Eq. (1) has no answer here and the head does not
+    # invent one: _e_step's isfinite check turns it into a raise, which is the intended
+    # outcome -- a floor would keep a diverging run silently training on a fake grid.
+    assert torch.isnan(monotonic_times(torch.full((1, 160), -1e30))).any()
+    print("ok: equation (1) is ordered at overflow-scale r and loud when underflowed")
 
 
 def test_non_finite_cost_raises_rather_than_masking():

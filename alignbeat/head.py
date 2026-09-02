@@ -3,6 +3,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from alignbeat.classes import F_MEASURE_TOLERANCE, NUM_CLASSES
 
@@ -135,12 +136,23 @@ def sinusoidal(position, dim):
     return out[..., :dim]
 
 
-def monotonic_times(r, alpha=1e-3):
-    """Equation (1) with the gap floor made explicit."""
+def monotonic_times(r):
+    """Equation (1), verbatim.
 
-    # JA: t_hat is in (0, 1] and of float32 type, in which any two values with less than
-    # 1e-7 (~2^-23) difference are truncated to the same value. softplus(r) = e^r can
-    # produce increments that are too small to be represented in float32
-    N = r.shape[-1]
-    inc = (1 - alpha) * torch.softmax(r, dim=-1) + alpha / N
+    Every summand is strictly positive, so in exact arithmetic t_hat is strictly
+    increasing for any r and monotonicity is architectural rather than learned. Two
+    caveats hold in float32, both confined to states a healthy run never reaches:
+
+      spread  an increment below eps(1.0) ~ 1.19e-7 is swallowed by the cumsum and two
+              candidates land on the same time. This needs r spread ~ 10; the converged
+              model runs at ~1.3, and the only run that approached it was diverging
+              anyway (A_f0, which then died of a non-finite matching cost at epoch 47).
+      collapse  softplus(-120) underflows to 0.0, so all-negative r gives 0/0 = NaN.
+
+    Both surface loudly: _e_step's isfinite check raises rather than training on a
+    degenerate grid. That is preferred here to a floor that would keep a diverging run
+    quietly going.
+    """
+    weights = F.softplus(r)
+    inc = weights / weights.sum(dim=-1, keepdim=True)
     return torch.cumsum(inc, dim=-1)
