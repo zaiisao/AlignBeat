@@ -111,7 +111,8 @@ def test_frozen_parameters_still_reach_the_optimizer():
     import torch
     from beat_this.model.pl_module import PLBeatThis
 
-    m = PLBeatThis(head_type="subset", num_candidates=188, transformer_dim=64,
+    m = PLBeatThis(head_type="subset", num_candidates=170,
+                   downsampled_seq_size=188, transformer_dim=64,
                    n_layers=2, downsample_stages=3, max_epochs=100)
     head = m.model.task_heads.head
     weight = head.precision_head.weight

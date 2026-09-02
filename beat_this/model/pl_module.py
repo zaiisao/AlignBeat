@@ -53,11 +53,11 @@ class PLBeatThis(LightningModule):
         # Only used by head_type="subset": N, the number of candidates the head
         # emits. Derived once in launch_scripts/train.py; no default here, so the
         # value can never disagree with the one a run was configured with.
+        downsampled_seq_size: int = None,
         num_candidates: int = None,
         downsample_mode: str = "learned",
         train_length: int = 1500,
         downsample_stages: int = None,
-        class_prior=None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
@@ -93,11 +93,11 @@ class PLBeatThis(LightningModule):
             sum_head=sum_head,
             partial_transformers=partial_transformers,
             num_candidates=num_candidates,
+            downsampled_seq_size=downsampled_seq_size,
             downsample_mode=downsample_mode,
             train_length=train_length,
             fps=fps,
             downsample_stages=downsample_stages,
-            class_prior=class_prior,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             class_attention_pos=class_attention_pos,

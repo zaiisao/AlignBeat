@@ -20,8 +20,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 from beat_this.dataset import BeatDataModule
-from alignbeat.downsample import (BPM_MAX, choose_num_candidates, halved_candidates,
-                                  n_candidates_from_tempo)
+from alignbeat.downsample import BPM_MAX, halved_candidates, stages_from_tempo
 from beat_this.model.pl_module import PLBeatThis
 
 
@@ -104,12 +103,9 @@ def main(args):
 
     window_seconds = args.train_length / float(args.fps)
 
-    min_num_candidates = choose_num_candidates(args.train_length, args.fps, args.bpm_max)
-    n_effective = halved_candidates(args.train_length, args.downsample_stages)
+    downsample_stages, downsampled_seq_size, num_candidates = stages_from_tempo(
+        args.train_length, args.fps, args.bpm_max)
 
-    class_prior = datamodule.subset_class_prior(
-        n_effective, window_seconds,
-        omega_downbeat=args.omega_db, gamma=args.gamma)
 
     pl_model = PLBeatThis(
         spect_dim=128,
@@ -133,12 +129,12 @@ def main(args):
         head_type=args.head_type,
         head_lr=args.head_lr,
         quantize_targets=args.quantize_targets,
+        downsampled_seq_size=downsampled_seq_size,
         num_candidates=num_candidates,
         stitch_border=args.stitch_border,
         downsample_mode=args.downsample_mode,
         train_length=args.train_length,
-        downsample_stages=args.downsample_stages,
-        class_prior=args.class_prior,
+        downsample_stages=downsample_stages,
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
         class_attention_pos=args.class_attention_pos,
@@ -343,10 +339,6 @@ if __name__ == "__main__":
     parser.add_argument("--meter_prior", type=str, default="",
                         help="'corpus' uses the measured meter distribution from "
                              "docs/METER_DISTRIBUTION.md; empty is uniform over (L, phi_0)")
-    parser.add_argument("--downsample_stages", type=int, default=None,
-                        help="Strict halving: N is derived as ceil(T / 2**stages) "
-                             "(1500 -> 750 -> 375 -> 188 for 3) instead of factorising "
-                             "T/num_candidates. Overrides --num_candidates.")
     parser.add_argument("--downsample_mode", type=str, default="learned",
                         choices=["learned", "avg", "max"],
                         help="how T frames become N candidates: a strided conv "

@@ -23,8 +23,10 @@ def n_candidates_from_tempo(window_frames: int, fps: float,
 class Downsample(nn.Module):
     """(B, T, d) -> (B, N, d) by one strided operator."""
 
-    def __init__(self, d_model: int, num_candidates: int, mode: str = "learned",
-                 window_frames: int = None, stages: int = None):
+    def __init__(self, d_model: int, num_candidates: int,
+                 downsampled_seq_size: int,
+                 mode: str = "learned", window_frames: int = None,
+                 stages: int = None):
         super().__init__()
 
         if mode not in ("learned", "avg", "max"):
@@ -33,6 +35,7 @@ class Downsample(nn.Module):
         self.mode = mode
         self.num_candidates = num_candidates
         self.conv = None
+        self.downsampled_seq_size = downsampled_seq_size
 
         if mode == "learned":
             if window_frames is None:
@@ -45,17 +48,17 @@ class Downsample(nn.Module):
             # to T/N exactly -- rounding to powers of two instead would pad the window
             # with silence and silently rescale what t_hat = 1 means.
             if stages is not None:
-                # Strict halving: N is derived, not requested. 1500 -> 750 -> 375 -> 188
-                # for stages=3; an odd length rounds up, so the grid can span a few
-                # frames more than the window and time_scale() carries that back.
+                # JA: We apply half downsampling three times assuming the original
+                # length of the spectrogram is 1500.
                 self.strides = [2] * int(stages)
-                num_candidates = halved_candidates(window_frames, int(stages))
-                self.num_candidates = num_candidates
             else:
                 self.strides = factor_strides(window_frames, num_candidates)
             self.num_stages = len(self.strides)
             self.kernel = self.strides[0]
-            self.padded_length = num_candidates * math.prod(self.strides)
+
+            # JA: The size of the sequence to be downsampled. It is the original
+            # length plus padding size
+            self.padded_length = downsampled_seq_size * math.prod(self.strides)
             self.window_frames = int(window_frames)
 
             layers = []
@@ -70,9 +73,9 @@ class Downsample(nn.Module):
         x = x.transpose(1, 2) # (B, T, d) -> (B, d, T)
 
         if self.mode == "avg":
-            z = F.adaptive_avg_pool1d(x, self.num_candidates)
+            z = F.adaptive_avg_pool1d(x, self.downsampled_seq_size)
         elif self.mode == "max":
-            z = F.adaptive_max_pool1d(x, self.num_candidates)
+            z = F.adaptive_max_pool1d(x, self.downsampled_seq_size)
         elif self.mode == "learned":
             length = x.shape[-1]
             if length > self.padded_length:
@@ -82,6 +85,7 @@ class Downsample(nn.Module):
                     f"input of {length} frames exceeds the {self.padded_length} this "
                     f"Downsample was built for; rebuild it with window_frames={length} "
                     f"or split the input")
+
             if length < self.padded_length:
                 x = F.pad(x, (0, self.padded_length - length))
 
@@ -112,6 +116,20 @@ def halved_candidates(window_frames: int, stages: int) -> int:
         n = -(-n // 2)
     return n
 
+def stages_from_tempo(window_frames: int, fps: float,
+                      bpm_max: float = BPM_MAX) -> tuple:
+    """Most halvings of T whose N still covers the tempo floor.
+
+    N only has to be >= the densest event count a window can hold; beyond that every
+    extra candidate is a background classification. So halve until one more halving
+    would drop below that floor: T=1500 at 50 fps floors at 170, and 750 -> 375 -> 188
+    all clear it while 94 does not, giving 3 stages. Returns (stages, N).
+    """
+    num_candidates = n_candidates_from_tempo(window_frames, fps, bpm_max)
+    stages = 0
+    while halved_candidates(window_frames, stages + 1) >= num_candidates:
+        stages += 1
+    return stages, halved_candidates(window_frames, stages), num_candidates
 
 def factor_strides(window_frames: int, num_candidates: int) -> list:
     """ceil(T/N) split into per-stage strides, smallest first, multiplying to it exactly.

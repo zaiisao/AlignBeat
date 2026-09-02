@@ -20,13 +20,12 @@ class SubsetSelectionHead(nn.Module):
     """Encoder features -> N candidates -> (class logits, monotone times)."""
 
     def __init__(self, feature_size=256, hidden_size=256,
-                 class_prior=(0.10, 0.30, 0.60), window_seconds=30.0,
+                 window_seconds=30.0,
                  class_attention_layers=0, class_attention_heads=4,
                  class_attention_pos="none"):
         super(SubsetSelectionHead, self).__init__()
 
         self.window_seconds = float(window_seconds)
-        self.class_prior = class_prior
 
         self.input_norm = nn.LayerNorm(feature_size)
         self.trunk = nn.Linear(feature_size, hidden_size)
@@ -80,10 +79,6 @@ class SubsetSelectionHead(nn.Module):
         nn.init.zeros_(self.regression_head.bias)
         nn.init.zeros_(self.class_head.weight)
         nn.init.zeros_(self.precision_head.weight)
-
-        prior = torch.tensor(self.class_prior, dtype=torch.float32)
-        with torch.no_grad():
-            self.class_head.bias.copy_(torch.log(prior / prior.sum()))
 
         # t_hat and the targets live on (0, 1] over the window, so the tolerance has to
         # cross into that unit before it can be a scale: 0.07 s of a 30 s window is

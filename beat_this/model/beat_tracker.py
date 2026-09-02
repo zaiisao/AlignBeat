@@ -34,11 +34,11 @@ class BeatThis(nn.Module):
         partial_transformers: bool = True,
         head_type: str = "dense",
         num_candidates: int = None,
+        downsampled_seq_size: int = None,
         downsample_mode: str = "learned",
         train_length: int = 1500,
         fps: int = 50,
         downsample_stages: int = None,
-        class_prior=None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
@@ -101,8 +101,9 @@ class BeatThis(nn.Module):
             # JA: This is the bridge to our AlignBeat architecture
             self.task_heads = SubsetHead(
                 transformer_dim, num_candidates=num_candidates,
+                downsampled_seq_size=downsampled_seq_size,
                 downsample_mode=downsample_mode, train_length=train_length, fps=fps,
-                downsample_stages=downsample_stages, class_prior=class_prior,
+                downsample_stages=downsample_stages,
                 class_attention_layers=class_attention_layers,
                 class_attention_heads=class_attention_heads,
                 class_attention_pos=class_attention_pos)
@@ -319,13 +320,16 @@ class PartialFTTransformer(nn.Module):
 class SubsetHead(nn.Module):
     """Progressive downsample T -> N, then the order-preserving alignment head."""
 
-    def __init__(self, input_dim, num_candidates, downsample_mode="learned",
-                 train_length=1500, fps=50, downsample_stages=None, class_prior=None,
+    def __init__(self, input_dim, num_candidates, downsampled_seq_size,
+                 downsample_mode="learned", train_length=1500, fps=50,
+                 downsample_stages=None,
                  class_attention_layers=0, class_attention_heads=4,
                  class_attention_pos="none"):
         super().__init__()
 
-        self.downsample = Downsample(input_dim, num_candidates, downsample_mode,
+        self.downsample = Downsample(input_dim, num_candidates,
+                                     downsampled_seq_size,
+                                     downsample_mode,
                                      window_frames=train_length,
                                      stages=downsample_stages)
 
@@ -336,11 +340,9 @@ class SubsetHead(nn.Module):
             print(f"[subset] downsample_stages={downsample_stages} derives "
                   f"N={self.num_candidates} (requested {num_candidates})", flush=True)
 
-        head_kwargs = {} if class_prior is None else {"class_prior": tuple(class_prior)}
         self.head = SubsetSelectionHead(
             feature_size=input_dim,
             window_seconds=train_length / float(fps),
-            **head_kwargs,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             class_attention_pos=class_attention_pos)

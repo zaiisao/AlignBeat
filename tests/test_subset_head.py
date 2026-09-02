@@ -289,7 +289,9 @@ def test_downsample_reaches_n_exactly():
     from alignbeat.downsample import Downsample
     for mode in ("learned", "avg", "max"):
         for T in (1440, 1281, 160):
-            z = Downsample(8, 160, mode, window_frames=T)(torch.randn(1, T, 8))
+            # num_candidates is the tempo floor; downsampled_seq_size is how many
+            # tokens the head actually emits, and every mode must agree on it.
+            z = Downsample(8, 160, 160, mode, window_frames=T)(torch.randn(1, T, 8))
             assert z.shape == (1, 160, 8), f"{mode} at T={T} gave {tuple(z.shape)}"
     print("ok: every downsample mode emits exactly N candidates")
 

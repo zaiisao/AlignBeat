@@ -52,7 +52,7 @@ def test_flags_reach_the_criterion():
     from beat_this.model.pl_module import PLBeatThis
     m = PLBeatThis(
         head_type="subset", transformer_dim=64, n_layers=2,
-        num_candidates=188,
+        num_candidates=170, downsampled_seq_size=188,
         subset_kwargs=dict(mu_meter=1e5, joint_phase=True, meter_length=4,
                            meter_candidates=(2, 3, 4, 6), omega_downbeat=4.0,
                            beat_only_confidence=0.9))
