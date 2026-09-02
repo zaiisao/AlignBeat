@@ -41,6 +41,7 @@ class BeatThis(nn.Module):
         class_prior=None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
+        class_attention_pos: str = "none",
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -103,7 +104,8 @@ class BeatThis(nn.Module):
                 downsample_mode=downsample_mode, train_length=train_length, fps=fps,
                 downsample_stages=downsample_stages, class_prior=class_prior,
                 class_attention_layers=class_attention_layers,
-                class_attention_heads=class_attention_heads)
+                class_attention_heads=class_attention_heads,
+                class_attention_pos=class_attention_pos)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -319,7 +321,8 @@ class SubsetHead(nn.Module):
 
     def __init__(self, input_dim, num_candidates, downsample_mode="learned",
                  train_length=1500, fps=50, downsample_stages=None, class_prior=None,
-                 class_attention_layers=0, class_attention_heads=4):
+                 class_attention_layers=0, class_attention_heads=4,
+                 class_attention_pos="none"):
         super().__init__()
 
         self.downsample = Downsample(input_dim, num_candidates, downsample_mode,
@@ -339,7 +342,8 @@ class SubsetHead(nn.Module):
             window_seconds=train_length / float(fps),
             **head_kwargs,
             class_attention_layers=class_attention_layers,
-            class_attention_heads=class_attention_heads)
+            class_attention_heads=class_attention_heads,
+            class_attention_pos=class_attention_pos)
 
     def forward(self, x):
         z = self.downsample(x) # (B, T, dim) -> (B, N, dim)

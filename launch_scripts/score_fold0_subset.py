@@ -40,12 +40,32 @@ def build_loader(num_workers, fold):
 
 
 def load_model(ckpt_path, device):
+    """Rebuild from the checkpoint's own hyper_parameters, tolerating retired knobs.
+
+    Older checkpoints carry arguments that no longer exist (predict_precision, b_scale,
+    marginal, ...). Drop those rather than refusing to load. Any parameter the current
+    architecture does not provide is reported loudly: strict=False would otherwise leave
+    it randomly initialised and score confident nonsense.
+    """
+    import inspect
     from beat_this.model.pl_module import PLBeatThis
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model = PLBeatThis(**ckpt["hyper_parameters"])
+    hp = dict(ckpt["hyper_parameters"])
+    accepted = set(inspect.signature(PLBeatThis.__init__).parameters)
+    dropped = sorted(k for k in hp if k not in accepted)
+    if dropped:
+        print(f"    ignoring retired hyper_parameters: {', '.join(dropped)}")
+        hp = {k: v for k, v in hp.items() if k in accepted}
+    model = PLBeatThis(**hp)
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
-    if missing:
-        print(f"    warning: {len(missing)} missing keys, e.g. {missing[:2]}")
+    real_missing = [k for k in missing if "criterion" not in k]
+    if real_missing:
+        print(f"    !! {len(real_missing)} MODEL weights absent from this checkpoint: "
+              f"{real_missing[:4]} -- architecture has changed, scores would be "
+              f"meaningless. Skipping.")
+        return None
+    if unexpected:
+        print(f"    note: {len(unexpected)} unused keys in checkpoint, e.g. {unexpected[:2]}")
     return model.eval().to(device)
 
 
@@ -68,11 +88,20 @@ def score(model, loader, device):
             path = batch["spect_path"][i]
             corpus = str(path).split("/", 1)[0]
             ibis = np.diff(truth)
-            rows.append(dict(
+            row = dict(
                 path=str(path), corpus=corpus,
                 bpm=float(60.0 / np.median(ibis)),
                 F=met["F-measure"], CMLt=met["CMLt"], AMLt=met["AMLt"],
-            ))
+            )
+            # Downbeats only where they were annotated: mir_eval scores 0.0 against an
+            # empty reference, and smc/simac (102 of 571 fold-0 pieces) have none, so
+            # including them would measure the corpus rather than the model.
+            truth_db = np.frombuffer(batch["truth_orig_downbeat"][i])
+            if bool(batch["downbeat_mask"][i]) and len(truth_db) >= 3:
+                met_d = model.metrics(truth_db, downbeats[i], step="test")
+                row.update(dbF=met_d["F-measure"], dbCMLt=met_d["CMLt"],
+                           dbAMLt=met_d["AMLt"])
+            rows.append(row)
     return rows
 
 
@@ -84,13 +113,22 @@ def summarize(rows):
         "SMC <70": lambda r: r["corpus"] == "smc" and r["bpm"] < 70,
         ">=70 bpm": lambda r: r["bpm"] >= 70,
     }
+    # Tempo bands, so a deficit can be attributed to a range rather than to "slow".
+    for lo, hi in ((0, 70), (70, 100), (100, 130), (130, 160), (160, 1e9)):
+        name = f"bpm {lo}-{hi:.0f}" if hi < 1e9 else f"bpm {lo}+"
+        groups[name] = (lambda l, h: lambda r: l <= r["bpm"] < h)(lo, hi)
+    # ...and per corpus, which is what a reader asks for first.
+    for corpus in sorted({r["corpus"] for r in rows}):
+        groups[f"ds:{corpus}"] = (lambda c: lambda r: r["corpus"] == c)(corpus)
     out = {}
     for name, fn in groups.items():
         sel = [r for r in rows if fn(r)]
-        if sel:
-            out[name] = (len(sel), float(np.mean([r["F"] for r in sel])),
-                         float(np.mean([r["CMLt"] for r in sel])),
-                         float(np.mean([r["AMLt"] for r in sel])))
+        if not sel:
+            continue
+        db = [r for r in sel if "dbF" in r]
+        mean = lambda k, xs: float(np.mean([x[k] for x in xs])) if xs else float("nan")
+        out[name] = (len(sel), mean("F", sel), mean("CMLt", sel), mean("AMLt", sel),
+                     len(db), mean("dbF", db), mean("dbCMLt", db), mean("dbAMLt", db))
     return out
 
 
@@ -112,7 +150,7 @@ def main():
     write_header = not os.path.exists(args.out)
     fh = open(args.out, "a")
     if write_header:
-        fh.write("arm,epoch,group,n,F,CMLt,AMLt\n")
+        fh.write("arm,epoch,group,n,F,CMLt,AMLt,n_db,dbF,dbCMLt,dbAMLt\n")
 
     for c in ckpts:
         stem = Path(c).stem
@@ -120,12 +158,15 @@ def main():
         epoch = int(m.group(1)) if m else -1
         arm = stem.split()[0]
         model = load_model(c, device)
+        if model is None:
+            continue
         summary = summarize(score(model, loader, device))
-        for group, (n, f, cmlt, amlt) in summary.items():
-            fh.write(f"{arm},{epoch},{group},{n},{f:.6f},{cmlt:.6f},{amlt:.6f}\n")
+        for group, v in summary.items():
+            fh.write(f"{arm},{epoch},{group},{v[0]},{v[1]:.6f},{v[2]:.6f},{v[3]:.6f},"
+                     f"{v[4]},{v[5]:.6f},{v[6]:.6f},{v[7]:.6f}\n")
             if group == "ALL":
-                print(f"  {arm:>12} ep{epoch:>3}  {group:>8}  n={n:<4} "
-                      f"F={f:.4f}  CMLt={cmlt:.4f}  AMLt={amlt:.4f}")
+                print(f"  {arm:>12} ep{epoch:>3}  beat F={v[1]:.4f} CMLt={v[2]:.4f} | "
+                      f"downbeat F={v[5]:.4f} CMLt={v[6]:.4f}  (n={v[0]}, n_db={v[4]})")
         fh.flush()
         del model
         torch.cuda.empty_cache()

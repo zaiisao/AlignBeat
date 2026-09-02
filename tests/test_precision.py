@@ -84,9 +84,10 @@ def test_head_bias_is_the_tolerance_and_stays_frozen():
         head = SubsetSelectionHead(feature_size=16, window_seconds=window_seconds)
         b0 = float(torch.nn.functional.softplus(head.precision_head.bias))
         assert abs(b0 * window_seconds - F_MEASURE_TOLERANCE) < 1e-6, window_seconds
-        # only the weights thaw; the bias is frozen for the whole run
+        # the whole head is frozen at construction; training_step thaws the WEIGHT at
+        # 30% of the run, and the bias stays frozen for the whole of it
         assert head.precision_head.bias.requires_grad is False
-        assert head.precision_head.weight.requires_grad is True
+        assert head.precision_head.weight.requires_grad is False
     print("ok: the precision bias is 70 ms of whatever window it is given, and frozen")
 
 
@@ -96,6 +97,51 @@ def test_head_emits_one_scale_per_candidate():
     assert b_hat.shape == (2, 8), b_hat.shape
     assert float(b_hat.min()) > 0.0, "softplus must keep b_hat positive"
     print("ok: the head emits one positive b_hat per candidate")
+
+
+def test_frozen_parameters_still_reach_the_optimizer():
+    """A parameter frozen at construction must still be given to the optimizer.
+
+    configure_optimizers runs once, at fit start. Filtering on requires_grad there
+    permanently excludes anything frozen at that moment, so a later thaw flips a flag on
+    a tensor no optimizer owns and the parameter never moves -- which is what kept b_hat
+    pinned at its init for every run until this was fixed. Freezing must be enforced by
+    the absence of a gradient, not by absence from the optimizer.
+    """
+    import torch
+    from beat_this.model.pl_module import PLBeatThis
+
+    m = PLBeatThis(head_type="subset", num_candidates=188, transformer_dim=64,
+                   n_layers=2, downsample_stages=3, max_epochs=100)
+    head = m.model.task_heads.head
+    weight = head.precision_head.weight
+    assert weight.requires_grad is False, "expected the head frozen at construction"
+
+    # the same grouping configure_optimizers builds, without needing a Trainer
+    def is_head(n):
+        return n.startswith("model.task_heads") or n.startswith("subset_criterion")
+    seen, groups = set(), []
+    for pred in (lambda n: not is_head(n), is_head):
+        for keep in (lambda p: p.ndim >= 2, lambda p: p.ndim <= 1):
+            ps = [p for n, p in m.named_parameters()
+                  if pred(n) and keep(p) and id(p) not in seen]
+            for p in ps:
+                seen.add(id(p))
+            if ps:
+                groups.append({"params": ps, "lr": 1e-3})
+    opt = torch.optim.AdamW(groups, lr=1e-3)
+    assert id(weight) in {id(p) for g in opt.param_groups for p in g["params"]}, \
+        "frozen parameter was dropped from the optimizer; a later thaw cannot work"
+
+    before = weight.detach().clone()
+    opt.step()
+    assert torch.equal(before, weight.detach()), "frozen parameter moved"
+
+    weight.requires_grad_(True)
+    weight.grad = torch.ones_like(weight)
+    opt.step()
+    assert not torch.equal(before, weight.detach()), "thawed parameter did not move"
+    print("ok: a frozen parameter stays in the optimizer and moves once thawed")
 
 
 if __name__ == "__main__":

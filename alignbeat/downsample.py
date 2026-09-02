@@ -138,8 +138,9 @@ def factor_strides(window_frames: int, num_candidates: int) -> list:
 def choose_num_candidates(window_frames: int, fps: float,
                           bpm_max: float = BPM_MAX) -> int:
     """Smallest N at or above the tempo floor that divides the window exactly."""
-    floor = n_candidates_from_tempo(window_frames, fps, bpm_max)
-    for n in range(floor, window_frames + 1):
+    # JA: This computes the max N; for example, assuming T is 1500, this is 170
+    min_num_candidates = n_candidates_from_tempo(window_frames, fps, bpm_max)
+    for n in range(min_num_candidates, window_frames + 1):
         if window_frames % n == 0:
             return n
-    return floor
+    return min_num_candidates

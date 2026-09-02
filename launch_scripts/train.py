@@ -84,27 +84,7 @@ def main(args):
         no_val=not args.val,
         fold=args.fold,
     )
-    # The classifier's initial bias is measured from this fold's training items only --
-    # never validation or test -- so it leaks nothing about what it is scored on. It
-    # needs N, which is settled just below, so the datamodule is set up first.
-    args.class_prior = (tuple(float(v) for v in args.class_prior.split(","))
-                        if args.class_prior else None)
 
-    if args.num_candidates is None:
-        args.num_candidates = choose_num_candidates(
-            args.train_length, args.fps, args.bpm_max)
-    floor = n_candidates_from_tempo(args.train_length, args.fps, args.bpm_max)
-    if args.num_candidates < floor:
-        # Below the floor an order-preserving injection may not exist, and
-        # SubsetCriterion silently drops those fragments from the loss rather than
-        # training in the wrong direction. Refuse instead of discovering it in a log.
-        parser.error(
-            f"--num_candidates {args.num_candidates} is below the floor {floor} implied "
-            f"by --bpm_max {args.bpm_max:g} over a {args.train_length}-frame window; "
-            f"fragments denser than N would be dropped from the loss.")
-    print(f"[subset] N = {args.num_candidates} candidates "
-          f"(floor {floor} from bpm_max={args.bpm_max:g}, "
-          f"window={args.train_length}f @ {args.fps}fps)")
     if args.dbn and args.head_type == "subset":
         # The DBN postprocessor consumes frame-wise activations; the alignment head
         # emits per-candidate events and never builds them, so use_dbn would be silently
@@ -121,15 +101,15 @@ def main(args):
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
-    if args.class_prior is None:
-        datamodule.setup("fit")
-        window_seconds = args.train_length / float(args.fps)
-        n_effective = args.num_candidates
-        if args.downsample_stages is not None:
-            n_effective = halved_candidates(args.train_length, args.downsample_stages)
-        args.class_prior = datamodule.subset_class_prior(
-            n_effective, window_seconds,
-            omega_downbeat=args.omega_db, gamma=args.gamma)
+
+    window_seconds = args.train_length / float(args.fps)
+
+    min_num_candidates = choose_num_candidates(args.train_length, args.fps, args.bpm_max)
+    n_effective = halved_candidates(args.train_length, args.downsample_stages)
+
+    class_prior = datamodule.subset_class_prior(
+        n_effective, window_seconds,
+        omega_downbeat=args.omega_db, gamma=args.gamma)
 
     pl_model = PLBeatThis(
         spect_dim=128,
@@ -153,7 +133,7 @@ def main(args):
         head_type=args.head_type,
         head_lr=args.head_lr,
         quantize_targets=args.quantize_targets,
-        num_candidates=args.num_candidates,
+        num_candidates=num_candidates,
         stitch_border=args.stitch_border,
         downsample_mode=args.downsample_mode,
         train_length=args.train_length,
@@ -161,6 +141,7 @@ def main(args):
         class_prior=args.class_prior,
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
+        class_attention_pos=args.class_attention_pos,
         tau_beat=args.tau_beat,
         tau_downbeat=args.tau_downbeat,
         db_margin=args.db_margin,
@@ -357,10 +338,6 @@ if __name__ == "__main__":
                         help="frames discarded either side of a chunk seam at whole-piece "
                              "inference; defaults to the dense arm's 2*tolerance so both "
                              "A/B arms decode under the same edge convention")
-    parser.add_argument("--class_prior", type=str, default="",
-                        help="classifier bias init, e.g. 0.1,0.3,0.6. Empty measures it "
-                             "from this fold's TRAINING split, weighted by --omega_db "
-                             "and --gamma so the init sits at the loss's own optimum.")
     parser.add_argument("--meter_candidates", type=str, default="",
                         help="latent meter: e.g. 2,3,4,6. Empty keeps L fixed at --meter_L")
     parser.add_argument("--meter_prior", type=str, default="",
@@ -377,12 +354,12 @@ if __name__ == "__main__":
     parser.add_argument("--bpm_max", type=float, default=BPM_MAX,
                         help=f"fastest tempo the corpus contains (default {BPM_MAX:g}); "
                              "N is derived from it and the window length")
-    parser.add_argument("--num_candidates", type=int, default=None,
-                        help="N, the number of candidates the head emits. Derived from "
-                             "--bpm_max and --train_length when not given; pass it to "
-                             "overgenerate beyond that floor.")
     parser.add_argument("--class_attention_layers", type=int, default=0)
     parser.add_argument("--class_attention_heads", type=int, default=4)
+    parser.add_argument("--class_attention_pos", type=str, default="none",
+                        choices=("none", "index", "time"),
+                        help="positional signal for the candidate attention: "
+                             "ordinal beat number, or t_hat")
     parser.add_argument("--tau_beat", type=float, default=0.2)
     parser.add_argument("--tau_downbeat", type=float, default=0.2)
     parser.add_argument("--init_encoder_from", type=str, default="",

@@ -1,15 +1,19 @@
 {
-    // Args mirror the runs in runs/*.sh, so a debug session is the real run. Additions
-    // are debugger necessities only:
+    // Args mirror the runs actually in flight (see the session's L*/W_warm arms), so a
+    // debug session is the real run. Additions are debugger necessities only:
     //   --compile        (no values) turns OFF torch.compile, which otherwise defaults to
     //                    ["frontend","transformer_blocks","task_heads"] and traces away
     //                    every breakpoint inside the model.
     //   --num-workers 0  keeps the dataloader in-process so breakpoints there hit.
     //   --name debug_*   so debug checkpoints do not collide with real runs.
+    //
+    // N is derived, not passed: --downsample_stages 3 halves 1500 -> 750 -> 375 -> 188.
+    // 188 clears the 170-candidate floor implied by --bpm_max 340 and drops only the
+    // ~0.03% of fragments whose asap MIDI annotations are note-level rather than beats.
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train: subset, N=250 derived (runs/new250.sh)",
+            "name": "train: subset N=188 baseline (L1_base)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
@@ -17,22 +21,16 @@
             "env": {"PYTHONPATH": "${workspaceFolder}",
                     "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
             "args": [
-                "--name", "debug_new250", "--gpu", "3", "--fold", "0", "--seed", "0",
-                "--max-epochs", "20", "--lr", "0.0003",
-                "--batch-size", "8", "--accumulate-grad-batches", "8",
-                "--num-workers", "0", "--logger", "none",
-                "--val-frequency", "10000", "--snapshot_every", "3",
-                // N omitted: derived from --bpm_max 340 and --train_length 1500 -> 250
-                "--head_type", "subset", "--downsample_mode", "learned",
-                "--class_attention_layers", "1", "--omega_db", "4",
-                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt", "--freeze_encoder",
-                "--compile"
+                "--name", "debug_L1_base", "--gpu", "0", "--fold", "0", "--seed", "0",
+                "--max-epochs", "100", "--val-frequency", "200", "--snapshot_every", "5",
+                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train: subset, N=188 explicit (runs/new188.sh)",
+            "name": "train: subset + candidate attention, index positions (L2_attn)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
@@ -40,22 +38,19 @@
             "env": {"PYTHONPATH": "${workspaceFolder}",
                     "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
             "args": [
-                "--name", "debug_new188", "--gpu", "3", "--fold", "0", "--seed", "0",
-                "--max-epochs", "20", "--lr", "0.0003",
-                "--batch-size", "8", "--accumulate-grad-batches", "8",
-                "--num-workers", "0", "--logger", "none",
-                "--val-frequency", "10000", "--snapshot_every", "3",
-                "--head_type", "subset", "--downsample_mode", "learned",
-                "--num_candidates", "188",
-                "--class_attention_layers", "1", "--omega_db", "4", "--learn_b",
-                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt", "--freeze_encoder",
-                "--compile"
+                "--name", "debug_L2_attn", "--gpu", "2", "--fold", "0", "--seed", "0",
+                "--max-epochs", "100", "--val-frequency", "200", "--snapshot_every", "5",
+                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                // section 10.2. Without --class_attention_pos the attention is
+                // permutation-equivariant and cannot express bar phase at all.
+                "--class_attention_layers", "1", "--class_attention_pos", "index",
+                "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train: dense control (runs/newdense.sh)",
+            "name": "train: subset, latent meter + corpus meter prior",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
@@ -63,61 +58,93 @@
             "env": {"PYTHONPATH": "${workspaceFolder}",
                     "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
             "args": [
-                "--name", "debug_newdense", "--gpu", "3", "--fold", "0", "--seed", "0",
-                "--max-epochs", "20", "--lr", "0.0003",
-                "--batch-size", "8", "--accumulate-grad-batches", "8",
-                "--num-workers", "0", "--logger", "none",
-                "--val-frequency", "10000", "--snapshot_every", "3",
+                "--name", "debug_meter", "--gpu", "3", "--fold", "0", "--seed", "0",
+                "--max-epochs", "20", "--val-frequency", "200", "--snapshot_every", "5",
+                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                // only affects beat-only fragments (smc, simac): infers L per fragment
+                "--meter_candidates", "2,3,4,6", "--meter_prior", "corpus",
+                "--num-workers", "0", "--logger", "none", "--compile"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "train: subset, warm-start the encoder (W_warm)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}",
+                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
+            "args": [
+                "--name", "debug_warm", "--gpu", "0", "--fold", "0", "--seed", "0",
+                "--max-epochs", "20", "--val-frequency", "200", "--snapshot_every", "5",
+                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                // frontend + transformer only; the head is always freshly initialised
+                "--init_encoder_from", "${workspaceFolder}/checkpoints/final100_subset S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=069.ckpt",
+                "--num-workers", "0", "--logger", "none", "--compile"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "train: dense control (vanilla Beat This)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}",
+                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
+            "args": [
+                "--name", "debug_dense", "--gpu", "0", "--fold", "0", "--seed", "0",
+                "--max-epochs", "100", "--val-frequency", "200", "--snapshot_every", "5",
                 "--head_type", "dense",
-                "--init_encoder_from", "/home/sogang/jaehoon/Analyze-SMC/third-party/beat_this/checkpoints/vanilla_f0 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue.ckpt", "--freeze_encoder",
-                "--compile"
+                "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train: thaw the encoder (runs/thaw3e5.sh)",
+            "name": "score: our snapshots on fold 0 (beat + downbeat)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/launch_scripts/train.py",
-            "cwd": "${workspaceFolder}",
-            "env": {"PYTHONPATH": "${workspaceFolder}",
-                    "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2"},
-            "args": [
-                "--name", "debug_thaw", "--gpu", "3", "--fold", "0", "--seed", "0",
-                "--head_type", "subset", "--downsample_mode", "learned",
-                "--num_candidates", "188",
-                "--class_attention_layers", "1", "--omega_db", "4", "--learn_b",
-                // encoder slow, head fast -- no --freeze_encoder here
-                "--max-epochs", "12", "--lr", "0.00003", "--head_lr", "0.0003",
-                "--batch-size", "8", "--accumulate-grad-batches", "8",
-                "--num-workers", "0", "--logger", "none",
-                "--val-frequency", "10000", "--snapshot_every", "2",
-                "--init_all_from", "${workspaceFolder}/checkpoints/new188 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=017.ckpt",
-                "--compile"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false
-        },
-        {
-            "name": "score: compute_paper_metrics (val, whole-piece)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/launch_scripts/compute_paper_metrics.py",
+            "program": "${workspaceFolder}/launch_scripts/score_fold0_subset.py",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"},
-            "args": ["--models", "${workspaceFolder}/checkpoints/new188 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=017.ckpt", "--gpu", "3", "--num_workers", "0", "--datasplit", "val"],
+            "args": [
+                "--gpu", "0", "--fold", "0", "--num-workers", "0",
+                "--pattern", "checkpoints/L1_base*.ckpt",
+                "--out", "cache/fold0_subset_scores.csv"
+            ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "diagnose_bottleneck (A/B/C/D breakdown)",
+            "name": "score: vanilla snapshots on fold 0 (beat + downbeat)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/score_fold0_dense.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
+            "args": [
+                "--gpu", "0", "--fold", "0", "--num-workers", "0",
+                "--pattern", "/disk1/jaehoon/ckpt_snapshots/vanillaS1_f0_ep099.ckpt",
+                "--out", "cache/fold0_dense_scores.csv"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "diagnose_bottleneck (A/B/C/D + downbeat precision)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/diagnose_bottleneck.py",
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"},
-            "args": ["--checkpoints", "${workspaceFolder}/checkpoints/new188 S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=017.ckpt", "--songs", "16", "--num-workers", "0", "--gpu", "3"],
+            "args": [
+                "--checkpoints", "checkpoints/L1_base*.ckpt",
+                "--songs", "100", "--gpu", "0", "--num-workers", "0"
+            ],
             "console": "integratedTerminal",
             "justMyCode": false
         },

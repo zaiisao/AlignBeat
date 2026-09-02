@@ -60,6 +60,7 @@ class PLBeatThis(LightningModule):
         class_prior=None,
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
+        class_attention_pos: str = "none",
         subset_kwargs: dict = None,
         tau_beat: float = 0.2,
         tau_downbeat: float = 0.2,
@@ -99,6 +100,7 @@ class PLBeatThis(LightningModule):
             class_prior=class_prior,
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
+            class_attention_pos=class_attention_pos,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -339,8 +341,10 @@ class PLBeatThis(LightningModule):
             # The bias stays frozen for the whole run either way (see SubsetHead), so
             # only the weights move -- the head can redistribute precision across
             # candidates but not shift its overall scale.
-            train_precision = self.current_epoch >= self.max_epochs * 0.3
-            self.model.task_heads.head.precision_head.weight.requires_grad_(train_precision)
+
+            if self.current_epoch >= self.max_epochs * 0.3:
+                precision_head = self.model.task_heads.head.precision_head
+                precision_head.weight.requires_grad_(True)
 
         # run the model
         model_prediction = self.model(batch["spect"])
@@ -518,8 +522,16 @@ class PLBeatThis(LightningModule):
         for tag, pred, lr in (("encoder", lambda n: not _is_head(n), self.lr),
                               ("head",    _is_head,                  head_lr)):
             for decay, keep in (("decay", lambda p: p.ndim >= 2), ("nodecay", lambda p: p.ndim <= 1)):
+                # No requires_grad filter: configure_optimizers runs once, at fit
+                # start, so filtering here permanently excludes anything frozen at
+                # construction -- the precision head was, and the epoch-30 thaw in
+                # training_step then flipped a flag on a tensor no optimizer owned, so
+                # b_hat never moved off its init in any run. requires_grad already
+                # controls whether a parameter RECEIVES a gradient; a frozen one keeps
+                # p.grad = None and AdamW skips it, so freezing still works and thawing
+                # now takes effect.
                 ps = [p for n, p in self.named_parameters()
-                      if p.requires_grad and pred(n) and keep(p) and id(p) not in seen]
+                      if pred(n) and keep(p) and id(p) not in seen]
                 for p in ps: seen.add(id(p))
                 if ps:
                     groups.append({"params": ps, "lr": lr,
