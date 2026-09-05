@@ -37,6 +37,28 @@ Everything else — dataset, augmentation, losses, postprocessor, metrics,
 
 To pull upstream changes: `git merge beat_this/main`.
 
+## A third arm: continuous phase
+
+`--head_type phase` replaces the subset head's 3-way class posterior with a
+continuous bar phase in [0, 1): a downbeat is phase 0, the k-th beat of an
+L-beat bar is k/L, and the meter is inferred at decode time rather than needed
+at the head. Everything upstream of the head is shared with `--head_type
+subset` — same encoder, same `Downsample`, same N, same equation (1), same
+order-preserving DP — so the two are a controlled comparison.
+
+It does not work yet, and `tests/test_phase_arm.py` says why rather than
+leaving it to be rediscovered. The phase objective is an L1 distance on the
+circle against a target distribution that is uniform on {0, ¼, ½, ¾}, a set
+invariant under rotation by ¼: every constant prediction is a stationary point
+with zero gradient. Measured on the reference implementation at epoch 9 of fold
+0, the trained head scored a mean circular phase error of **0.2488** against
+**0.2484** for a fixed constant and **0.2434** for the best constant — worse
+than a constant — and downbeat F was exactly 0.0000 on every dataset. Two of
+the tests pin that landscape, and a third pins the second defect: the timing
+scale's normaliser is `log(2b)` rather than `log(2ε + 2b)`, with no Gamma prior,
+so the loss improves without limit as b shrinks and its curve says nothing about
+whether the model is learning.
+
 ## What is implemented
 
 Everything is off by default: the defaults are the hard-EM pipeline of Sections 5-7.

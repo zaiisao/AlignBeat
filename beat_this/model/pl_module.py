@@ -20,6 +20,8 @@ import numpy as np
 from beat_this.model.beat_tracker import BeatThis
 from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
+from alignbeat.phase_criterion import PhaseCriterion, phases_from_downbeats
+from alignbeat.phase_decode import decode_events as phase_decode_events
 from alignbeat.decode import decode_events
 from alignbeat.stitching import stitch_piece
 from beat_this.model.postprocessor import Postprocessor
@@ -108,6 +110,7 @@ class PLBeatThis(LightningModule):
         # candidates are responsible for which events, and the loss is evaluated at that
         # selection. Nothing frame-wise applies, so the BCE variants below are skipped.
         self.subset_criterion = None
+        self.phase_criterion = None
         if head_type == "subset":
             # Checkpoints written before a knob was retired still carry it in their
             # saved hyper_parameters, so drop anything the criterion no longer takes
@@ -120,6 +123,15 @@ class PLBeatThis(LightningModule):
                       f"checkpoint: {', '.join(dropped)}", flush=True)
                 kwargs = {k: v for k, v in kwargs.items() if k in accepted}
             self.subset_criterion = SubsetCriterion(**kwargs)
+        elif head_type == "phase":
+            kwargs = dict(subset_kwargs or {})
+            accepted = set(inspect.signature(PhaseCriterion.__init__).parameters)
+            dropped = sorted(k for k in kwargs if k not in accepted)
+            if dropped:
+                print(f"[phase] ignoring arguments this criterion does not take: "
+                      f"{', '.join(dropped)}", flush=True)
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+            self.phase_criterion = PhaseCriterion(**kwargs)
         elif loss_type == "shift_tolerant_weighted_bce":
             self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
                 pos_weight=pos_weights["beat"]
@@ -182,6 +194,68 @@ class PLBeatThis(LightningModule):
             downbeats.append(np.sort(seconds[classes == DOWNBEAT]))
         return tuple(beats), tuple(downbeats)
 
+    def _phase_decode(self, batch, model_prediction):
+        """Section 5 / Algorithm 9-10 per excerpt, as predicted TIMES in seconds.
+
+        Same contract as _subset_decode, so validation_step and the metrics are shared.
+        """
+        num_frames = batch["truth_beat"].shape[-1]
+        window_seconds = num_frames / self.fps
+        padding_mask = batch.get("padding_mask")
+        beats, downbeats = [], []
+        for index in range(len(batch["spect"])):
+            beat_t, downbeat_t, _meter = phase_decode_events(
+                model_prediction["phi_hat"][index].float().detach(),
+                model_prediction["t_hat"][index].float().detach())
+            beat_s = np.asarray(beat_t) * window_seconds
+            downbeat_s = np.asarray(downbeat_t) * window_seconds
+            if padding_mask is not None:
+                # Same restriction the subset arm applies: candidates in the zero-padded
+                # tail are pure false positives that no ground-truth event can match.
+                valid_seconds = float(padding_mask[index].sum()) / self.fps
+                beat_s = beat_s[beat_s < valid_seconds]
+                downbeat_s = downbeat_s[downbeat_s < valid_seconds]
+            beats.append(np.sort(beat_s))
+            downbeats.append(np.sort(downbeat_s))
+        return tuple(beats), tuple(downbeats)
+
+    def _phase_targets(self, batch):
+        """Ground-truth events for the phase head: times, and bar phase where known.
+
+        phi_true is None for a beat-only excerpt. That is not a missing value to be
+        imputed -- the annotation genuinely does not say which beats are downbeats -- and
+        the criterion's E-step branches on it, matching phase-blind and resolving the bar
+        phase afterwards.
+        """
+        num_frames = batch["truth_beat"].shape[-1]
+        window_seconds = num_frames / self.fps
+        device = batch["spect"].device
+        targets = []
+        for index in range(len(batch["spect"])):
+            beats = np.frombuffer(batch["truth_orig_beat"][index])
+            downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
+            has_downbeats = bool(batch["downbeat_mask"][index])
+
+            # eq. (1) maps onto the half-open axis (0, 1], so a target at exactly 0 is
+            # unreachable by construction and would be an unmatchable event.
+            beats = np.unique(beats[(beats > 0) & (beats <= window_seconds)])
+            if self.quantize_targets:
+                beats = np.round(beats * self.fps) / self.fps
+
+            phi_true = None
+            if has_downbeats and len(beats):
+                positions = np.flatnonzero(np.isin(beats, downbeats))
+                phi_true = torch.as_tensor(
+                    phases_from_downbeats(len(beats), positions),
+                    dtype=torch.float32, device=device)
+
+            targets.append({
+                "t_true": torch.as_tensor(beats / window_seconds,
+                                          dtype=torch.float32, device=device),
+                "phi_true": phi_true,
+            })
+        return targets
+
     def _subset_targets(self, batch):
         """Ground-truth events for the alignment head, from this batch's own annotations."""
         num_frames = batch["truth_beat"].shape[-1]
@@ -212,6 +286,7 @@ class PLBeatThis(LightningModule):
                 classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
             else:
                 classes = np.full(len(beats), CLASS_UNKNOWN)
+
             targets.append({
                 "times": torch.as_tensor(beats / window_seconds,
                                          dtype=torch.float32, device=device),
@@ -220,6 +295,17 @@ class PLBeatThis(LightningModule):
         return targets
 
     def _compute_loss(self, batch, model_prediction):
+        if self.phase_criterion is not None:
+            losses, _stats = self.phase_criterion(
+                model_prediction["phi_hat"].float(),
+                model_prediction["t_hat"].float(),
+                model_prediction["b_e"].float(),
+                self._phase_targets(batch))
+            # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
+            # are unchanged; they carry the timing and phase terms of this arm's loss.
+            return {"beat": losses["phase"], "downbeat": losses["time"],
+                    "total": losses["total"]}
+
         if self.subset_criterion is not None:
             losses, _stats = self.subset_criterion(
                 model_prediction["class_logits"].float(),
@@ -348,8 +434,9 @@ class PLBeatThis(LightningModule):
             self.model.task_heads.head.precision_head.weight.grad = None
 
     def training_step(self, batch, batch_idx):
-        # run the model
-        model_prediction = self.model(batch["spect"])
+        # run the model. The epoch is only read by the phase head, whose timing scale is
+        # held at b_0 until its warm start is over; every other head ignores it.
+        model_prediction = self.model(batch["spect"], epoch=self.current_epoch)
 
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
@@ -358,11 +445,13 @@ class PLBeatThis(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # run the model
-        model_prediction = self.model(batch["spect"])
+        model_prediction = self.model(batch["spect"], epoch=self.current_epoch)
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
         # postprocess the predictions
-        if self.subset_criterion is not None:
+        if self.phase_criterion is not None:
+            postp_beat, postp_downbeat = self._phase_decode(batch, model_prediction)
+        elif self.subset_criterion is not None:
             postp_beat, postp_downbeat = self._subset_decode(batch, model_prediction)
         else:
             postp_beat, postp_downbeat = self.postprocessor(

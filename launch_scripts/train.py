@@ -84,12 +84,13 @@ def main(args):
         fold=args.fold,
     )
 
-    if args.dbn and args.head_type == "subset":
+    if args.dbn and args.head_type in ("subset", "phase"):
         # The DBN postprocessor consumes frame-wise activations; the alignment head
         # emits per-candidate events and never builds them, so use_dbn would be silently
         # ignored. Refuse rather than report DBN numbers that were not produced by one.
-        parser.error("--dbn is not supported with --head_type subset: the alignment "
-                     "head emits events, not the frame-wise activations a DBN needs.")
+        parser.error(f"--dbn is not supported with --head_type {args.head_type}: "
+                     "the alignment heads emit events, not the frame-wise activations "
+                     "a DBN needs.")
 
     datamodule.setup(stage="fit")
 
@@ -97,7 +98,7 @@ def main(args):
     pos_weights = datamodule.get_train_positive_weights(widen_target_mask=3)
     print("Using positive weights: ", pos_weights)
     if args.lr is None:
-        args.lr = 3e-4 if args.head_type == "subset" else 8e-4
+        args.lr = 3e-4 if args.head_type in ("subset", "phase") else 8e-4
         print(f"[lr] {args.lr:g} resolved from head_type={args.head_type}", flush=True)
 
     dropout = {
@@ -150,7 +151,13 @@ def main(args):
         # implemented but has no path from the CLI is worse than one that is absent:
         # an ablation of it shows no difference and reads as "the idea does not help",
         # when in fact it never ran.
-        subset_kwargs={
+        # The phase arm's criterion takes a different set entirely; passing the subset
+        # ones would print a "does not take" line for every single knob.
+        subset_kwargs=({
+            "lambda_phi": args.lambda_phi,
+            "lambda_r": args.lambda_r,
+            "normalize_by_events": args.normalize_by_events,
+        } if args.head_type == "phase" else {
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
             "joint_phase": args.joint_phase,
@@ -161,7 +168,7 @@ def main(args):
             "mu_meter": args.mu_meter,
             "normalize_by_events": args.normalize_by_events,
             "background_by_unmatched": args.background_by_unmatched,
-        },
+        }),
     )
     # --- frozen-encoder head swap -------------------------------------------------
     # Isolates "is the encoder good enough" from "is the head lossy". Both arms share
@@ -304,7 +311,7 @@ if __name__ == "__main__":
     # explicit --lr still wins. Do NOT pair 8e-4 with --head_lr 3e-4: that is the
     # disc_lr2 arm, 0.649 at ep17, killed (docs/ABLATIONS.md).
     parser.add_argument("--lr", type=float, default=None,
-                        help="default: 3e-4 for --head_type subset, 8e-4 for dense")
+                        help="default: 3e-4 for --head_type subset/phase, 8e-4 for dense")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
@@ -341,7 +348,7 @@ if __name__ == "__main__":
                         help="keep a checkpoint every N epochs (0 = overwrite one file); "
                              "pair with a large --val-frequency to train without eval")
     parser.add_argument("--head_type", type=str, default="dense",
-                        choices=["dense", "subset"])
+                        choices=["dense", "subset", "phase"])
     parser.add_argument("--train_length", type=int, default=1500,
                         help="T, the excerpt length in frames; N is derived from it")
     parser.add_argument("--stitch_border", type=int, default=None,
@@ -408,6 +415,12 @@ if __name__ == "__main__":
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
     parser.add_argument("--joint_phase", action="store_true", default=False)
+    # --- the continuous-phase arm (--head_type phase) -----------------------------
+    parser.add_argument("--lambda_phi", type=float, default=3.0,
+                        help="weight on the circular phase distance, against a timing "
+                             "term already scaled by 1/b_e")
+    parser.add_argument("--lambda_r", type=float, default=0.0,
+                        help="periodicity regularizer on matched downbeat spacings")
     parser.add_argument("--meter_L", type=int, default=0)
     parser.add_argument("--mu_meter", type=float, default=0.0,
                         help="Section 4.2 eq. (6): known-meter spacing inside the selection")

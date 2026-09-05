@@ -6,6 +6,7 @@ import contextlib
 
 from alignbeat.downsample import Downsample
 from alignbeat.head import SubsetSelectionHead
+from alignbeat.phase_head import PhaseTimeHead
 from collections import OrderedDict
 
 import torch
@@ -107,6 +108,20 @@ class BeatThis(nn.Module):
                 class_attention_heads=class_attention_heads,
                 class_attention_pos=class_attention_pos,
                 class_attention_final_norm=class_attention_final_norm)
+        elif head_type == "phase":
+            if num_candidates is None:
+                raise ValueError(
+                    "head_type='phase' needs num_candidates; launch_scripts/train.py "
+                    "derives it from --bpm_max and --train_length")
+            # The continuous-phase arm: the same candidate grid as 'subset', with a
+            # phase branch in place of the class branch.
+            self.task_heads = PhaseTimeHead(
+                transformer_dim, num_candidates=num_candidates,
+                downsample_mode=downsample_mode, train_length=train_length, fps=fps,
+                downsample_stages=downsample_stages,
+                phase_attention_layers=class_attention_layers,
+                phase_attention_heads=class_attention_heads,
+                phase_attention_final_norm=class_attention_final_norm)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -118,7 +133,7 @@ class BeatThis(nn.Module):
         # ...then restore the subset head's own initialisation, which the generic pass
         # above would otherwise overwrite: the class prior on the classifier bias, the
         # zeroed regression/class/precision weights, and the precision head's scale.
-        if isinstance(self.task_heads, SubsetHead):
+        if isinstance(self.task_heads, (SubsetHead, PhaseTimeHead)):
             self.task_heads.head._initialize_weights()
 
     @staticmethod
@@ -201,11 +216,14 @@ class BeatThis(nn.Module):
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0)
 
-    def forward(self, x):
+    def forward(self, x, epoch=None):
         x = self.frontend(x)
         x = self.transformer_blocks(x)
-        x = self.task_heads(x)
-        return x
+        # Only the phase head reads the epoch, for its timing-scale warm start; the
+        # other two take the features alone.
+        if isinstance(self.task_heads, PhaseTimeHead):
+            return self.task_heads(x, epoch=epoch)
+        return self.task_heads(x)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         # remove _orig_mod prefixes for compiled models
