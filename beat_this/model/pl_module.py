@@ -179,14 +179,12 @@ class PLBeatThis(LightningModule):
                 model_prediction["t_hat"][index].float(),
                 self.tau_beat, self.tau_downbeat,
                 db_margin=self.db_margin)
-            times = times.detach().cpu().numpy()
+            seconds = (times * window_seconds).detach().cpu().numpy()
             classes = classes.detach().cpu().numpy()
-            # Filtered independently, which is the same result as filtering the pair
-            # together: the downbeats are a subset of the beats and share the threshold.
-            beats.append(self._emitted_seconds(times, window_seconds,
-                                               padding_mask, index))
-            downbeats.append(self._emitted_seconds(times[classes == DOWNBEAT],
-                                                   window_seconds, padding_mask, index))
+            keep = seconds < self._valid_seconds(padding_mask, index)
+            seconds, classes = seconds[keep], classes[keep]
+            beats.append(np.sort(seconds))
+            downbeats.append(np.sort(seconds[classes == DOWNBEAT]))
         return tuple(beats), tuple(downbeats)
 
     def _window_events(self, batch, index, window_seconds):
@@ -210,20 +208,17 @@ class PLBeatThis(LightningModule):
             beats = np.round(beats * self.fps) / self.fps
         return beats
 
-    def _emitted_seconds(self, times, window_seconds, padding_mask, index):
-        """Decoded times on the (0, 1] axis -> sorted seconds, padding excluded.
+    def _valid_seconds(self, padding_mask, index):
+        """How much of this excerpt is real audio rather than zero padding.
 
-        Without the restriction, candidates landing in an excerpt's zero-padded tail are
-        emitted as detections that no ground-truth event can match (truth_orig_* stops at
-        the real end), so they are pure false positives charged to one arm only.
+        The dense arm passes padding_mask to its postprocessor; without the same cutoff,
+        events decoded into an excerpt's padded tail are emitted as detections that no
+        ground-truth event can match (truth_orig_* stops at the real end), so they are
+        pure false positives charged to the alignment arms only.
         """
-        # No dtype coercion: the subset arm's times arrive as float32, and upcasting
-        # here would shift its emitted seconds by ~1e-6 s against every number already
-        # recorded for it.
-        seconds = np.asarray(times) * window_seconds
-        if padding_mask is not None:
-            seconds = seconds[seconds < float(padding_mask[index].sum()) / self.fps]
-        return np.sort(seconds)
+        if padding_mask is None:
+            return float("inf")
+        return float(padding_mask[index].sum()) / self.fps
 
     def _phase_decode(self, batch, model_prediction):
         """Section 5 / Algorithm 9-10 per excerpt, as predicted TIMES in seconds.
@@ -238,10 +233,11 @@ class PLBeatThis(LightningModule):
             beat_t, downbeat_t, _meter = phase_decode_events(
                 model_prediction["phi_hat"][index].float().detach(),
                 model_prediction["t_hat"][index].float().detach())
-            beats.append(self._emitted_seconds(beat_t, window_seconds,
-                                               padding_mask, index))
-            downbeats.append(self._emitted_seconds(downbeat_t, window_seconds,
-                                                   padding_mask, index))
+            valid = self._valid_seconds(padding_mask, index)
+            beat_s = np.asarray(beat_t) * window_seconds
+            downbeat_s = np.asarray(downbeat_t) * window_seconds
+            beats.append(np.sort(beat_s[beat_s < valid]))
+            downbeats.append(np.sort(downbeat_s[downbeat_s < valid]))
         return tuple(beats), tuple(downbeats)
 
     def _phase_targets(self, batch):
