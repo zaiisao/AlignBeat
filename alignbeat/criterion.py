@@ -140,15 +140,26 @@ class SubsetCriterion(nn.Module):
 
     @staticmethod
     def class_nll(log_probabilities, event_classes):
-        """-log p_j(c_i) for every (event, candidate) pair, handling unlabelled classes."""
-        empty = event_classes == CLASS_UNKNOWN
-        safe = torch.where(empty, torch.zeros_like(event_classes), event_classes)
-        cost = -log_probabilities[:, safe].transpose(0, 1)                      # (M, N)
-        if bool(empty.any()):
-            active = torch.logsumexp(
-                log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1)                 # (N,)
-            cost = torch.where(empty[:, None], (-active)[None, :], cost)
-        return cost
+        """-log p_j(c_i) for every (event, candidate) pair, handling unlabelled classes.
+
+        A labelled event costs the NLL of its own class. An unlabelled one (beat-only
+        data's B* label) is known to be an event but not which kind, so it costs the
+        marginal -log(p_DB + p_B) instead, which steers the model toward neither.
+        """
+        # JA: CLASS_UNKNOWN is assigned to all events in the beat-only dataset
+        labelled = event_classes != CLASS_UNKNOWN
+        
+        # JA: We first calculate the log-probability of the union of the downbeat and
+        # beat classes. The three classes are mutually exclusive and exhaustive, so
+        # summing two of them marginalizes out which kind of event it is and leaves
+        # log(1 - p_background): the log-probability that this candidate is an event
+        # at all.
+        cost = -torch.logsumexp(log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1,
+                                keepdim=True).repeat(1, len(event_classes))     # (N, M)
+
+        cost[:, labelled] = -log_probabilities[:, event_classes[labelled]]
+
+        return cost.transpose(0, 1)                                             # (M, N)
 
     def _e_step(self, log_probabilities_b, t_hat_b, laplace_scale, event_classes, event_times):
         """Algorithm 3 lines 1-9: the MAP estimate of sigma under the current theta."""
