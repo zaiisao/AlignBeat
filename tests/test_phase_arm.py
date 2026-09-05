@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alignbeat.dp import subset_select_dp
 from alignbeat.phase_criterion import PhaseCriterion, circ_dist, phases_from_downbeats
-from alignbeat.phase_decode import decode_events, infer_meter
+from alignbeat.phase_decode import decode, decode_events, decode_fragment, grid_tolerance, infer_meter
 from alignbeat.phase_head import PhaseHead, PhaseSelectionHead, PhaseTimeHead
 
 
@@ -59,8 +59,13 @@ def test_warm_start_pins_the_scale_then_releases_it():
     _, _, early = head(torch.randn(2, 16, 12), epoch=0)
     _, _, late = head(torch.randn(2, 16, 12), epoch=6)
     assert torch.allclose(early, torch.full_like(early, head.b_0)), early
-    assert not torch.allclose(late, torch.full_like(late, head.b_0)), late
-    print("ok: b_e is pinned at b_0 through the warm start and learned afterwards")
+    # Pinned: a constant, nothing to train. Released: the same VALUE (continuity is the
+    # point) but now on the graph, so the scale head can move from here.
+    assert not early.requires_grad
+    assert late.requires_grad and late.grad_fn is not None
+    late.sum().backward()
+    assert head.precision_head.net[-1].bias.grad is not None
+    print("ok: b_e is pinned at b_0 through the warm start and trainable afterwards")
 
 
 def test_skip_cost_is_a_column_subtraction():
@@ -295,6 +300,170 @@ def test_end_to_end_head_shapes():
     assert out["t_hat"].shape == (2, 20) and out["b_e"].shape == (2,)
     assert out["beat"] is None and out["downbeat"] is None
     print("ok: PhaseTimeHead maps a window to N candidates with the shared Downsample")
+
+
+def test_warm_start_release_is_continuous():
+    """The reference released b_e at softplus(random init) ~ 0.69, 280x b_0."""
+    torch.manual_seed(0)
+    head = PhaseSelectionHead(feature_size=16, reduced_dim=8, hidden_size=8, warmup_epochs=5)
+    x = torch.randn(3, 16, 20)
+    _, _, pinned = head(x, epoch=5)
+    _, _, released = head(x, epoch=6)
+    assert torch.allclose(pinned, released, atol=1e-5), (pinned, released)
+    assert abs(float(released[0]) - head.b_0) < 1e-5, (float(released[0]), head.b_0)
+    print("ok: b_e is identical the epoch before and after the warm start releases it")
+
+
+def test_head_widths_match_the_reference():
+    head = PhaseSelectionHead(feature_size=16, reduced_dim=8)
+    for branch in (head.phase_head, head.regression_head, head.precision_head):
+        assert branch.net[0].out_features == 256, branch.net[0].out_features
+    print("ok: every head branch is 256 wide, as in the reference and SubsetSelectionHead")
+
+
+def test_positional_encoding_lets_the_phase_branch_count():
+    """Identical candidate features must still yield DIFFERENT phases under index pos."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 16, 1).expand(1, 16, 12).contiguous()      # 12 identical candidates
+    blind = PhaseSelectionHead(feature_size=16, reduced_dim=8, hidden_size=8,
+                               phase_attention_pos="none")
+    torch.manual_seed(0)
+    indexed = PhaseSelectionHead(feature_size=16, reduced_dim=8, hidden_size=8,
+                                 phase_attention_pos="index")
+    phi_blind, _, _ = blind(x)
+    phi_index, _, _ = indexed(x)
+    assert float(phi_blind.std()) < 1e-5, "with no position, identical inputs give identical phase"
+    assert float(phi_index.std()) > 1e-3, "with index position, identical inputs must differ"
+    print("ok: permutation-equivariant attention cannot count; index encoding can")
+
+
+def test_prior_is_per_event_so_the_floor_does_not_drift_with_M():
+    """Added once per fragment the floor was eps/sqrt(M): 9 ms at M=60, not 50 ms."""
+    from alignbeat.phase_criterion import EPS
+    crit = PhaseCriterion(timing_guards=True)
+    floors = {}
+    for M in (2, 10, 60):
+        t_true = torch.linspace(0.1, 0.9, M)
+        t_hat = t_true + 1e-5 * EPS                              # inside the dead zone
+        sigma = torch.arange(M)
+        phi = torch.zeros(M)
+        best_b, best = None, float("inf")
+        for b in torch.logspace(-6, -1, 2000):
+            terms = crit._m_step(sigma, phi, t_true, t_hat, phi, b, t_hat.new_zeros(0))
+            v = float(terms["time"] + terms["scale"])
+            if v < best:
+                best, best_b = v, float(b)
+        floors[M] = best_b / EPS
+    for M, f in floors.items():
+        assert abs(f - 0.707) < 0.05, f"M={M}: b*/eps = {f:.3f}, expected ~0.707"
+    print(f"ok: guarded b*/eps = {floors} -- independent of M")
+
+
+def test_decode_threshold_rejects_something_at_every_meter():
+    """tau=0.2 absolute exceeded 1/(2L) for L>=3: every candidate fired, always."""
+    torch.manual_seed(0)
+    phi = torch.rand(10000)
+    t = torch.linspace(0.0001, 1.0, 10000)
+    for L in (2, 3, 4, 6):
+        _, _, accepted = decode(phi, t, L)
+        frac = len(accepted) / 10000
+        assert 0.0 < frac < 1.0, f"L={L}: accepted fraction {frac}"
+        # tau is a fraction of the half-spacing, so the accepted fraction IS tau
+        assert abs(frac - 0.4) < 0.03, f"L={L}: accepted {frac:.3f}, expected ~0.40"
+        on_grid = torch.arange(L, dtype=torch.float) / L
+        _, _, all_in = decode(on_grid, torch.linspace(0.1, 0.9, L), L)
+        assert len(all_in) == L, "phases exactly on the grid must all be accepted"
+    assert grid_tolerance(1.0, 4) == 0.125, grid_tolerance(1.0, 4)
+    print("ok: the decode threshold now rejects 60% of uniform phase at every meter")
+
+
+def test_decode_fragment_matches_decode_events():
+    phi = torch.tensor([0.0, .25, .5, .75] * 8) + 0.01 * torch.randn(32)
+    t = torch.linspace(0.01, 0.99, 32)
+    beats, downbeats, _ = decode_events(phi % 1.0, t)
+    classes, times, scores = decode_fragment(phi % 1.0, t)
+    assert times.tolist() == beats, "same accepted times in the same order"
+    assert sorted(times[classes == 0].tolist()) == sorted(downbeats)
+    assert float(scores.min()) >= 0.0 and float(scores.max()) <= 1.0
+    print("ok: the stitcher's per-fragment decode agrees with the excerpt decode")
+
+
+def test_beat_only_phase_blind_mode_sends_no_phase_gradient():
+    """A perfect 3/4 prediction on a beat-only fragment: lattice mode still penalises it."""
+    torch.manual_seed(0)
+    M, N = 12, 40
+    t_true = torch.linspace(0.05, 0.95, M)
+    t_hat = t_true.clone()
+    phi_hat = torch.tensor([(k % 3) / 3 for k in range(M)]).repeat_interleave(1)
+    full_phi = torch.zeros(N); full_phi[torch.arange(M)] = phi_hat
+    full_phi = full_phi.requires_grad_(True)
+    full_t = torch.sort(torch.cat([t_hat, torch.rand(N - M) * 0.98 + 0.01])).values
+    b = torch.full((1,), 0.002)
+    grads = {}
+    for mode in ("lattice", "phase_blind"):
+        crit = PhaseCriterion(beat_only_mode=mode)
+        losses, _ = crit(full_phi.unsqueeze(0), full_t.unsqueeze(0), b,
+                         [{"t_true": t_true, "phi_true": None}])
+        if not losses["total"].requires_grad:      # nothing in the loss touches phi
+            grads[mode] = 0.0
+            continue
+        g, = torch.autograd.grad(losses["total"], full_phi, allow_unused=True)
+        grads[mode] = 0.0 if g is None else float(g.abs().sum())
+    assert grads["phase_blind"] == 0.0, grads
+    assert grads["lattice"] > 0.0, grads
+    print(f"ok: beat-only gradient on phi -- lattice {grads['lattice']:.2f}, phase_blind 0")
+
+
+def test_phase_in_b_puts_phase_and_timing_on_one_scale():
+    crit = PhaseCriterion(phase_in_b=True)
+    ref = PhaseCriterion(phase_in_b=False)
+    t_true = torch.tensor([0.3, 0.6]); phi_true = torch.tensor([0.0, 0.5])
+    t_hat = torch.linspace(0.1, 0.9, 9); phi_hat = torch.rand(9)
+    b = torch.tensor(0.002)
+    a = crit.match_cost(t_true, phi_true, t_hat, phi_hat, b, phase_blind=False)
+    r = ref.match_cost(t_true, phi_true, t_hat, phi_hat, b, phase_blind=False)
+    from alignbeat.phase_criterion import EPS
+    residual = (t_true[:, None] - t_hat[None, :]).abs().sub(EPS).clamp(min=0)
+    phase = 3.0 * circ_dist(phi_true[:, None], phi_hat[None, :])
+    assert torch.allclose(a, (residual + phase) / b)
+    assert torch.allclose(r, residual / b + phase)
+    print("ok: phase_in_b divides the phase distance by b in the matching cost")
+
+
+def test_quantize_targets_keeps_downbeats():
+    """Rounding beats but not downbeats made np.isin miss every one of them."""
+    import numpy as np
+    from beat_this.model.pl_module import PLBeatThis
+    m = PLBeatThis(head_type="phase", num_candidates=188, transformer_dim=64, n_layers=2,
+                   downsample_stages=3, quantize_targets=True, max_epochs=1)
+    beats = 0.5 + 0.513 * np.arange(40)                       # off the 50 fps grid
+    batch = {"spect": torch.zeros(1, 1500, 128), "truth_beat": torch.zeros(1, 1500),
+             "truth_orig_beat": [beats.tobytes()],
+             "truth_orig_downbeat": [beats[::4].tobytes()],
+             "downbeat_mask": torch.tensor([True])}
+    phi = m._phase_targets(batch)[0]["phi_true"]
+    assert phi is not None
+    assert int((phi == 0).sum()) == 10, f"expected 10 downbeats, got {int((phi == 0).sum())}"
+    assert len(torch.unique(phi)) == 4, torch.unique(phi)
+    print("ok: --quantize_targets moves downbeats to the same grid as beats")
+
+
+def test_predict_step_routes_the_phase_arm():
+    from beat_this.model.pl_module import PLBeatThis
+    # 3 halvings of a 400-frame window: 400 -> 200 -> 100 -> 50, so N must be 50.
+    m = PLBeatThis(head_type="phase", num_candidates=50, transformer_dim=64, n_layers=2,
+                   downsample_stages=3, train_length=400, max_epochs=1)
+    m.eval()
+    T = 900
+    beats = np.arange(0.5, 17.5, 0.5)
+    batch = {"spect": torch.randn(1, T, 128), "padding_mask": torch.ones(1, T, dtype=torch.bool),
+             "truth_beat": torch.zeros(1, T), "truth_downbeat": torch.zeros(1, T),
+             "downbeat_mask": torch.tensor([True]),
+             "truth_orig_beat": [beats.tobytes()], "truth_orig_downbeat": [beats[::4].tobytes()],
+             "dataset": ["synthetic"], "spect_path": ["synthetic"]}
+    metrics, _, _, _ = m.predict_step(batch, 0, chunk_size=400)
+    assert isinstance(metrics, dict) and metrics, metrics
+    print("ok: predict_step reaches the phase decoder through the shared stitcher")
 
 
 if __name__ == "__main__":

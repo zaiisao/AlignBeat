@@ -68,10 +68,26 @@ class PhaseCriterion(nn.Module):
 
     def __init__(self, lambda_phi=LAMBDA_PHI, lambda_r=0.0,
                  beat_only_meter=FALLBACK_METER, normalize_by_events=True,
-                 timing_guards=True):
+                 timing_guards=True, phase_in_b=False, beat_only_mode="lattice"):
         super().__init__()
         self.lambda_phi = float(lambda_phi)
         self.lambda_r = float(lambda_r)
+        # phase_in_b puts the phase distance on the SAME scale as timing, (r + lam*d)/b,
+        # in both the E-step cost and the M-step. As written, the cost is r/b + lam*d with
+        # 1/b ~ 430 at the guard floor against lam = 3, so the DP matches on timing alone
+        # and phase supervision lands on whichever candidate is nearest in time. In the
+        # audit's bisection this was the only criterion change that moved anything: DP
+        # match accuracy 0.17-0.40 -> 0.74-0.97, phase error at the DP's sigma 0.177 ->
+        # 0.0015, seed-stable. A formulation change, so opt-in until a real run confirms.
+        self.phase_in_b = bool(phase_in_b)
+        # beat_only_mode: how a fragment with no downbeat labels is supervised.
+        #   lattice      the reference: assume a 4-beat bar, pick the best phase offset,
+        #                and teach that lattice at full weight -- anti-supervision on
+        #                every 3/4 excerpt in simac and smc, ~18% of training tracks.
+        #   phase_blind  timing and scale only; no phase or agree term on these fragments.
+        if beat_only_mode not in ("lattice", "phase_blind"):
+            raise ValueError(f"beat_only_mode must be lattice|phase_blind, got {beat_only_mode!r}")
+        self.beat_only_mode = beat_only_mode
         # SubsetCriterion's three protections on the timing scale, absent from the source
         # formulation. Without them b tracks the raw residual to zero, the timing term's
         # 1/b weight grows without bound, and it takes over the SHARED trunk: measured on
@@ -88,7 +104,8 @@ class PhaseCriterion(nn.Module):
         print(f"[phase-criterion] lambda_phi={self.lambda_phi} "
               f"lambda_r={self.lambda_r} beat_only_meter={self.beat_only_meter} "
               f"normalize_by_events={self.normalize_by_events} "
-              f"timing_guards={self.timing_guards}", flush=True)
+              f"timing_guards={self.timing_guards} phase_in_b={self.phase_in_b} "
+              f"beat_only_mode={self.beat_only_mode}", flush=True)
 
     # -- cost ---------------------------------------------------------------
 
@@ -97,10 +114,12 @@ class PhaseCriterion(nn.Module):
         residual = torch.abs(t_true[:, None] - t_hat[None, :])
         if self.timing_guards:
             residual = residual.sub(EPS).clamp(min=0.0)
-        timing = residual / b_e
         if phase_blind:
-            return timing
-        return timing + self.lambda_phi * circ_dist(phi_true[:, None], phi_hat[None, :])
+            return residual / b_e
+        phase = self.lambda_phi * circ_dist(phi_true[:, None], phi_hat[None, :])
+        if self.phase_in_b:
+            return (residual + phase) / b_e
+        return residual / b_e + phase
 
     @staticmethod
     def l_agree(phi_hat, t_true, phi_true, t_hat):
@@ -170,10 +189,15 @@ class PhaseCriterion(nn.Module):
                 cost = self.match_cost(t_true, None, t_hat, phi_hat, b_e,
                                        phase_blind=True)
                 sigma = subset_select_dp(cost.cpu().numpy())
-                phi_i = self._hard_phi0(torch.from_numpy(sigma).to(phi_hat.device),
-                                        phi_hat, self.beat_only_meter)
+                if self.beat_only_mode == "phase_blind":
+                    phi_i = None
+                else:
+                    phi_i = self._hard_phi0(torch.from_numpy(sigma).to(phi_hat.device),
+                                            phi_hat, self.beat_only_meter)
 
         sigma = torch.from_numpy(sigma).to(t_hat.device)
+        if phi_i is None:
+            return sigma, None, t_hat.new_zeros(0)
 
         unmatched = torch.ones(t_hat.shape[0], dtype=torch.bool, device=t_hat.device)
         unmatched[sigma] = False
@@ -198,21 +222,34 @@ class PhaseCriterion(nn.Module):
             #    residual and 1/b grows without bound.
             residual = residual.sub(EPS).clamp(min=0.0)
             scale = M * torch.log(2 * EPS + 2 * b_e)
-            prior = (PRECISION_PRIOR_ALPHA - 1.0) * torch.log(b_e) + (
-                EPS * (PRECISION_PRIOR_ALPHA - 1.0)) / b_e
+            # Per EVENT, like the scale term and like SubsetCriterion, which sums its
+            # prior over the M matched b_j. Added once per fragment the floor is
+            # eps/sqrt(M) -- 9 ms at M=60 -- not the 0.71 eps the analysis assumed.
+            prior = M * ((PRECISION_PRIOR_ALPHA - 1.0) * torch.log(b_e) + (
+                EPS * (PRECISION_PRIOR_ALPHA - 1.0)) / b_e)
         else:
             scale = M * torch.log(2 * b_e)
             prior = b_e * 0.0
 
+        zero = t_hat.sum() * 0.0
+        if phi_i is None:                              # beat-only, phase_blind mode
+            phase = agree = zero
+        else:
+            phase = self.lambda_phi * circ_dist(phi_i, matched_phi).sum()
+            agree = agree_unmatched.sum() if agree_unmatched.numel() else zero
+            if self.phase_in_b:
+                # Detached: the phase branch should not be able to lower its own cost by
+                # inflating the timing scale.
+                phase, agree = phase / b_e.detach(), agree / b_e.detach()
+
         terms = {
             "time": (residual / b_e).sum(),
-            "phase": self.lambda_phi * circ_dist(phi_i, matched_phi).sum(),
+            "phase": phase,
             "scale": scale + prior,
-            "agree": (agree_unmatched.sum() if agree_unmatched.numel()
-                      else t_hat.sum() * 0.0),
+            "agree": agree,
         }
 
-        if self.lambda_r > 0.0:
+        if self.lambda_r > 0.0 and phi_i is not None:
             downbeats = (phi_i == 0.0)
             if int(downbeats.sum()) >= 2:
                 db_times = matched_t[downbeats]
@@ -248,8 +285,9 @@ class PhaseCriterion(nn.Module):
 
             for key, value in terms.items():
                 buckets.setdefault(key, []).append(value)
-            with torch.no_grad():
-                phase_errors.append(circ_dist(phi_i, phi_hat[i][sigma]).mean())
+            if phi_i is not None:
+                with torch.no_grad():
+                    phase_errors.append(circ_dist(phi_i, phi_hat[i][sigma]).mean())
 
             num_events += M
             contributing += 1

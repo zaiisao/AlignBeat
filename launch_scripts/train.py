@@ -153,10 +153,14 @@ def main(args):
         # when in fact it never ran.
         # The phase arm's criterion takes a different set entirely; passing the subset
         # ones would print a "does not take" line for every single knob.
+        phase_attention_pos=args.phase_attention_pos,
         subset_kwargs=({
             "lambda_phi": args.lambda_phi,
             "lambda_r": args.lambda_r,
             "normalize_by_events": args.normalize_by_events,
+            "timing_guards": not args.no_timing_guards,
+            "phase_in_b": args.phase_in_b,
+            "beat_only_mode": args.beat_only_mode,
         } if args.head_type == "phase" else {
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
@@ -421,6 +425,20 @@ if __name__ == "__main__":
                              "term already scaled by 1/b_e")
     parser.add_argument("--lambda_r", type=float, default=0.0,
                         help="periodicity regularizer on matched downbeat spacings")
+    parser.add_argument("--no_timing_guards", action="store_true", default=False,
+                        help="drop the eps dead zone, the log(2eps+2b) normaliser and the "
+                             "Gamma prior -- the reference formulation, whose b has no floor")
+    parser.add_argument("--phase_in_b", action="store_true", default=False,
+                        help="put the phase distance on the timing scale, (r + lam*d)/b, in "
+                             "the E-step cost and the M-step; off = the reference's r/b + lam*d")
+    parser.add_argument("--beat_only_mode", type=str, default="lattice",
+                        choices=["lattice", "phase_blind"],
+                        help="beat-only fragments: 'lattice' assumes a 4-beat bar and teaches "
+                             "it (the reference); 'phase_blind' trains timing and scale only")
+    parser.add_argument("--phase_attention_pos", type=str, default="none",
+                        choices=["none", "index", "time"],
+                        help="positional signal into the phase branch's self-attention, as "
+                             "class_attention_pos is for the subset arm; 'none' = reference")
     parser.add_argument("--meter_L", type=int, default=0)
     parser.add_argument("--mu_meter", type=float, default=0.0,
                         help="Section 4.2 eq. (6): known-meter spacing inside the selection")

@@ -21,7 +21,8 @@ from beat_this.model.beat_tracker import BeatThis
 from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
 from alignbeat.phase_criterion import PhaseCriterion, phases_from_downbeats
-from alignbeat.phase_decode import decode_events as phase_decode_events
+from alignbeat.phase_decode import (decode_events as phase_decode_events,
+                                    decode_fragment as phase_decode_fragment)
 from alignbeat.decode import decode_events
 from alignbeat.stitching import stitch_piece
 from beat_this.model.postprocessor import Postprocessor
@@ -61,6 +62,7 @@ class PLBeatThis(LightningModule):
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
         class_attention_final_norm: bool = False,
+        phase_attention_pos: str = "none",
         subset_kwargs: dict = None,
         tau_beat: float = 0.2,
         tau_downbeat: float = 0.2,
@@ -101,6 +103,7 @@ class PLBeatThis(LightningModule):
             class_attention_heads=class_attention_heads,
             class_attention_pos=class_attention_pos,
             class_attention_final_norm=class_attention_final_norm,
+            phase_attention_pos=phase_attention_pos,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -195,6 +198,7 @@ class PLBeatThis(LightningModule):
         merely sorted, per Definition 1.
         """
         beats = np.frombuffer(batch["truth_orig_beat"][index])
+        downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
         beats = np.unique(beats[(beats > 0) & (beats <= window_seconds)])
         if self.quantize_targets:
             # Round to the frame grid, which is what the DENSE head is necessarily
@@ -206,7 +210,12 @@ class PLBeatThis(LightningModule):
             # otherwise see ground truth up to 1/(2*fps) = 10 ms more precise than the
             # dense arm does -- and its size should be measured rather than argued about.
             beats = np.round(beats * self.fps) / self.fps
-        return beats
+            # The downbeats must move to the same grid, or np.isin finds none of them
+            # and every event is labelled a plain beat -- or, in the phase arm, a
+            # DOWNBEAT, since phases_from_downbeats reads an empty position list as
+            # "no bar structure" and returns phase 0 everywhere.
+            downbeats = np.round(downbeats * self.fps) / self.fps
+        return beats, downbeats
 
     def _valid_seconds(self, padding_mask, index):
         """How much of this excerpt is real audio rather than zero padding.
@@ -232,7 +241,8 @@ class PLBeatThis(LightningModule):
         for index in range(len(batch["spect"])):
             beat_t, downbeat_t, _meter = phase_decode_events(
                 model_prediction["phi_hat"][index].float().detach(),
-                model_prediction["t_hat"][index].float().detach())
+                model_prediction["t_hat"][index].float().detach(),
+                lambda_phi=self.phase_criterion.lambda_phi)
             valid = self._valid_seconds(padding_mask, index)
             beat_s = np.asarray(beat_t) * window_seconds
             downbeat_s = np.asarray(downbeat_t) * window_seconds
@@ -253,8 +263,7 @@ class PLBeatThis(LightningModule):
         device = batch["spect"].device
         targets = []
         for index in range(len(batch["spect"])):
-            beats = self._window_events(batch, index, window_seconds)
-            downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
+            beats, downbeats = self._window_events(batch, index, window_seconds)
             has_downbeats = bool(batch["downbeat_mask"][index])
 
             phi_true = None
@@ -278,8 +287,7 @@ class PLBeatThis(LightningModule):
         device = batch["spect"].device
         targets = []
         for index in range(len(batch["spect"])):
-            beats = self._window_events(batch, index, window_seconds)
-            downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
+            beats, downbeats = self._window_events(batch, index, window_seconds)
             has_downbeats = bool(batch["downbeat_mask"][index])
             if has_downbeats:
                 classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
@@ -502,6 +510,8 @@ class PLBeatThis(LightningModule):
             )
         if self.subset_criterion is not None:
             return self._subset_predict_piece(batch, chunk_size)
+        if self.phase_criterion is not None:
+            return self._phase_predict_piece(batch, chunk_size)
 
         # compute border size according to the loss type
         if hasattr(
@@ -542,6 +552,32 @@ class PLBeatThis(LightningModule):
         classes, frames, _scores = stitch_piece(
             batch["spect"][0], forward_fn, chunk_size, border,
             self.tau_beat, self.tau_downbeat, db_margin=self.db_margin)
+
+        seconds = (frames / self.fps).detach().cpu().numpy()
+        classes = classes.detach().cpu().numpy()
+        beats = (seconds,)
+        downbeats = (seconds[classes == DOWNBEAT],)
+        metrics = self._compute_metrics(batch, beats, downbeats, step="test")
+        return metrics, None, batch["dataset"], batch["spect_path"]
+
+    def _phase_predict_piece(self, batch, chunk_size):
+        """Whole-piece decoding for the phase head: the subset arm's stitcher, with the
+        phase arm's per-fragment decode plugged in, so the seam rule exists once."""
+        def forward_fn(batch_mel):
+            with torch.no_grad():
+                out = self.model(batch_mel)
+            return out["phi_hat"].float(), out["t_hat"].float()
+
+        def decode_fn(phi_hat, t_hat):
+            return phase_decode_fragment(phi_hat, t_hat,
+                                         lambda_phi=self.phase_criterion.lambda_phi)
+
+        border = self.stitch_border
+        if border is None:
+            border = 2 * getattr(getattr(self, "beat_loss", None), "tolerance", 3)
+
+        classes, frames, _scores = stitch_piece(
+            batch["spect"][0], forward_fn, chunk_size, border, decode_fn=decode_fn)
 
         seconds = (frames / self.fps).detach().cpu().numpy()
         classes = classes.detach().cpu().numpy()

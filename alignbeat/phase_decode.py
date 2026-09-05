@@ -16,11 +16,18 @@ import math
 
 import torch
 
-from alignbeat.classes import METER_PRIOR
+from alignbeat.classes import BEAT, DOWNBEAT, METER_PRIOR
 from alignbeat.phase_criterion import circ_dist
 
 CANDIDATE_METERS = (2, 3, 4, 6)
-TAU = 0.2
+# tau is a FRACTION of the grid half-spacing 1/(2L), not an absolute phase distance. The
+# reference used an absolute 0.2, copied from the subset arm's probability threshold, and
+# the largest distance any phase can have from its nearest grid point is 1/(2L) -- 0.167
+# at L=3, 0.125 at L=4 -- so "d <= 0.2" accepted every candidate at every meter above 2.
+# Beat F under that rule measured grid density, never a firing decision. As a fraction,
+# 1.0 accepts everything (the old behaviour, for L >= 3) and 0.4 accepts the 40% of the
+# circle nearest a grid point.
+TAU = 0.4
 TAU_PRIME = 1.5 * TAU
 
 
@@ -50,18 +57,24 @@ def infer_meter(phi_hat, candidate_meters=CANDIDATE_METERS, lambda_phi=3.0,
     return best_ell
 
 
+def grid_tolerance(tau, meter):
+    """tau as an absolute circular distance at this meter: a fraction of 1/(2L)."""
+    return tau / (2.0 * meter)
+
+
 def decode(phi_hat, t_hat, meter, tau=TAU):
     """Nearest-grid-point decoding at a known meter.
 
     Returns (positions, distances, accepted), where positions[j] is the bar position the
     candidate claims, distances[j] its disagreement with that position, and accepted the
-    (position, time) pairs within tau. Already in time order, since t_hat is strictly
-    increasing by construction.
+    (position, time) pairs within tau of the grid. Already in time order, since t_hat is
+    strictly increasing by construction.
     """
     positions = (torch.round(phi_hat * meter).long() % meter)
     distances = circ_dist(phi_hat, positions.to(phi_hat.dtype) / meter)
+    limit = grid_tolerance(tau, meter)
     accepted = [(int(positions[j]), float(t_hat[j]))
-                for j in range(phi_hat.shape[0]) if float(distances[j]) <= tau]
+                for j in range(phi_hat.shape[0]) if float(distances[j]) <= limit]
     return positions.tolist(), distances.tolist(), accepted
 
 
@@ -74,6 +87,7 @@ def meter_consistency_correction(accepted, meter, positions, distances, times,
     nearest candidate under a relaxed threshold, the second pruned. This is a repair pass
     over a decision the model already made, not part of the model.
     """
+    tau, tau_prime = grid_tolerance(tau, meter), grid_tolerance(tau_prime, meter)
     downbeats = sorted((j for j in range(len(positions))
                         if positions[j] == 0 and distances[j] <= tau),
                        key=lambda j: times[j])
@@ -106,19 +120,45 @@ def meter_consistency_correction(accepted, meter, positions, distances, times,
     return sorted(set(corrected), key=lambda pair: pair[1])
 
 
+def _accepted_events(phi_hat, t_hat, tau, tau_prime, candidate_meters, lambda_phi):
+    """infer the meter, decode against it, repair: (meter, positions, distances, accepted)."""
+    meter = infer_meter(phi_hat, candidate_meters, lambda_phi)
+    positions, distances, accepted = decode(phi_hat, t_hat, meter, tau)
+    accepted = meter_consistency_correction(accepted, meter, positions, distances,
+                                            t_hat.tolist(), tau, tau_prime)
+    return meter, positions, distances, accepted
+
+
 def decode_events(phi_hat, t_hat, tau=TAU, tau_prime=TAU_PRIME,
                   candidate_meters=CANDIDATE_METERS, lambda_phi=3.0):
-    """One excerpt -> (beat_times, downbeat_times) on t_hat's own (0, 1] axis.
+    """One excerpt -> (beat_times, downbeat_times, meter) on t_hat's own (0, 1] axis.
 
     Mirrors alignbeat.decode.decode_events' contract so pl_module can treat the two arms
     identically: downbeats are a SUBSET of beats, as the dense arm's targets also have
     it, since bar position 0 is still a beat.
     """
-    meter = infer_meter(phi_hat, candidate_meters, lambda_phi)
-    positions, distances, accepted = decode(phi_hat, t_hat, meter, tau)
-    accepted = meter_consistency_correction(accepted, meter, positions, distances,
-                                            t_hat.tolist(), tau, tau_prime)
+    meter, _, _, accepted = _accepted_events(phi_hat, t_hat, tau, tau_prime,
+                                             candidate_meters, lambda_phi)
+    return ([t for _, t in accepted], [t for p, t in accepted if p == 0], meter)
 
-    beats = [t for _, t in accepted]
-    downbeats = [t for p, t in accepted if p == 0]
-    return beats, downbeats, meter
+
+def decode_fragment(phi_hat, t_hat, tau=TAU, tau_prime=TAU_PRIME,
+                    candidate_meters=CANDIDATE_METERS, lambda_phi=3.0):
+    """decode_events in the (classes, times, scores) form stitch_piece consumes.
+
+    classes use the subset arm's labels so the stitcher and the piece-level scorer need no
+    second vocabulary: bar position 0 is DOWNBEAT, every other accepted position is BEAT.
+    score is 1 - d/limit, so a candidate exactly on its grid point scores 1 and one on the
+    acceptance boundary scores 0.
+    """
+    meter, positions, distances, accepted = _accepted_events(
+        phi_hat, t_hat, tau, tau_prime, candidate_meters, lambda_phi)
+    limit = grid_tolerance(tau, meter)
+    by_time = {float(t_hat[j]): distances[j] for j in range(len(positions))}
+    classes = [DOWNBEAT if position == 0 else BEAT for position, _ in accepted]
+    times = [time for _, time in accepted]
+    scores = [1.0 - min(by_time.get(time, 0.0) / limit, 1.0) for time in times]
+    device = t_hat.device
+    return (torch.tensor(classes, dtype=torch.long, device=device),
+            torch.tensor(times, dtype=t_hat.dtype, device=device),
+            torch.tensor(scores, dtype=t_hat.dtype, device=device))

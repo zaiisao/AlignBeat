@@ -49,8 +49,21 @@ def fragment_offsets(total_frames, fragment_frames, border_frames):
 
 
 def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
-                 threshold_beat=0.2, threshold_downbeat=0.2, db_margin=0.0):
-    """Section 9.3 over one piece."""
+                 threshold_beat=0.2, threshold_downbeat=0.2, db_margin=0.0,
+                 decode_fn=None):
+    """Section 9.3 over one piece.
+
+    forward_fn maps a (B, D, mels) batch to a tuple of per-fragment tensors, and
+    decode_fn maps ONE fragment's slice of that tuple to (classes, times, scores) on the
+    fragment's own (0, 1] axis. The default decode_fn is the subset arm's Algorithm 10;
+    the phase arm passes its own. The fragment layout, the half-open seams and the
+    ordering below are shared, which is the point -- the seam rule is subtle enough to
+    have been audited once already and should not exist twice.
+    """
+    if decode_fn is None:
+        def decode_fn(class_logits, t_hat):
+            return decode_events(class_logits, t_hat, threshold_beat,
+                                 threshold_downbeat, db_margin=db_margin)
     total_frames, num_mels = mel.shape
     fragments = fragment_offsets(total_frames, fragment_frames, border_frames)
 
@@ -70,13 +83,11 @@ def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
                 fragment, (0, 0, 0, fragment_frames - fragment.shape[0]))
 
         batch.append(fragment)
-    batched_class_logits, batched_t_hat = forward_fn(torch.stack(batch))
+    batched = forward_fn(torch.stack(batch))
 
     all_classes, all_frames, all_scores = [], [], []
     for index, (offset, keep_start, keep_end) in enumerate(fragments):
-        classes, times, scores = decode_events(
-            batched_class_logits[index], batched_t_hat[index],
-            threshold_beat, threshold_downbeat, db_margin=db_margin)
+        classes, times, scores = decode_fn(*(tensor[index] for tensor in batched))
 
         if classes.numel() == 0:
             continue

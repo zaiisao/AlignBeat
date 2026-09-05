@@ -43,6 +43,7 @@ class BeatThis(nn.Module):
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
         class_attention_final_norm: bool = False,
+        phase_attention_pos: str = "none",
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -121,6 +122,7 @@ class BeatThis(nn.Module):
                 downsample_stages=downsample_stages,
                 phase_attention_layers=class_attention_layers,
                 phase_attention_heads=class_attention_heads,
+                phase_attention_pos=phase_attention_pos,
                 phase_attention_final_norm=class_attention_final_norm)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
