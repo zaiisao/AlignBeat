@@ -116,7 +116,17 @@ class PhaseCriterion(nn.Module):
         phi_i, phi_i1 = phi_true[idx - 1], phi_true[idx]
 
         w = (t_hat.detach() - t_i) / (t_i1 - t_i).clamp_min(1e-8)
-        target = (phi_i + w * (phi_i1 - phi_i)) % 1.0
+        # Interpolate AROUND the circle, not across it. Phase advances forward through a
+        # bar, so the step from one event to the next is (phi_i1 - phi_i) mod 1: at a bar
+        # line that is 0.75 -> 0.00 as a forward step of 0.25, through 0.875. Interpolating
+        # the raw difference instead runs backwards through 0.375, which is ANTIPODAL to
+        # the truth -- a circular error of 0.5, the largest there is -- on every interval
+        # that wraps: 22% of them at L=4 and 48% at L=2. Those candidates are the majority
+        # of the phase supervision (N-M of N), and they contradict what the matched events
+        # are taught one candidate away, which is what left the trunk carrying no phase at
+        # all. The mean of the broken targets is 0.375; the arm collapsed to 0.3446.
+        step = (phi_i1 - phi_i) % 1.0
+        target = (phi_i + w * step) % 1.0
         return circ_dist(phi_hat, target.detach())
 
     def _hard_phi0(self, sigma, phi_hat, meter):

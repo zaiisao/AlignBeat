@@ -108,6 +108,46 @@ def test_phases_from_downbeats_reads_the_bar():
     print("ok: bar phase is read per bar, so a meter change needs no annotation")
 
 
+def test_l_agree_interpolates_around_the_circle_not_across_it():
+    """The bug that actually corrupted the supervision.
+
+    An unmatched candidate is taught the phase interpolated between the two annotated
+    events bracketing it. Phase advances FORWARD through a bar, so the step from one
+    event to the next is (phi_i1 - phi_i) mod 1: at a bar line, 0.75 -> 0.00 is a forward
+    step of 0.25, through 0.875. Interpolating the raw difference runs backwards through
+    0.375 instead -- a circular error of 0.5, the largest possible -- on every wrapping
+    interval, which is 22% of them at L=4 and 48% at L=2.
+
+    Those candidates are N-M of N, the majority of the phase supervision, and they
+    contradict what the matched events are taught one candidate away.
+    """
+    t_true = torch.linspace(0.05, 0.95, 12)
+    phi_true = torch.tensor([0., .25, .5, .75] * 3)
+    # A candidate at the midpoint of a wrapping interval: between phi=0.75 and phi=0.00.
+    wrap = [k for k in range(11) if float(phi_true[k + 1]) < float(phi_true[k])]
+    assert wrap, "fixture must contain a bar line"
+    k = wrap[0]
+    midpoint = (t_true[k] + t_true[k + 1]) / 2
+
+    zero = torch.zeros(1)
+    d = float(PhaseCriterion.l_agree(zero, t_true, phi_true, midpoint.reshape(1)))
+    # l_agree returns the distance from a prediction of 0.0, so the target it used is
+    # whichever of d / 1-d lies in the interval; either way it must be 0.875, not 0.375.
+    assert abs(d - 0.125) < 1e-5, (
+        f"target at a bar line's midpoint is {1 - d if d > 0.5 else d:.3f} away from 0; "
+        f"expected 0.875 (distance 0.125), got distance {d:.3f}")
+
+    # ...and away from a bar line, plain interpolation is unchanged.
+    flat = [k for k in range(11) if float(phi_true[k + 1]) > float(phi_true[k])][0]
+    mid2 = (t_true[flat] + t_true[flat + 1]) / 2
+    want = (float(phi_true[flat]) + float(phi_true[flat + 1])) / 2
+    got = float(PhaseCriterion.l_agree(torch.tensor([want]), t_true, phi_true,
+                                       mid2.reshape(1)))
+    assert got < 1e-5, f"non-wrapping interval should interpolate linearly, off by {got}"
+    print("ok: l_agree takes the circular short path, so bar lines are not taught "
+          "antipodal targets")
+
+
 def test_circular_l1_learns_phase_when_the_input_carries_it():
     """The objective is NOT the defect, which is why the fix is not to replace it.
 
