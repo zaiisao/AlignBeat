@@ -17,10 +17,10 @@ formulation does not have them: the eps-insensitive dead zone, the 2 eps in the 
 normaliser, and the Gamma prior on 1/b. See tests/test_phase_arm.py, which pins their
 absence and what it costs, rather than leaving it to be rediscovered.
 """
+import numpy as np
 import torch
 import torch.nn as nn
 
-from alignbeat.classes import F_MEASURE_TOLERANCE
 from alignbeat.dp import subset_select_dp
 
 FALLBACK_METER = 4
@@ -40,8 +40,6 @@ def phases_from_downbeats(n_beats, downbeat_positions, fallback_meter=FALLBACK_M
     than per track, so a fragment whose meter changes mid-window still gets correct
     phases without the change point being annotated.
     """
-    import numpy as np
-
     phi = np.zeros(n_beats, dtype=np.float64)
     if len(downbeat_positions) == 0:
         return phi
