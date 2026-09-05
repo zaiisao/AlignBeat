@@ -46,18 +46,30 @@ at the head. Everything upstream of the head is shared with `--head_type
 subset` — same encoder, same `Downsample`, same N, same equation (1), same
 order-preserving DP — so the two are a controlled comparison.
 
-It does not work yet, and `tests/test_phase_arm.py` says why rather than
-leaving it to be rediscovered. The phase objective is an L1 distance on the
-circle against a target distribution that is uniform on {0, ¼, ½, ¾}, a set
-invariant under rotation by ¼: every constant prediction is a stationary point
-with zero gradient. Measured on the reference implementation at epoch 9 of fold
-0, the trained head scored a mean circular phase error of **0.2488** against
-**0.2484** for a fixed constant and **0.2434** for the best constant — worse
-than a constant — and downbeat F was exactly 0.0000 on every dataset. Two of
-the tests pin that landscape, and a third pins the second defect: the timing
-scale's normaliser is `log(2b)` rather than `log(2ε + 2b)`, with no Gamma prior,
-so the loss improves without limit as b shrinks and its curve says nothing about
-whether the model is learning.
+As ported it did not train — downbeat F was exactly 0.0000 on every dataset of
+fold 0, with the phase head measuring worse than a fixed constant (0.2488
+against 0.2484). The cause was **not** the phase objective: circular L1 learns
+phase perfectly (0.0001) when its input carries phase. Its input did not. A
+probe on the arm's own frozen candidate features recovers nothing (0.2519, at
+chance), because the shared trunk had been reallocated entirely to timing:
+
+    b has no floor without the guards, so it tracks the raw residual to zero
+      -> the timing term's 1/b weight grows without bound
+      -> gradient into the shared trunk went 22:1 for phase at epoch 4 to
+         237:1 for timing at epoch 9, as b fell 0.589 -> 8.5e-4
+      -> the trunk stops carrying phase, and phi collapses to a constant
+
+`--head_type subset` is the control: its Gamma prior pins b at 61.3 ms after 100
+epochs and it reaches dbF 0.866 from the same encoder. `PhaseCriterion` now
+carries the same three protections (`timing_guards=True`): the ε-insensitive
+residual, `log(2ε + 2b)` in place of `log(2b)`, and the Gamma prior on 1/b.
+Together they floor b at ~0.71ε, so the timing weight stops at ~600 instead of
+diverging. `tests/test_phase_arm.py` pins each step of that chain.
+
+Whether the guards alone restore the balance is **not yet measured**: λ_φ is a
+fixed 3.0 against a timing weight of ~600, and unlike the class term in
+`SubsetCriterion` the phase term is not a normalised log-likelihood, so the two
+are not commensurable in principle. That is the next thing to settle.
 
 ## What is implemented
 

@@ -21,10 +21,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from alignbeat.classes import F_MEASURE_TOLERANCE
 from alignbeat.dp import subset_select_dp
 
 FALLBACK_METER = 4
 LAMBDA_PHI = 3.0
+# The tolerance in the units t_hat lives in, the same quantity SubsetCriterion's EPS is.
+EPS = F_MEASURE_TOLERANCE / 30.0
+PRECISION_PRIOR_ALPHA = 2.0
 
 
 def circ_dist(a, b):
@@ -63,10 +67,18 @@ class PhaseCriterion(nn.Module):
     """Per-pair cost, the selection DP, and the phase arm's training loss."""
 
     def __init__(self, lambda_phi=LAMBDA_PHI, lambda_r=0.0,
-                 beat_only_meter=FALLBACK_METER, normalize_by_events=True):
+                 beat_only_meter=FALLBACK_METER, normalize_by_events=True,
+                 timing_guards=True):
         super().__init__()
         self.lambda_phi = float(lambda_phi)
         self.lambda_r = float(lambda_r)
+        # SubsetCriterion's three protections on the timing scale, absent from the source
+        # formulation. Without them b tracks the raw residual to zero, the timing term's
+        # 1/b weight grows without bound, and it takes over the SHARED trunk: measured on
+        # fold 0, gradient into the trunk ran 22:1 in phase's favour at epoch 4 and
+        # 237:1 in timing's favour at epoch 9, over exactly the epochs in which the phase
+        # output collapsed to a constant. Off only to reproduce that.
+        self.timing_guards = bool(timing_guards)
         self.beat_only_meter = int(beat_only_meter)
         self.normalize_by_events = normalize_by_events
         # Prior over phi_0 for beat-only fragments; uniform until something estimates it.
@@ -75,13 +87,17 @@ class PhaseCriterion(nn.Module):
 
         print(f"[phase-criterion] lambda_phi={self.lambda_phi} "
               f"lambda_r={self.lambda_r} beat_only_meter={self.beat_only_meter} "
-              f"normalize_by_events={self.normalize_by_events}", flush=True)
+              f"normalize_by_events={self.normalize_by_events} "
+              f"timing_guards={self.timing_guards}", flush=True)
 
     # -- cost ---------------------------------------------------------------
 
     def match_cost(self, t_true, phi_true, t_hat, phi_hat, b_e, phase_blind):
         """L'_match(y_i, y_hat_j) for every pair, as an (M, N) cost."""
-        timing = torch.abs(t_true[:, None] - t_hat[None, :]) / b_e
+        residual = torch.abs(t_true[:, None] - t_hat[None, :])
+        if self.timing_guards:
+            residual = residual.sub(EPS).clamp(min=0.0)
+        timing = residual / b_e
         if phase_blind:
             return timing
         return timing + self.lambda_phi * circ_dist(phi_true[:, None], phi_hat[None, :])
@@ -162,13 +178,26 @@ class PhaseCriterion(nn.Module):
         matched_t, matched_phi = t_hat[sigma], phi_hat[sigma]
         M = t_true.shape[0]
 
+        residual = torch.abs(t_true - matched_t)
+        if self.timing_guards:
+            # 1. eps-insensitive: a residual inside the F-measure tolerance is free, so
+            #    b has nothing left to chase once timing is good enough.
+            # 2. log(2 eps + 2 b) rather than log(2 b), which floors the normaliser.
+            # 3. a Gamma prior on 1/b, whose optimum pins b near eps. Together these put
+            #    b* at ~50 ms however good timing gets; without them b* is the raw
+            #    residual and 1/b grows without bound.
+            residual = residual.sub(EPS).clamp(min=0.0)
+            scale = M * torch.log(2 * EPS + 2 * b_e)
+            prior = (PRECISION_PRIOR_ALPHA - 1.0) * torch.log(b_e) + (
+                EPS * (PRECISION_PRIOR_ALPHA - 1.0)) / b_e
+        else:
+            scale = M * torch.log(2 * b_e)
+            prior = b_e * 0.0
+
         terms = {
-            "time": (torch.abs(t_true - matched_t) / b_e).sum(),
+            "time": (residual / b_e).sum(),
             "phase": self.lambda_phi * circ_dist(phi_i, matched_phi).sum(),
-            # The normaliser that makes the timing term a likelihood in b_e rather than
-            # a free discount. NOTE: unlike SubsetCriterion's log(2 eps + 2 b), this has
-            # no eps floor, so it is unbounded below as b_e -> 0.
-            "scale": M * torch.log(2 * b_e),
+            "scale": scale + prior,
             "agree": (agree_unmatched.sum() if agree_unmatched.numel()
                       else t_hat.sum() * 0.0),
         }

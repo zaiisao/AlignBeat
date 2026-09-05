@@ -1,14 +1,23 @@
 """Correctness tests for the continuous-phase arm (--head_type phase).
 
-Several of these pin a KNOWN DEFECT rather than a guarantee. The phase objective as
-ported cannot learn: its target distribution is rotation-symmetric and its loss is an L1
-distance on the circle, so every constant output is a stationary point. Measured on the
-standalone arm at epoch 9 of fold 0, the trained head scored a mean circular phase error
-of 0.2488 against 0.2484 for a single fixed constant and 0.2434 for the best constant --
-worse than a constant, and dbF was exactly 0.0000 on every dataset.
+Several of these pin a DIAGNOSED DEFECT rather than a guarantee. As ported, this arm
+scored dbF exactly 0.0000 on every dataset of fold 0, with a trained phase head measuring
+WORSE than a fixed constant (0.2488 against 0.2484, and 0.2434 for the best constant).
 
-The tests below encode that, so a future change to the objective is measured against it
-instead of rediscovering it after another eight-fold run.
+The cause is not the phase objective itself. A circular-L1 head learns phase perfectly
+(error 0.0001) when its input carries phase, so the loss is learnable. The cause is that
+its input does not: a probe trained on the arm's own frozen candidate features recovers
+nothing (0.2519, at chance), because the SHARED trunk was reallocated entirely to timing.
+
+  b has no floor without the guards, so it tracks the raw residual toward zero
+      -> the timing term's 1/b weight grows without bound
+      -> gradient into the shared trunk went 22:1 in phase's favour at epoch 4 to
+         237:1 in timing's favour at epoch 9, as b fell 0.589 -> 8.5e-4
+      -> the trunk stops carrying phase, and phi collapses to a constant
+         (its spread across candidates fell 0.0283 -> 0.0072 over those same epochs)
+
+The subset arm is the control: its Gamma prior pins b at 61.3 ms after 100 epochs, and
+it reaches dbF 0.866 from the same encoder and the same Downsample.
 """
 import os
 import sys
@@ -21,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from alignbeat.dp import subset_select_dp
 from alignbeat.phase_criterion import PhaseCriterion, circ_dist, phases_from_downbeats
 from alignbeat.phase_decode import decode_events, infer_meter
-from alignbeat.phase_head import PhaseSelectionHead, PhaseTimeHead
+from alignbeat.phase_head import PhaseHead, PhaseSelectionHead, PhaseTimeHead
 
 
 def test_head_emits_a_valid_phase_and_a_monotone_time():
@@ -99,45 +108,99 @@ def test_phases_from_downbeats_reads_the_bar():
     print("ok: bar phase is read per bar, so a meter change needs no annotation")
 
 
-def test_the_phase_loss_is_flat_over_constant_predictions():
-    """THE DEFECT. Any constant phi_hat is a stationary point of the phase term.
+def test_circular_l1_learns_phase_when_the_input_carries_it():
+    """The objective is NOT the defect, which is why the fix is not to replace it.
 
-    A 4/4 corpus puts the targets uniformly on {0, 1/4, 1/2, 3/4}, a set invariant under
-    rotation by 1/4. circ_dist is an L1 distance, so E[d(c, phi)] is the SAME for every
-    constant c and its gradient vanishes. A head that has collapsed to a constant has no
-    gradient out of it, which is why the ported arm scored dbF = 0.
+    A constant output is a stationary point -- the 4/4 target set {0, 1/4, 1/2, 3/4} is
+    invariant under rotation by 1/4, so the gradient there vanishes -- but it is not an
+    attractor once the input is informative. This test is what rules the loss out.
     """
+    torch.manual_seed(0)
+    D, N, METER = 32, 64, 4
+    basis = torch.randn(METER, D)
+
+    def batch(B=8):
+        pos = torch.randint(0, METER, (B, N))
+        return basis[pos] + 0.1 * torch.randn(B, N, D), pos.float() / METER
+
+    head = PhaseHead(D, hidden=64)
+    opt = torch.optim.AdamW(head.parameters(), lr=1e-3)
+    for _ in range(1500):
+        z, target = batch()
+        loss = circ_dist(target, head(z)).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    z, target = batch(32)
+    with torch.no_grad():
+        err = float(circ_dist(target, head(z)).mean())
+    assert err < 0.05, f"circular L1 failed to learn a perfectly predictable phase: {err}"
+
+    # ...while the landscape over CONSTANTS really is flat, which is the trap it falls
+    # into once the trunk has stopped carrying phase.
     targets = torch.tensor([0.0, .25, .5, .75] * 8)
     costs = torch.tensor([float(circ_dist(targets, torch.full_like(targets, c / 400)).mean())
                           for c in range(400)])
-    assert float(costs.max() - costs.min()) < 1e-6, (
-        f"the landscape over constants varies by {float(costs.max() - costs.min())}; if "
-        f"this now FAILS the objective has been changed and this test should be replaced "
-        f"by one asserting the trained head beats the best constant")
-
-    c = torch.tensor(0.31, requires_grad=True)
-    circ_dist(targets, c.expand_as(targets)).mean().backward()
-    assert abs(float(c.grad)) < 1e-6, f"gradient at a constant is {float(c.grad)}, expected 0"
-    print("ok: the phase loss is provably flat over constants -- the collapse is structural")
+    assert float(costs.max() - costs.min()) < 1e-6, float(costs.max() - costs.min())
+    print(f"ok: circular L1 learns phase from informative features ({err:.4f}), so the "
+          f"loss is not the defect")
 
 
-def test_the_timing_scale_has_no_floor():
-    """THE SECOND DEFECT. This arm dropped three guards SubsetCriterion has.
+def test_the_guards_put_a_floor_under_the_timing_scale():
+    """THE DEFECT, and the fix. Without the guards b* is the residual, so it -> 0.
 
-    SubsetCriterion's normaliser is log(2 eps + 2 b), whose 2 eps bounds it below; this
-    arm's is log(2 b), which is not bounded, and there is no Gamma prior on 1/b either.
-    The loss can therefore improve without limit by shrinking b, which is what makes its
-    training curve uninformative about whether anything is being learned.
+    All three terms are per-event, as SubsetCriterion normalises them: the eps-insensitive
+    residual, log(2 eps + 2 b) rather than log(2 b), and the Gamma prior on 1/b.
     """
-    from alignbeat.criterion import EPS
+    from alignbeat.phase_criterion import EPS, PRECISION_PRIOR_ALPHA
 
-    b = torch.logspace(-8, -2, 40)
-    assert float((2 * b).log().min()) < np.log(2 * EPS) - 5.0, (
-        "log(2b) should run far below the floor eps would have imposed")
-    guarded = (2 * EPS + 2 * b).log()
-    assert float(guarded.min()) > float(np.log(2 * EPS)) - 1e-6, "eps must floor it"
-    print(f"ok: log(2b) is unbounded below, while log(2 eps + 2b) floors at "
-          f"{float(np.log(2 * EPS)):.2f}")
+    def b_star(residual, guarded):
+        b = np.logspace(-7, -1, 20000)
+        if guarded:
+            r = max(residual - EPS, 0.0)
+            loss = r / b + np.log(2 * EPS + 2 * b) + (np.log(b) + EPS / b)
+        else:
+            loss = residual / b + np.log(2 * b)
+        return b[loss.argmin()]
+
+    tiny = 1e-4 * EPS                                  # timing far inside tolerance
+    assert b_star(tiny, guarded=False) < 0.02 * EPS, "unguarded b* must chase the residual"
+    floored = b_star(tiny, guarded=True)
+    assert 0.5 * EPS < floored < 1.5 * EPS, f"guarded b* should sit near eps, got {floored}"
+    # ...and the floor holds however good timing gets, which is what bounds 1/b.
+    assert abs(b_star(tiny, True) - b_star(1e-8 * EPS, True)) < 1e-9
+    print(f"ok: guarded b* floors at {floored / EPS:.2f} eps; unguarded b* tracks the "
+          f"residual to zero")
+
+
+def test_guards_bound_the_timing_terms_weight_on_the_shared_trunk():
+    """Why the floor matters: 1/b IS the timing term's weight on the shared features.
+
+    Unguarded, b* is the mean residual, so as timing improves 1/b grows without bound and
+    the trunk is reallocated to timing -- measured 22:1 for phase at epoch 4 against
+    237:1 for timing at epoch 9. Guarded, 1/b* stops at a constant however good timing
+    gets, so the phase branch keeps a fixed share.
+    """
+    from alignbeat.phase_criterion import EPS
+
+    def timing_weight(residual, guarded):
+        b = np.logspace(-8, -1, 20000)
+        if guarded:
+            r = max(residual - EPS, 0.0)
+            loss = r / b + np.log(2 * EPS + 2 * b) + (np.log(b) + EPS / b)
+        else:
+            loss = residual / b + np.log(2 * b)
+        return 1.0 / b[loss.argmin()]
+
+    shrinking = [EPS * f for f in (10.0, 1.0, 1e-2, 1e-4, 1e-6)]
+    unguarded = [timing_weight(r, False) for r in shrinking]
+    guarded = [timing_weight(r, True) for r in shrinking]
+
+    assert unguarded[-1] / unguarded[0] > 1e5, "unguarded 1/b must diverge"
+    assert max(guarded) / min(guarded) < 10.0, f"guarded 1/b must stay bounded: {guarded}"
+    assert unguarded[-1] > 100 * max(guarded), (unguarded[-1], max(guarded))
+    print(f"ok: as the residual shrinks 1e7x, the timing weight goes "
+          f"{unguarded[0]:.0f} -> {unguarded[-1]:.0f} unguarded but stays under "
+          f"{max(guarded):.0f} guarded")
 
 
 def test_criterion_runs_on_labelled_and_beat_only_fragments():
