@@ -23,36 +23,17 @@ class SubsetSelectionHead(nn.Module):
     def __init__(self, feature_size=256, hidden_size=256,
                  window_seconds=30.0,
                  class_attention_layers=0, class_attention_heads=4,
-                 class_attention_pos="none"):
+                 class_attention_pos="none", class_attention_final_norm=False):
         super(SubsetSelectionHead, self).__init__()
 
         self.window_seconds = float(window_seconds)
 
-        # Both norms are load-bearing, not decoration, and dropping the trunk's cost a
-        # from-scratch run dearly -- see the measurement below.
-        #
-        # input_norm: the encoder emits unnormalised features with |max| ~40. Without
-        # it the final Linears see large activations and produce a gradient norm of
-        # ~130 while the whole backbone contributes ~0 (measured); clipping then scales
-        # everything by 1/130 and the encoder never trains.
-        #
-        # The trunk's LayerNorm + GELU: without them the head is a pure linear map
-        # (LayerNorm -> Linear -> Linear collapses to one Linear), nothing bounds the
-        # representation the class and regression heads read, and the encoder is free
-        # to inflate its activations at no cost to the loss. It does. Measured max of
-        # frontend.blocks.*.norm.running_var after 100 from-scratch epochs:
-        #
-        #     dense baseline (vanilla)      24.0
-        #     with these layers             2.8   (final100_subset)
-        #     without them                  47.8  (L3_seed1), 2933 (L1_base)
-        #     without them, 2026-09-02      1.4e5 / 1.6e7  (F3 / F1, by epoch 19)
-        #
-        # The runaway is invisible in training loss, which uses batch statistics, and
-        # only surfaces at eval, which uses the running ones -- F1 scored 0.03 while
-        # its train loss looked healthy. Warm-started runs inherit the dense model's
-        # statistics and 20 epochs is not long enough to drift, which is why this went
-        # unnoticed: every run between 3fb106e and now was warm-started.
         self.input_norm = nn.LayerNorm(feature_size)
+
+        # JA: Trunk is from the tree metaphor: one shared trunk, then branches. Here
+        # self.trunk is the single shared path every candidate feature goes through,
+        # and class_head, regression_head and precision_head are the three branches
+        # that split off it
         self.trunk = nn.Sequential(
             nn.Linear(feature_size, hidden_size),
             nn.LayerNorm(hidden_size),
@@ -65,7 +46,15 @@ class SubsetSelectionHead(nn.Module):
                 d_model=hidden_size, nhead=class_attention_heads,
                 dim_feedforward=hidden_size * 2, dropout=0.0,
                 batch_first=True, norm_first=True)
-            self.candidate_attention = nn.TransformerEncoder(layer, class_attention_layers)
+            # norm_first=True normalizes each sublayer's INPUT; the residual stream
+            # itself is never normalized, so what class_head reads leaves the block ~4x
+            # longer than it entered (measured: token norm 11.7 -> 46.5 at one layer)
+            # and the scale compounds with depth. The canonical pre-LN transformer ends
+            # in a LayerNorm for exactly this reason. Opt-in, not default: adding the
+            # parameters unconditionally would stop every existing checkpoint loading.
+            final_norm = nn.LayerNorm(hidden_size) if class_attention_final_norm else None
+            self.candidate_attention = nn.TransformerEncoder(
+                layer, class_attention_layers, norm=final_norm)
 
         # Self-attention is permutation-equivariant, so without this the classifier can
         # see WHAT the other candidates look like but not WHERE they are -- and bar phase,
@@ -115,8 +104,12 @@ class SubsetSelectionHead(nn.Module):
         b_initial = F_MEASURE_TOLERANCE / self.window_seconds
         nn.init.constant_(self.precision_head.bias, softplus_inverse(b_initial))
 
-        # JA: Both weights and bias are frozen
-        self.precision_head.requires_grad_(False)
+        # The bias fixes b's overall scale (softplus_inverse of the 70 ms init) and stays
+        # frozen for the whole run. The weight is trainable from step 0 so the autograd
+        # graph never changes shape mid-run; the warm-up in PLBeatThis gates its updates
+        # by dropping the gradient instead. Toggling requires_grad here was the reason
+        # the epoch-30 thaw never took effect and b_hat stayed at its init in every run.
+        self.precision_head.bias.requires_grad_(False)
 
     def forward(self, x):
         """x: (B, C, N) candidate features from Downsample, one token per candidate."""
@@ -125,6 +118,8 @@ class SubsetSelectionHead(nn.Module):
 
         # Regression reads z directly and is therefore unaffected by section 10.2's
         # attention pass; only the classifier sees the contextualised features.
+
+        # JA: regression_head reduces 256-dim features to 1-d
         r = self.regression_head(z).squeeze(dim=2)      # (B, N)
         t_hat = monotonic_times(r)
 
@@ -138,10 +133,12 @@ class SubsetSelectionHead(nn.Module):
                 # t_hat is on (0, 1] over the window; scale to candidate-index units so
                 # both encodings live at the same frequency range and are comparable.
                 z_class = z + sinusoidal(t_hat * z.shape[1], z.shape[2])
+
             z_class = self.candidate_attention(z_class)
+
         class_logits = self.class_head(z_class)         # (B, N, 3)
 
-        b_hat_logit = self.precision_head(z).squeeze(dim=2)
+        b_hat_logit = self.precision_head(z).squeeze(dim=2)     # (B, N)
         b_hat = nn.functional.softplus(b_hat_logit)
 
         # Raw output u_j; the criterion applies b_j = b_min + softplus(u_j).

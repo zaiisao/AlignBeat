@@ -13,7 +13,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train: subset N=188 baseline (L1_base)",
+            "name": "train: subset baseline (L1_base)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
@@ -23,7 +23,7 @@
             "args": [
                 "--name", "debug_L1_base", "--gpu", "0", "--fold", "0", "--seed", "0",
                 "--max-epochs", "100", "--val-frequency", "200", "--snapshot_every", "5",
-                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                "--head_type", "subset", "--omega_db", "2",
                 "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",

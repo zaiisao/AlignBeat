@@ -21,6 +21,7 @@ from beat_this.model.beat_tracker import BeatThis
 from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
 from alignbeat.decode import decode_events
+from alignbeat.stitching import stitch_piece
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
 
@@ -50,10 +51,6 @@ class PLBeatThis(LightningModule):
         head_lr: float = 0.0,
         quantize_targets: bool = False,
         stitch_border: int = None,
-        # Only used by head_type="subset": N, the number of candidates the head
-        # emits. Derived once in launch_scripts/train.py; no default here, so the
-        # value can never disagree with the one a run was configured with.
-        downsampled_seq_size: int = None,
         num_candidates: int = None,
         downsample_mode: str = "learned",
         train_length: int = 1500,
@@ -61,6 +58,7 @@ class PLBeatThis(LightningModule):
         class_attention_layers: int = 0,
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
+        class_attention_final_norm: bool = False,
         subset_kwargs: dict = None,
         tau_beat: float = 0.2,
         tau_downbeat: float = 0.2,
@@ -93,7 +91,6 @@ class PLBeatThis(LightningModule):
             sum_head=sum_head,
             partial_transformers=partial_transformers,
             num_candidates=num_candidates,
-            downsampled_seq_size=downsampled_seq_size,
             downsample_mode=downsample_mode,
             train_length=train_length,
             fps=fps,
@@ -101,6 +98,7 @@ class PLBeatThis(LightningModule):
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             class_attention_pos=class_attention_pos,
+            class_attention_final_norm=class_attention_final_norm,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -333,19 +331,23 @@ class PLBeatThis(LightningModule):
                 sync_dist=True,
             )
 
+    def on_before_optimizer_step(self, optimizer):
+        """Hold b_j at its init for the first 30% of the run, then let it learn.
+
+        The weight is trainable from construction (see SubsetHead), so the graph never
+        changes shape; the warm-up is enforced here by dropping the gradient. Dropping
+        it rather than zeroing it is what matters: AdamW skips a parameter whose grad is
+        None, but would still apply weight decay and momentum to a zero one.
+
+        The bias stays frozen for the whole run, so only the weights move -- the head
+        can redistribute precision across candidates but not shift its overall scale.
+        """
+        if self.subset_criterion is None:
+            return
+        if self.current_epoch < self.max_epochs * 0.3:
+            self.model.task_heads.head.precision_head.weight.grad = None
+
     def training_step(self, batch, batch_idx):
-        if self.subset_criterion is not None:
-            # Frozen for the first 30% of the RUN, then thawed: batch_idx counts
-            # batches within an epoch, so comparing it against an epoch count froze the
-            # head for the first 30 batches of every epoch and never for a 1-epoch run.
-            # The bias stays frozen for the whole run either way (see SubsetHead), so
-            # only the weights move -- the head can redistribute precision across
-            # candidates but not shift its overall scale.
-
-            if self.current_epoch >= self.max_epochs * 0.3:
-                precision_head = self.model.task_heads.head.precision_head
-                precision_head.weight.requires_grad_(True)
-
         # run the model
         model_prediction = self.model(batch["spect"])
 
@@ -390,8 +392,7 @@ class PLBeatThis(LightningModule):
         batch: Any,
         batch_idx: int,
         dataloader_idx: int = 0,
-        chunk_size: int = 1500,
-        overlap_mode: str = "keep_first",
+        chunk_size: int = 1500
     ) -> Any:
         """
         Compute predictions and metrics for a batch (a dictionary with an "spect" key).
@@ -412,7 +413,7 @@ class PLBeatThis(LightningModule):
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
         if self.subset_criterion is not None:
-            return self._subset_predict_piece(batch, chunk_size, overlap_mode)
+            return self._subset_predict_piece(batch, chunk_size)
 
         # compute border size according to the loss type
         if hasattr(
@@ -436,72 +437,29 @@ class PLBeatThis(LightningModule):
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="test")
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
 
-    def _subset_predict_piece(self, batch, chunk_size, overlap_mode):
+    def _subset_predict_piece(self, batch, chunk_size):
         """Whole-piece decoding for the alignment head (Section 9.3)."""
-        from beat_this.inference import split_piece
+        def forward_fn(batch_mel):
+            with torch.no_grad():
+                out = self.model(batch_mel)
+            return out["class_logits"].float(), out["t_hat"].float()
 
-        spect = batch["spect"][0]
-        # Border at chunk seams. The dense path always discards 2*tolerance frames
-        # either side of an internal boundary (aggregate_prediction), and Section 9.3
-        # likewise requires beta in (0, D/2) so that a candidate near a fragment edge is
-        # never the ONLY candidate covering that moment. Using 0 here left the two arms
-        # decoding under different edge conventions, which is not a head difference.
-        # Default matches whatever the dense arm uses, so the A/B stays controlled.
         border = self.stitch_border
         if border is None:
-            border = 2 * getattr(self.beat_loss, "tolerance", 3) if hasattr(
-                self, "beat_loss") else 6
-        chunks, starts = split_piece(spect, chunk_size, border_size=border,
-                                     avoid_short_end=True)
-        # Section 9.3 / Algorithm 11: fragment k owns [o_k + beta, o_k + D - beta], with
-        # the edge exceptions that the FIRST fragment owns from 0 and the LAST owns to
-        # the end of the piece. Previously each chunk owned its full span, so its
-        # trailing border -- the lowest-context frames it has, and exactly the ones the
-        # dense arm discards in aggregate_prediction -- won every seam over the next
-        # chunk's interior. That is an edge-convention difference between the two A/B
-        # arms, not a head difference.
-        piece_end = spect.shape[0] / self.fps
-        covered_to = 0.0          # high-water mark: end of what earlier fragments own
-        beats, downbeats = [], []
-        n_chunks = len(chunks)
-        for index, (chunk, start) in enumerate(zip(chunks, starts)):
-            prediction = self.model(chunk.unsqueeze(0))
-            classes, times, _scores = decode_events(
-                prediction["class_logits"][0].float(),
-                prediction["t_hat"][0].float(),
-                self.tau_beat, self.tau_downbeat,
-                db_margin=self.db_margin)
-            seconds = (start + times * chunk.shape[0]).detach().cpu().numpy() / self.fps
-            classes = classes.detach().cpu().numpy()
+            # A subset run has no beat_loss at all -- the subset branch of __init__
+            # builds subset_criterion instead -- and nn.Module.__getattr__ raises
+            # before getattr's default can apply, so guard self as well.
+            border = 2 * getattr(getattr(self, "beat_loss", None), "tolerance", 3)
 
-            # keep region for this fragment, in seconds. split_piece(avoid_short_end)
-            # shifts the LAST chunk's start left so it ends exactly at the piece end,
-            # which can overlap its predecessor by far more than `border` -- so the
-            # nominal starts are NOT uniformly strided and a naive start+border can land
-            # before the previous fragment's own_end, re-emitting every event in between.
-            # Clamping to the running high-water mark keeps the keep regions a true
-            # partition, which is what Section 9.3 requires.
-            own_start = (start + border) / self.fps if index > 0 else 0.0
-            own_start = max(own_start, covered_to)
-            own_end = ((start + chunk.shape[0] - border) / self.fps
-                       if index < n_chunks - 1 else piece_end)
-            own_end = max(own_end, own_start)
-            keep = (seconds >= own_start) & (seconds < own_end)
-            # The final chunk is right-zero-padded and t_hat is stretched over that
-            # padding, so clamp to the real end of the piece rather than emitting
-            # events into silence. The first chunk's left pad is handled by own_start.
-            keep &= (seconds >= 0.0) & (seconds <= piece_end)
-            seconds, classes = seconds[keep], classes[keep]
-            covered_to = max(covered_to, own_end)
+        classes, frames, _scores = stitch_piece(
+            batch["spect"][0], forward_fn, chunk_size, border,
+            self.tau_beat, self.tau_downbeat, db_margin=self.db_margin)
 
-            beats.append(seconds)
-            downbeats.append(seconds[classes == DOWNBEAT])
-
-        beats = (np.sort(np.concatenate(beats)),) if beats else (np.zeros(0),)
-        downbeats = (np.sort(np.concatenate(downbeats)),) if downbeats else (np.zeros(0),)
+        seconds = (frames / self.fps).detach().cpu().numpy()
+        classes = classes.detach().cpu().numpy()
+        beats = (seconds,)
+        downbeats = (seconds[classes == DOWNBEAT],)
         metrics = self._compute_metrics(batch, beats, downbeats, step="test")
-        # model_prediction is returned for the caller's loss computation; the alignment
-        # head has no piece-level framewise prediction to hand back, so None is honest.
         return metrics, None, batch["dataset"], batch["spect_path"]
 
     def configure_optimizers(self):

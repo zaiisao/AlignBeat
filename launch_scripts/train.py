@@ -96,16 +96,21 @@ def main(args):
     # compute positive weights
     pos_weights = datamodule.get_train_positive_weights(widen_target_mask=3)
     print("Using positive weights: ", pos_weights)
+    if args.lr is None:
+        args.lr = 3e-4 if args.head_type == "subset" else 8e-4
+        print(f"[lr] {args.lr:g} resolved from head_type={args.head_type}", flush=True)
+
     dropout = {
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
 
-    window_seconds = args.train_length / float(args.fps)
-
-    downsample_stages, downsampled_seq_size, num_candidates = stages_from_tempo(
+    downsample_stages, num_candidates, tempo_floor = stages_from_tempo(
         args.train_length, args.fps, args.bpm_max)
 
+    print(f"[subset] N={num_candidates} from {downsample_stages} halvings of "
+          f"{args.train_length} (tempo floor at {args.bpm_max} bpm: {tempo_floor})",
+          flush=True)
 
     pl_model = PLBeatThis(
         spect_dim=128,
@@ -129,7 +134,6 @@ def main(args):
         head_type=args.head_type,
         head_lr=args.head_lr,
         quantize_targets=args.quantize_targets,
-        downsampled_seq_size=downsampled_seq_size,
         num_candidates=num_candidates,
         stitch_border=args.stitch_border,
         downsample_mode=args.downsample_mode,
@@ -138,6 +142,7 @@ def main(args):
         class_attention_layers=args.class_attention_layers,
         class_attention_heads=args.class_attention_heads,
         class_attention_pos=args.class_attention_pos,
+        class_attention_final_norm=args.class_attention_final_norm,
         tau_beat=args.tau_beat,
         tau_downbeat=args.tau_downbeat,
         db_margin=args.db_margin,
@@ -154,6 +159,8 @@ def main(args):
                                  if args.meter_candidates else ()),
             "meter_prior": args.meter_prior or None,
             "mu_meter": args.mu_meter,
+            "normalize_by_events": args.normalize_by_events,
+            "background_by_unmatched": args.background_by_unmatched,
         },
     )
     # --- frozen-encoder head swap -------------------------------------------------
@@ -180,6 +187,7 @@ def main(args):
         print(f"[encoder-init] loaded {loaded} tensors from "
               f"{os.path.basename(args.init_encoder_from)} (epoch {blob.get('epoch')})",
               flush=True)
+
     if args.init_all_from:
         # Full-model init (encoder AND head), no optimizer/epoch state: start a FRESH
         # schedule from an already-converged system. Used for the thaw experiment --
@@ -290,7 +298,13 @@ if __name__ == "__main__":
         default=0.2,
         help="dropout rate to apply in the main transformer blocks",
     )
-    parser.add_argument("--lr", type=float, default=0.0008)
+    # No single default is right for both heads: the dense control loses 0.025 joint at
+    # 3e-4 (0.894 vs 0.919), while the subset head collapses at 8e-4 (0.617 at ep4 ->
+    # 0.545 at ep9). Left unset, the rate is resolved from --head_type in main(); an
+    # explicit --lr still wins. Do NOT pair 8e-4 with --head_lr 3e-4: that is the
+    # disc_lr2 arm, 0.649 at ep17, killed (docs/ABLATIONS.md).
+    parser.add_argument("--lr", type=float, default=None,
+                        help="default: 3e-4 for --head_type subset, 8e-4 for dense")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
@@ -346,9 +360,15 @@ if __name__ == "__main__":
     parser.add_argument("--bpm_max", type=float, default=BPM_MAX,
                         help=f"fastest tempo the corpus contains (default {BPM_MAX:g}); "
                              "N is derived from it and the window length")
-    parser.add_argument("--class_attention_layers", type=int, default=0)
+    # Section 10.2. Defaults follow the best recorded arms (docs/ABLATIONS.md): the
+    # frozen screen at 0.899 and final100_subset at 0.892 both ran one attention layer
+    # with index positions. Pass 0 to ablate it back out.
+    parser.add_argument("--class_attention_layers", type=int, default=1)
     parser.add_argument("--class_attention_heads", type=int, default=4)
-    parser.add_argument("--class_attention_pos", type=str, default="none",
+    parser.add_argument("--class_attention_final_norm", action="store_true", default=False,
+                        help="add the pre-LN transformer's missing final LayerNorm to "
+                             "the candidate-attention stack (see alignbeat/head.py)")
+    parser.add_argument("--class_attention_pos", type=str, default="index",
                         choices=("none", "index", "time"),
                         help="positional signal for the candidate attention: "
                              "ordinal beat number, or t_hat")
@@ -372,7 +392,21 @@ if __name__ == "__main__":
                              "undoes the class-weighted training bias; 0 keeps "
                              "Algorithm 10's plain argmax. See decode_events.")
     parser.add_argument("--gamma", type=float, default=0.5)
-    parser.add_argument("--omega_db", type=float, default=2.0)
+    # Loss (8) is a plain sum; dividing by M is a local addition. It makes a fragment's
+    # background term weigh gamma*(N-M)/M against its class term, which runs from 3.3 at
+    # 25 events to 0.5 at 92 -- so slow fragments carry ~6x the loss of fast ones and
+    # dominate the batch gradient. --no_normalize_by_events restores eq. (8) verbatim.
+    parser.add_argument("--no_normalize_by_events", dest="normalize_by_events",
+                        action="store_false", default=True,
+                        help="divide loss (8) by nothing, as the paper writes it, "
+                             "instead of by the fragment's event count M")
+    parser.add_argument("--background_by_unmatched", action="store_true", default=False,
+                        help="divide the background term by N-M rather than M, so it is "
+                             "a mean like the class term; removes the tempo-dependent "
+                             "gamma*(N-M)/M weight without rescaling the loss")
+    # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
+    # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
+    parser.add_argument("--omega_db", type=float, default=4.0)
     parser.add_argument("--joint_phase", action="store_true", default=False)
     parser.add_argument("--meter_L", type=int, default=0)
     parser.add_argument("--mu_meter", type=float, default=0.0,

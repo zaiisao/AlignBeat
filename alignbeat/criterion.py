@@ -46,6 +46,7 @@ class SubsetCriterion(nn.Module):
     def __init__(self,
                  omega_downbeat=2.0, gamma=0.5,
                  normalize_by_events=NORMALIZE_BY_EVENTS,
+                 background_by_unmatched=False,
                  b_min=B_MIN,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
@@ -57,6 +58,7 @@ class SubsetCriterion(nn.Module):
         self.omega_downbeat = omega_downbeat
         self.gamma = gamma
         self.normalize_by_events = normalize_by_events
+        self.background_by_unmatched = background_by_unmatched
 
         self.b_min = b_min
         self.precision_prior_alpha = precision_prior_alpha
@@ -259,10 +261,19 @@ class SubsetCriterion(nn.Module):
         unmatched = torch.ones(num_candidates, dtype=torch.bool, device=device)
         unmatched[sigma] = False
 
+        # The background sum runs over N-M candidates but is divided by M, so it carries
+        # a weight of gamma*(N-M)/M relative to the class term -- 3.3 at 25 events, 0.5
+        # at 92. A slow fragment's loss is then ~6x a fast one's and dominates the batch
+        # gradient. Dividing it by N-M instead makes it a mean like the others, removing
+        # the tempo dependence without changing the loss's overall scale.
+        background_denominator = denominator
+        if self.background_by_unmatched and self.normalize_by_events:
+            background_denominator = float(max(num_candidates - M, 1))
+
         return {
             'class': (omega * per_event).sum() / denominator,
             'time': time_term,
-            'background': background_nll[unmatched].sum() / denominator,
+            'background': background_nll[unmatched].sum() / background_denominator,
             'precision': precision_term,
             'residual': matched_residual.detach(),
             'unlabelled': unlabelled,
