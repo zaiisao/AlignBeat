@@ -179,20 +179,51 @@ class PLBeatThis(LightningModule):
                 model_prediction["t_hat"][index].float(),
                 self.tau_beat, self.tau_downbeat,
                 db_margin=self.db_margin)
-            seconds = (times * window_seconds).detach().cpu().numpy()
+            times = times.detach().cpu().numpy()
             classes = classes.detach().cpu().numpy()
-            if padding_mask is not None:
-                # The dense arm passes padding_mask to its postprocessor; without the
-                # same restriction here, candidates landing in an excerpt's zero-padded
-                # tail are emitted as detections that no ground-truth event can match
-                # (truth_orig_* stops at the real end), so they are pure false positives
-                # charged to one arm of the A/B only.
-                valid_seconds = float(padding_mask[index].sum()) / self.fps
-                keep = seconds < valid_seconds
-                seconds, classes = seconds[keep], classes[keep]
-            beats.append(np.sort(seconds))
-            downbeats.append(np.sort(seconds[classes == DOWNBEAT]))
+            # Filtered independently, which is the same result as filtering the pair
+            # together: the downbeats are a subset of the beats and share the threshold.
+            beats.append(self._emitted_seconds(times, window_seconds,
+                                               padding_mask, index))
+            downbeats.append(self._emitted_seconds(times[classes == DOWNBEAT],
+                                                   window_seconds, padding_mask, index))
         return tuple(beats), tuple(downbeats)
+
+    def _window_events(self, batch, index, window_seconds):
+        """This excerpt's annotated beats, in seconds, as both arms need them.
+
+        eq. (1) maps onto the half-open axis (0, 1], so a target at exactly 0 is
+        unreachable by construction and would be an unmatchable event. unique, not
+        merely sorted, per Definition 1.
+        """
+        beats = np.frombuffer(batch["truth_orig_beat"][index])
+        beats = np.unique(beats[(beats > 0) & (beats <= window_seconds)])
+        if self.quantize_targets:
+            # Round to the frame grid, which is what the DENSE head is necessarily
+            # trained on (its output is per-frame, so it cannot represent sub-frame
+            # targets). Off by default: eq. (1) produces a continuous time and
+            # Definition 1 is stated over continuous ground truth, so quantizing would
+            # degrade these heads to match a limitation of the other one. Exposed as a
+            # flag because it is a real asymmetry in the A/B -- the alignment arms
+            # otherwise see ground truth up to 1/(2*fps) = 10 ms more precise than the
+            # dense arm does -- and its size should be measured rather than argued about.
+            beats = np.round(beats * self.fps) / self.fps
+        return beats
+
+    def _emitted_seconds(self, times, window_seconds, padding_mask, index):
+        """Decoded times on the (0, 1] axis -> sorted seconds, padding excluded.
+
+        Without the restriction, candidates landing in an excerpt's zero-padded tail are
+        emitted as detections that no ground-truth event can match (truth_orig_* stops at
+        the real end), so they are pure false positives charged to one arm only.
+        """
+        # No dtype coercion: the subset arm's times arrive as float32, and upcasting
+        # here would shift its emitted seconds by ~1e-6 s against every number already
+        # recorded for it.
+        seconds = np.asarray(times) * window_seconds
+        if padding_mask is not None:
+            seconds = seconds[seconds < float(padding_mask[index].sum()) / self.fps]
+        return np.sort(seconds)
 
     def _phase_decode(self, batch, model_prediction):
         """Section 5 / Algorithm 9-10 per excerpt, as predicted TIMES in seconds.
@@ -207,16 +238,10 @@ class PLBeatThis(LightningModule):
             beat_t, downbeat_t, _meter = phase_decode_events(
                 model_prediction["phi_hat"][index].float().detach(),
                 model_prediction["t_hat"][index].float().detach())
-            beat_s = np.asarray(beat_t) * window_seconds
-            downbeat_s = np.asarray(downbeat_t) * window_seconds
-            if padding_mask is not None:
-                # Same restriction the subset arm applies: candidates in the zero-padded
-                # tail are pure false positives that no ground-truth event can match.
-                valid_seconds = float(padding_mask[index].sum()) / self.fps
-                beat_s = beat_s[beat_s < valid_seconds]
-                downbeat_s = downbeat_s[downbeat_s < valid_seconds]
-            beats.append(np.sort(beat_s))
-            downbeats.append(np.sort(downbeat_s))
+            beats.append(self._emitted_seconds(beat_t, window_seconds,
+                                               padding_mask, index))
+            downbeats.append(self._emitted_seconds(downbeat_t, window_seconds,
+                                                   padding_mask, index))
         return tuple(beats), tuple(downbeats)
 
     def _phase_targets(self, batch):
@@ -232,15 +257,9 @@ class PLBeatThis(LightningModule):
         device = batch["spect"].device
         targets = []
         for index in range(len(batch["spect"])):
-            beats = np.frombuffer(batch["truth_orig_beat"][index])
+            beats = self._window_events(batch, index, window_seconds)
             downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
             has_downbeats = bool(batch["downbeat_mask"][index])
-
-            # eq. (1) maps onto the half-open axis (0, 1], so a target at exactly 0 is
-            # unreachable by construction and would be an unmatchable event.
-            beats = np.unique(beats[(beats > 0) & (beats <= window_seconds)])
-            if self.quantize_targets:
-                beats = np.round(beats * self.fps) / self.fps
 
             phi_true = None
             if has_downbeats and len(beats):
@@ -263,25 +282,9 @@ class PLBeatThis(LightningModule):
         device = batch["spect"].device
         targets = []
         for index in range(len(batch["spect"])):
-            beats = np.frombuffer(batch["truth_orig_beat"][index])
+            beats = self._window_events(batch, index, window_seconds)
             downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
             has_downbeats = bool(batch["downbeat_mask"][index])
-
-            # eq. (1) maps onto the half-open axis (0, 1], so a target at exactly 0 is
-            # unreachable by construction and would be an unmatchable event.
-            keep = (beats > 0) & (beats <= window_seconds)
-            beats = np.unique(beats[keep])   # unique, not just sorted: Definition 1
-            if self.quantize_targets:
-                # Round to the frame grid, which is what the DENSE head is necessarily
-                # trained on (its output is per-frame, so it cannot represent sub-frame
-                # targets). Off by default: eq. (1) produces a continuous time and
-                # Definition 1 is stated over continuous ground truth, so quantizing
-                # would degrade this head to match a limitation of the other one.
-                # Exposed as a flag because it is a real asymmetry in the A/B -- the
-                # subset arm otherwise sees ground truth up to 1/(2*fps) = 10 ms more
-                # precise than the dense arm does -- and its size should be measured
-                # rather than argued about.
-                beats = np.round(beats * self.fps) / self.fps
             if has_downbeats:
                 classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
             else:
