@@ -38,14 +38,14 @@ def test_stop_gradient_decouples_the_two_roles():
 
 
 def test_normaliser_gives_b_a_finite_optimum():
-    """log(2 eps + 2 b_j) is what stops the head inflating b_j to switch timing off."""
+    """log(2 b_j) is what stops the head inflating b_j to switch timing off."""
     c = SubsetCriterion()
-    residual = torch.tensor([0.004, 0.001, 0.006]).sub(EPS).clamp(min=0.0)
+    residual = torch.tensor([0.004, 0.001, 0.006])
 
     # Under 4.1.3's split only the precision channel sees b, so that channel is what
-    # determines b's optimum: dL/db = 0 at b* = (s + sqrt(s^2 + 4 eps s)) / 2.
+    # determines b's optimum: dL/db = 0 at b* = mean residual for the Laplace density.
     s = float(residual.mean())
-    expected = (s + math.sqrt(s * s + 4.0 * EPS * s)) / 2.0
+    expected = s
 
     # b* is optimal for the SUM: each candidate keeps its own residual, so the
     # per-element gradients cancel rather than vanishing individually.

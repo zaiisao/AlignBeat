@@ -259,12 +259,13 @@ class SubsetCriterion(nn.Module):
         per_event, unlabelled = self._class_term(
             log_probabilities[sigma], event_classes, target, match)
 
-        # line 13, second bracket. Two distinct quantities: the loss uses the
-        # eps-insensitive residual, but eq. (5)'s b and the ms diagnostic want the true
-        # error -- clamping those would drive b toward b_min and report 0 ms while the
-        # model is still tens of ms out.
+        # line 13, second bracket. The loss sees the true error: a pointed Laplace, no
+        # flat core, so t_hat is pulled onto the onset rather than merely inside the
+        # tolerance. (Under the flat core the clock stopped at the window edge: slope
+        # 0.63 of the needed shift, 24 ms mean error, b_hat parked at its 73 ms init.)
+        # The E-step cost keeps its eps-insensitive form, so the assignment is unchanged.
         matched_residual = (event_times - t_hat[sigma]).abs()            # (M,), raw
-        residual = matched_residual.sub(EPS).clamp(min=0.0)              # eps-insensitive
+        residual = matched_residual
         time_term, precision_term = self._time_term(
             residual, laplace_scale, sigma, denominator)
 
@@ -509,15 +510,15 @@ class SubsetCriterion(nn.Module):
                 valid[start:end] = True
         return r, valid
 
-    def _per_candidate_time_term(self, residual, b_j, eps=EPS):
-        """-log p(r | b_j) for the uniform-core / Laplace-tail density, split per 4.1.3.
+    def _per_candidate_time_term(self, residual, b_j):
+        """-log p(r | b_j) for the Laplace density exp(-r/b)/(2b), split per 4.1.3.
 
-        residual is already eps-insensitive, so log(2 eps + 2 b_j) is the normaliser that
-        makes this a likelihood in b_j: without it b_j -> inf minimises the loss and the
-        timing channel switches itself off.
+        log(2 b_j) is the normaliser that makes this a likelihood in b_j: without it
+        b_j -> inf minimises the loss and the timing channel switches itself off. Its
+        stationary point is b_j = mean residual, the actual timing error.
         """
         localisation = residual / b_j.detach()                       # gradient to t_hat
-        precision = residual.detach() / b_j + torch.log(2.0 * eps + 2.0 * b_j)  # to b_j
+        precision = residual.detach() / b_j + torch.log(2.0 * b_j)   # to b_j
         return localisation + precision
 
     def _precision_prior(self, b_j):
