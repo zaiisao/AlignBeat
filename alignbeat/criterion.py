@@ -47,7 +47,7 @@ class SubsetCriterion(nn.Module):
                  omega_downbeat=2.0, gamma=0.5,
                  normalize_by_events=NORMALIZE_BY_EVENTS,
                  background_by_unmatched=False,
-                 b_min=B_MIN,
+                 b_min=B_MIN, ema_decay=0.99,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
                  meter_length=0, meter_candidates=(), meter_prior=None,
@@ -61,6 +61,12 @@ class SubsetCriterion(nn.Module):
         self.background_by_unmatched = background_by_unmatched
 
         self.b_min = b_min
+        # Eq. (5): one scalar b for the pair cost (3), the mean matched residual, kept
+        # as an EMA across minibatches and held fixed within each step. The DP solves
+        # (4) on this b, never on the per-candidate b_j of the loss, so the assignment
+        # is insulated from the precision head (section 4.1.3, last paragraph).
+        self.register_buffer("global_b", torch.tensor(float(EPS)))
+        self.ema_decay = ema_decay
         self.precision_prior_alpha = precision_prior_alpha
         self.precision_prior_beta = precision_prior_beta
 
@@ -93,26 +99,21 @@ class SubsetCriterion(nn.Module):
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
-    def eps_l1(self, t_hat, t_target, laplace_scale, eps=None):
-        """eps-insensitive L1: exactly zero within eps of the annotation."""
-        # eps is a tolerance in seconds; t_hat is a fraction of the window, so it has
-        # to cross into the same unit as the residual it is subtracted from.
-        if eps is None:
-            eps = EPS
-        return (t_hat - t_target).abs().sub(eps).clamp(min=0.0) / laplace_scale
+    def l1(self, t_hat, t_target):
+        """Eq. (3)'s time channel: plain L1 over eq. (5)'s global b."""
+        return (t_hat - t_target).abs() / self.global_b
 
-    def build_cost(self, log_probabilities, t_hat, laplace_scale, event_classes,
-                   event_times):
+    def build_cost(self, log_probabilities, t_hat, event_classes, event_times):
         """Per-pair cost (3) plus the section 8.4 background correction."""
         class_cost = self.class_nll(log_probabilities, event_classes) # (M, N)
-        time_cost = self.eps_l1(t_hat[None, :], event_times[:, None], laplace_scale)
+        time_cost = self.l1(t_hat[None, :], event_times[:, None])
 
         background_nll = -log_probabilities[:, BACKGROUND]                                # (N,)
 
         l_match = class_cost + time_cost                                        # eq. (3)
         return l_match - self.gamma * background_nll[None, :]                   # section 8.4
 
-    def build_phase_cost(self, log_probabilities, t_hat, laplace_scale, event_classes,
+    def build_phase_cost(self, log_probabilities, t_hat, event_classes,
                          event_times, meter, p):
         """Equation (18), and its section 8.5 background-corrected form L'^p_match."""
         M = event_times.shape[0]
@@ -123,7 +124,7 @@ class SubsetCriterion(nn.Module):
 
         # Same time channel as build_cost, so the phase hypotheses are ranked on the
         # same quantity the phase-blind path uses.
-        time_cost = self.eps_l1(t_hat[None, :], event_times[:, None], laplace_scale)
+        time_cost = self.l1(t_hat[None, :], event_times[:, None])
         background_nll = -log_probabilities[:, BACKGROUND]                    # (N,)
 
         l_match_p = class_cost + time_cost                                    # eq. (18)
@@ -161,11 +162,11 @@ class SubsetCriterion(nn.Module):
 
         return cost.transpose(0, 1)                                             # (M, N)
 
-    def _e_step(self, log_probabilities_b, t_hat_b, laplace_scale, event_classes, event_times):
+    def _e_step(self, log_probabilities_b, t_hat_b, event_classes, event_times):
         """Algorithm 3 lines 1-9: the MAP estimate of sigma under the current theta."""
         with torch.no_grad():
             corrected = self.build_cost(log_probabilities_b, t_hat_b,
-                                        laplace_scale, event_classes, event_times)
+                                        event_classes, event_times)
             fragment_meter = self._fragment_meter(event_classes)
 
             if not bool(torch.isfinite(corrected).all()):
@@ -180,7 +181,7 @@ class SubsetCriterion(nn.Module):
                 # JA: Section 8.3 eq. (19): rerun the DP once per phase hypothesis, keep the
                 # cheapest, so sigma is chosen WITH phase evidence rather than before it.
                 phase_costs = torch.stack([
-                    self.build_phase_cost(log_probabilities_b, t_hat_b, laplace_scale,
+                    self.build_phase_cost(log_probabilities_b, t_hat_b,
                                           event_classes, event_times, fragment_meter, p)
                     for p in range(fragment_meter)])
 
@@ -263,7 +264,6 @@ class SubsetCriterion(nn.Module):
         # flat core, so t_hat is pulled onto the onset rather than merely inside the
         # tolerance. (Under the flat core the clock stopped at the window edge: slope
         # 0.63 of the needed shift, 24 ms mean error, b_hat parked at its 73 ms init.)
-        # The E-step cost keeps its eps-insensitive form, so the assignment is unchanged.
         matched_residual = (event_times - t_hat[sigma]).abs()            # (M,), raw
         residual = matched_residual
         time_term, precision_term = self._time_term(
@@ -328,8 +328,7 @@ class SubsetCriterion(nn.Module):
                 continue
 
             # E-step: MAP estimate of sigma under the current theta (Alg. 3, 1-9)
-            # laplace_scale is (B, N); each step sees this fragment's own candidates.
-            match = self._e_step(log_probabilities[i], t_hat[i], laplace_scale[i],
+            match = self._e_step(log_probabilities[i], t_hat[i],
                                  event_classes, event_times)
 
             # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15).
@@ -351,6 +350,12 @@ class SubsetCriterion(nn.Module):
         losses = self._aggregate(
             class_logits, class_terms, time_terms, background_terms,
             precision_terms, num_contributing)
+
+        if self.training and matched_residuals:
+            # Eq. (5) between steps: the batch's mean raw matched residual, blended in.
+            with torch.no_grad():
+                batch_b = torch.cat(matched_residuals).mean().clamp(min=self.b_min)
+                self.global_b.mul_(self.ema_decay).add_((1.0 - self.ema_decay) * batch_b)
 
         with torch.no_grad():
             stats = self._make_stats(
@@ -404,7 +409,8 @@ class SubsetCriterion(nn.Module):
         return stats
 
     def _log_diagnostic(self, stats, num_candidates):
-        print(f"[subset] b_hat={stats['b_hat_mean']:.5f} "
+        print(f"[subset] global_b={float(self.global_b) * FRAGMENT_SECONDS * 1000:.0f}ms "
+              f"b_hat={stats['b_hat_mean']:.5f} "
               f"[{stats['b_hat_min']:.5f}, {stats['b_hat_max']:.5f}] "
               f"({stats['b_hat_mean'] * FRAGMENT_SECONDS * 1000:.0f}ms) | "
               f"residual={stats.get('residual_mean', float('nan')):.5f} "
