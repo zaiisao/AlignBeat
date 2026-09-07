@@ -54,6 +54,7 @@ def collect(model, loader, device):
             b_j = crit.b_min + pred["b_hat"][i]
             cost = crit.build_cost(logp, pred["t_hat"][i], gt_c, gt_t)
             frags.append(dict(
+                time_scale=model.model.task_heads.downsample.time_scale(batch["spect"].shape[1]),
                 z=F.normalize(z_all[i], dim=-1).cpu().numpy(),          # (N, C)
                 t_hat=pred["t_hat"][i].cpu().numpy(),
                 gt_t=gt_t.cpu().numpy(),
@@ -121,8 +122,11 @@ def main():
           f"(when pick != nearest: {np.mean(ms_off[cells != 0] > 70):.1%})")
 
     # (c) does the regression move the clock toward the onset? Initial grid is
-    # (j+1)/N by eq. (1); compare the learned shift with the shift that would be needed.
-    init = (np.arange(N) + 1.0) / N
+    # (j+1)/N by eq. (1) over the PADDED candidate window, which SubsetHead rescales by
+    # padded_length / input_frames (1504/1500 at N=188) before anyone reads t_hat. Build
+    # the init the same way, or the rescale shows up as a 0 -> +80 ms ramp across the
+    # window and reads as a learned drift (it did, for one afternoon).
+    init = (np.arange(N) + 1.0) / N * frags[0]["time_scale"]
     shift, need, d_init, d_hat = [], [], [], []
     for f in frags:
         d = np.abs(f["gt_t"][:, None] - f["t_hat"][None, :])

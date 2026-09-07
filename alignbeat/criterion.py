@@ -29,6 +29,21 @@ BEAT_ONLY_CONFIDENCE = 0.7
 # The tolerance in the units t_hat lives in: a fraction of the window.
 EPS = F_MEASURE_TOLERANCE / FRAGMENT_SECONDS
 
+# E-step time scale, eq. (3)'s 1/lambda_L1: fixed from the tolerance rather than
+# estimated by eq. (5). At b = eps/2 the Laplace puts 86% of its mass inside the window
+# and charges a linear tail beyond it (rubato, late annotations). Fixed so the
+# class/time exchange rate does not drift as the regression sharpens: eq. (5)'s EMA ran
+# 73 -> 28 ms over one run and steepened the cost into a gate by itself (E_estep).
+ESTEP_B = EPS / 2.0
+
+# Cap on the class channel of the matching cost (3), stated as a DISTANCE: confidence
+# may relocate a match within the tolerance, never beyond it. In nats that is eps / b =
+# 2.0. Inside the cap the cost is the log-likelihood of observation model (2) term for
+# term; beyond it the head's -log p is not credited, since under hard EM it was trained
+# on this cost's own earlier assignments. Offline on E_bhat ep19: K=inf 4.9% off-tolerance
+# picks, K=2 3.3%, K=1.5 2.9% (E_cap), K=1 2.3% (E_detr), floor 1.7%. Loss (8) unclamped.
+CLASS_COST_CAP = EPS / ESTEP_B
+
 PRECISION_PRIOR_ALPHA = 2.0
 PRECISION_PRIOR_BETA = None
 
@@ -47,7 +62,7 @@ class SubsetCriterion(nn.Module):
                  omega_downbeat=2.0, gamma=0.5,
                  normalize_by_events=NORMALIZE_BY_EVENTS,
                  background_by_unmatched=False,
-                 b_min=B_MIN, ema_decay=0.99,
+                 b_min=B_MIN, residual_ema_decay=0.99,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
                  meter_length=0, meter_candidates=(), meter_prior=None,
@@ -61,12 +76,11 @@ class SubsetCriterion(nn.Module):
         self.background_by_unmatched = background_by_unmatched
 
         self.b_min = b_min
-        # Eq. (5): one scalar b for the pair cost (3), the mean matched residual, kept
-        # as an EMA across minibatches and held fixed within each step. The DP solves
-        # (4) on this b, never on the per-candidate b_j of the loss, so the assignment
-        # is insulated from the precision head (section 4.1.3, last paragraph).
-        self.register_buffer("global_b", torch.tensor(float(EPS)))
-        self.ema_decay = ema_decay
+        self.estep_b = ESTEP_B
+        # Running mean matched residual, eq. (5): used only as the Gamma prior's mode
+        # (section 4.1.3's data-informed default). The E-step cost runs on ESTEP_B.
+        self.register_buffer("residual_ema", torch.tensor(float(EPS)))
+        self.residual_ema_decay = residual_ema_decay
         self.precision_prior_alpha = precision_prior_alpha
         self.precision_prior_beta = precision_prior_beta
 
@@ -100,15 +114,21 @@ class SubsetCriterion(nn.Module):
 
 
     def l1(self, t_hat, t_target):
-        """Eq. (3)'s time channel: plain L1 over eq. (5)'s global b."""
-        return (t_hat - t_target).abs() / self.global_b
+        """Eq. (3)'s time channel: plain L1 over the fixed E-step scale."""
+        return (t_hat - t_target).abs() / self.estep_b
 
     def build_cost(self, log_probabilities, t_hat, event_classes, event_times):
-        """Per-pair cost (3) plus the section 8.4 background correction."""
-        class_cost = self.class_nll(log_probabilities, event_classes) # (M, N)
+        """Per-pair cost (3) plus the section 8.4 background correction.
+
+        Both class terms are clamped at CLASS_COST_CAP: inside the cap the cost is the
+        log-likelihood of observation model (2) term for term; beyond it the head's
+        confidence is not credited, since under hard EM it was trained on this cost's
+        own earlier assignments.
+        """
+        class_cost = self.class_nll(log_probabilities, event_classes).clamp(max=CLASS_COST_CAP)
         time_cost = self.l1(t_hat[None, :], event_times[:, None])
 
-        background_nll = -log_probabilities[:, BACKGROUND]                                # (N,)
+        background_nll = (-log_probabilities[:, BACKGROUND]).clamp(max=CLASS_COST_CAP)   # (N,)
 
         l_match = class_cost + time_cost                                        # eq. (3)
         return l_match - self.gamma * background_nll[None, :]                   # section 8.4
@@ -120,12 +140,12 @@ class SubsetCriterion(nn.Module):
         phase_cost = phase_class_nll(log_probabilities, M, meter, p)          # (M, N)
         observed_cost = self.class_nll(log_probabilities, event_classes)      # (M, N)
         empty = (event_classes == CLASS_UNKNOWN)[:, None]
-        class_cost = torch.where(empty, phase_cost, observed_cost)
+        class_cost = torch.where(empty, phase_cost, observed_cost).clamp(max=CLASS_COST_CAP)
 
         # Same time channel as build_cost, so the phase hypotheses are ranked on the
         # same quantity the phase-blind path uses.
         time_cost = self.l1(t_hat[None, :], event_times[:, None])
-        background_nll = -log_probabilities[:, BACKGROUND]                    # (N,)
+        background_nll = (-log_probabilities[:, BACKGROUND]).clamp(max=CLASS_COST_CAP)  # (N,)
 
         l_match_p = class_cost + time_cost                                    # eq. (18)
         return l_match_p - self.gamma * background_nll[None, :]               # section 8.5
@@ -352,10 +372,11 @@ class SubsetCriterion(nn.Module):
             precision_terms, num_contributing)
 
         if self.training and matched_residuals:
-            # Eq. (5) between steps: the batch's mean raw matched residual, blended in.
+            # Eq. (5) between steps, for the prior only.
             with torch.no_grad():
                 batch_b = torch.cat(matched_residuals).mean().clamp(min=self.b_min)
-                self.global_b.mul_(self.ema_decay).add_((1.0 - self.ema_decay) * batch_b)
+                self.residual_ema.mul_(self.residual_ema_decay).add_(
+                    (1.0 - self.residual_ema_decay) * batch_b)
 
         with torch.no_grad():
             stats = self._make_stats(
@@ -409,7 +430,7 @@ class SubsetCriterion(nn.Module):
         return stats
 
     def _log_diagnostic(self, stats, num_candidates):
-        print(f"[subset] global_b={float(self.global_b) * FRAGMENT_SECONDS * 1000:.0f}ms "
+        print(f"[subset] residual_ema={float(self.residual_ema) * FRAGMENT_SECONDS * 1000:.0f}ms "
               f"b_hat={stats['b_hat_mean']:.5f} "
               f"[{stats['b_hat_min']:.5f}, {stats['b_hat_max']:.5f}] "
               f"({stats['b_hat_mean'] * FRAGMENT_SECONDS * 1000:.0f}ms) | "
@@ -530,11 +551,11 @@ class SubsetCriterion(nn.Module):
     def _precision_prior(self, b_j):
         """Mitigation two: a Gamma prior on the precision 1/b_j, as a MAP term.
 
-        Its mode is eq. (5)'s global b, section 4.1.3's data-informed default, so each
-        b_j is shrunk toward the running mean residual rather than toward the tolerance.
+        Its mode is eq. (5)'s running mean residual, section 4.1.3's data-informed
+        default, so each b_j is shrunk toward the data rather than toward the tolerance.
         """
         alpha = self.precision_prior_alpha
         beta = (self.precision_prior_beta if self.precision_prior_beta is not None
-                else float(self.global_b) * max(alpha - 1.0, 1e-6))
+                else float(self.residual_ema) * max(alpha - 1.0, 1e-6))
         return ((alpha - 1.0) * torch.log(b_j) + beta / b_j).sum()
 
