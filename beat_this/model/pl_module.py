@@ -332,20 +332,17 @@ class PLBeatThis(LightningModule):
             )
 
     def on_before_optimizer_step(self, optimizer):
-        """Hold b_j at its init for the first 30% of the run, then let it learn.
+        """Formerly held b_j at its init for the first 30% of the run.
 
-        The weight is trainable from construction (see SubsetHead), so the graph never
-        changes shape; the warm-up is enforced here by dropping the gradient. Dropping
-        it rather than zeroing it is what matters: AdamW skips a parameter whose grad is
-        None, but would still apply weight decay and momentum to a zero one.
-
-        The bias stays frozen for the whole run, so only the weights move -- the head
-        can redistribute precision across candidates but not shift its overall scale.
+        Removed: b_j is detached from t_hat's gradient, from the DP (global b), and from
+        the trunk (z.detach()), so the warm-up has nothing left to guard. Kept as a hook
+        so the gate can be reinstated if b_hat's trajectory says it was needed. If it is,
+        drop the gradient (set it to None) rather than zeroing it: AdamW skips a
+        parameter whose grad is None, but would still apply weight decay and momentum
+        to a zero one.
         """
         if self.subset_criterion is None:
             return
-        if self.current_epoch < self.max_epochs * 0.3:
-            self.model.task_heads.head.precision_head.weight.grad = None
 
     def training_step(self, batch, batch_idx):
         # run the model

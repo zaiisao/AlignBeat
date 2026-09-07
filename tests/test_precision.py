@@ -78,18 +78,16 @@ def test_gamma_prior_pulls_toward_the_data_informed_default():
     print("ok: Gamma prior is minimised at beta/(alpha-1) and penalises both directions")
 
 
-def test_head_bias_is_the_tolerance_and_stays_frozen():
-    """The head starts by claiming exactly the F-measure tolerance, and cannot drift."""
+def test_head_bias_starts_at_the_tolerance():
+    """The head starts by claiming exactly the F-measure tolerance, then may learn."""
     for window_seconds in (15.0, 30.0, 60.0):
         head = SubsetSelectionHead(feature_size=16, window_seconds=window_seconds)
         b0 = float(torch.nn.functional.softplus(head.precision_head.bias))
         assert abs(b0 * window_seconds - F_MEASURE_TOLERANCE) < 1e-6, window_seconds
-        # The bias stays frozen for the whole run, fixing b's scale at the 70 ms init.
-        # The weight is trainable from step 0 -- the warm-up gates it by dropping the
-        # gradient, not by flipping requires_grad, so the graph never changes shape.
-        assert head.precision_head.bias.requires_grad is False
+        # Both bias and weight train from step 0, so b's scale can follow the data.
+        assert head.precision_head.bias.requires_grad is True
         assert head.precision_head.weight.requires_grad is True
-    print("ok: the precision bias is 70 ms of whatever window it is given, and frozen")
+    print("ok: the precision bias starts at 70 ms of whatever window it is given")
 
 
 def test_head_emits_one_scale_per_candidate():
@@ -98,55 +96,6 @@ def test_head_emits_one_scale_per_candidate():
     assert b_hat.shape == (2, 8), b_hat.shape
     assert float(b_hat.min()) > 0.0, "softplus must keep b_hat positive"
     print("ok: the head emits one positive b_hat per candidate")
-
-
-def test_frozen_parameters_still_reach_the_optimizer():
-    """A parameter frozen at construction must still be given to the optimizer.
-
-    configure_optimizers runs once, at fit start. Filtering on requires_grad there
-    permanently excludes anything frozen at that moment, so a later thaw flips a flag on
-    a tensor no optimizer owns and the parameter never moves -- which is what kept b_hat
-    pinned at its init for every run until this was fixed. Freezing must be enforced by
-    the absence of a gradient, not by absence from the optimizer.
-    """
-    import torch
-    from beat_this.model.pl_module import PLBeatThis
-
-    m = PLBeatThis(head_type="subset", num_candidates=188,
-                   transformer_dim=64,
-                   n_layers=2, downsample_stages=3, max_epochs=100)
-    head = m.model.task_heads.head
-    # The bias is what is frozen: it fixes b's overall scale at the 70 ms init and stays
-    # put for the whole run, while the weight trains from step 0 so the autograd graph
-    # never changes shape mid-run. See SubsetSelectionHead._initialize_weights.
-    frozen = head.precision_head.bias
-    assert frozen.requires_grad is False, "expected the bias frozen at construction"
-
-    # the same grouping configure_optimizers builds, without needing a Trainer
-    def is_head(n):
-        return n.startswith("model.task_heads") or n.startswith("subset_criterion")
-    seen, groups = set(), []
-    for pred in (lambda n: not is_head(n), is_head):
-        for keep in (lambda p: p.ndim >= 2, lambda p: p.ndim <= 1):
-            ps = [p for n, p in m.named_parameters()
-                  if pred(n) and keep(p) and id(p) not in seen]
-            for p in ps:
-                seen.add(id(p))
-            if ps:
-                groups.append({"params": ps, "lr": 1e-3})
-    opt = torch.optim.AdamW(groups, lr=1e-3)
-    assert id(frozen) in {id(p) for g in opt.param_groups for p in g["params"]}, \
-        "frozen parameter was dropped from the optimizer; a later thaw cannot work"
-
-    before = frozen.detach().clone()
-    opt.step()
-    assert torch.equal(before, frozen.detach()), "frozen parameter moved"
-
-    frozen.requires_grad_(True)
-    frozen.grad = torch.ones_like(frozen)
-    opt.step()
-    assert not torch.equal(before, frozen.detach()), "thawed parameter did not move"
-    print("ok: a frozen parameter stays in the optimizer and moves once thawed")
 
 
 if __name__ == "__main__":

@@ -104,12 +104,9 @@ class SubsetSelectionHead(nn.Module):
         b_initial = F_MEASURE_TOLERANCE / self.window_seconds
         nn.init.constant_(self.precision_head.bias, softplus_inverse(b_initial))
 
-        # The bias fixes b's overall scale (softplus_inverse of the 70 ms init) and stays
-        # frozen for the whole run. The weight is trainable from step 0 so the autograd
-        # graph never changes shape mid-run; the warm-up in PLBeatThis gates its updates
-        # by dropping the gradient instead. Toggling requires_grad here was the reason
-        # the epoch-30 thaw never took effect and b_hat stayed at its init in every run.
-        self.precision_head.bias.requires_grad_(False)
+        # The bias sets b's overall scale, and the 70 ms init is only its starting point:
+        # both bias and weight train from step 0 so the scale can follow the data. (It
+        # used to be frozen, which held b_hat near twice the true residual.)
 
     def forward(self, x):
         """x: (B, C, N) candidate features from Downsample, one token per candidate."""
@@ -138,7 +135,9 @@ class SubsetSelectionHead(nn.Module):
 
         class_logits = self.class_head(z_class)         # (B, N, 3)
 
-        b_hat_logit = self.precision_head(z).squeeze(dim=2)     # (B, N)
+        # b_j reads the trunk but never trains it: the precision term has no path into
+        # the features the class and regression heads share (section 4.1.2's concern).
+        b_hat_logit = self.precision_head(z.detach()).squeeze(dim=2)     # (B, N)
         b_hat = nn.functional.softplus(b_hat_logit)
 
         # Raw output u_j; the criterion applies b_j = b_min + softplus(u_j).

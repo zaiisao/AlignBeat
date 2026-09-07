@@ -528,9 +528,13 @@ class SubsetCriterion(nn.Module):
         return localisation + precision
 
     def _precision_prior(self, b_j):
-        """Mitigation two: a Gamma prior on the precision 1/b_j, as a MAP term."""
+        """Mitigation two: a Gamma prior on the precision 1/b_j, as a MAP term.
+
+        Its mode is eq. (5)'s global b, section 4.1.3's data-informed default, so each
+        b_j is shrunk toward the running mean residual rather than toward the tolerance.
+        """
         alpha = self.precision_prior_alpha
         beta = (self.precision_prior_beta if self.precision_prior_beta is not None
-                else float(F_MEASURE_TOLERANCE / FRAGMENT_SECONDS) * max(alpha - 1.0, 1e-6))
+                else float(self.global_b) * max(alpha - 1.0, 1e-6))
         return ((alpha - 1.0) * torch.log(b_j) + beta / b_j).sum()
 
