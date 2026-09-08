@@ -100,33 +100,31 @@ def test_infeasible_raises():
 
 
 def test_monotonicity_invariant():
-    """Equation (1) is strictly increasing at any realistic parameter scale."""
+    """The bounded offset is strictly increasing for every r, at every scale."""
     torch.manual_seed(0)
-    # Strictly increasing wherever a healthy run lives. In exact arithmetic eq. (1) is
-    # strict for every r; in float32 an increment can fall below eps(1.0) and be
-    # swallowed by the cumsum. Measured at N=160, the first tie appears at an r spread
-    # of 4 (2/1272 gaps), and the converged model sits at ~1.3.
-    for scale in (1e-3, 0.1, 1.0, 2.0):
-        r = torch.randn(8, 160) * scale
+    from alignbeat.head import MAX_OFFSET
+    N = 160
+    floor = (1.0 - 2.0 * MAX_OFFSET) / N            # the smallest gap any r can produce
+    for scale in (1e-3, 0.1, 1.0, 2.0, 20.0, 1000.0):
+        r = torch.randn(8, N) * scale
         t = monotonic_times(r)
         gaps = t[:, 1:] - t[:, :-1]
-        assert torch.all(gaps > 0), (
-            f"not strictly increasing at scale {scale} (min gap {gaps.min():.3e})")
-        assert torch.all(t > 0) and torch.all(t <= 1.0 + 1e-6)
+        assert torch.all(gaps >= floor - 1e-6), (
+            f"gap below the architectural floor at scale {scale} (min {gaps.min():.3e})")
+        assert torch.all(t > 0) and torch.all(t < 1.0), "clocks live strictly inside (0, 1)"
         assert torch.isfinite(t).all()
-        assert torch.allclose(t[:, -1], torch.ones(8), atol=1e-6), "t_N must equal 1"
 
-    # Never decreasing, at any scale: the order constraint the DP relies on survives even
-    # where float32 collapses a gap to zero.
-    for scale in (5.0, 20.0, 200.0, 1000.0):
-        t = monotonic_times(torch.randn(8, 160) * scale)
-        assert torch.all(t[:, 1:] - t[:, :-1] >= 0), f"decreasing at scale {scale}"
-        assert torch.isfinite(t).all(), f"non-finite at scale {scale}"
-
-    # r == 0 gives the uniform grid the head is initialised to
+    # r == 0 gives the cell-centre grid the head is initialised to
     t0 = monotonic_times(torch.zeros(1, 8))
-    assert torch.allclose(t0[0], torch.arange(1, 9, dtype=torch.float32) / 8.0, atol=1e-5)
-    print("ok: equation (1) strict where a healthy run lives, never decreasing anywhere")
+    assert torch.allclose(t0[0], (torch.arange(8, dtype=torch.float32) + 0.5) / 8.0, atol=1e-6)
+
+    # each clock moves on its own r and reaches exactly +-MAX_OFFSET of a cell: a change
+    # to r_j moves t_hat_j and nothing else
+    r = torch.zeros(1, 8); r[0, 3] = 50.0
+    t = monotonic_times(r)
+    assert abs(float(t[0, 3] - t0[0, 3]) - MAX_OFFSET / 8.0) < 1e-6
+    assert torch.allclose(t[0, [0, 1, 2, 4, 5, 6, 7]], t0[0, [0, 1, 2, 4, 5, 6, 7]])
+    print("ok: bounded offset is strictly increasing at every scale, local, and centred at r=0")
 
 
 def test_logsumexp_dp_bounds_the_min():
@@ -283,7 +281,7 @@ def test_head_shapes_and_monotonicity_end_to_end():
     assert t_hat.shape == (2, 160)
     assert torch.all(t_hat[:, 1:] > t_hat[:, :-1])
     # at initialization the regression head is zeroed -> uniform candidate grid
-    assert torch.allclose(t_hat[0], torch.arange(1, 161, dtype=torch.float32) / 160.0, atol=1e-5)
+    assert torch.allclose(t_hat[0], (torch.arange(160, dtype=torch.float32) + 0.5) / 160.0, atol=1e-5)
     print("ok: head shapes correct, uniform grid at init")
 
 
@@ -398,24 +396,23 @@ def test_log_prob_floor_keeps_dp_cost_finite():
 
 
 def test_monotonic_times_survives_overflow_scale_r():
-    """Equation (1) stays finite and ordered at overflow-scale r."""
-    # Large positive r is fine: softplus is the identity there, so the normalisation
-    # cancels the scale outright and the grid is the same one r == 0 gives.
-    t = monotonic_times(torch.full((1, 160), 1e30))
-    assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
-    assert torch.allclose(t[0], torch.arange(1, 161, dtype=torch.float32) / 160.0,
-                          atol=1e-5), "constant r must give the uniform grid at any scale"
+    """Bounded offset stays finite and ordered at overflow-scale r, of either sign."""
+    from alignbeat.head import MAX_OFFSET
+    N = 160
+    centre = (torch.arange(N, dtype=torch.float32) + 0.5) / N
+    for value in (1e30, -1e30):
+        t = monotonic_times(torch.full((1, N), value))
+        assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
+        # tanh saturates: every clock sits at its centre +- exactly MAX_OFFSET of a cell
+        assert torch.allclose(t[0], centre + (1.0 if value > 0 else -1.0) * MAX_OFFSET / N, atol=1e-6)
 
-    # A lone spike keeps the order the DP needs, though the crowded-out candidates tie.
-    mixed = torch.zeros(1, 160); mixed[0, 0] = 1e30
+    # A lone spike moves one clock to its bound and leaves every other clock in place;
+    # there is no normaliser for it to crowd the rest through.
+    mixed = torch.zeros(1, N); mixed[0, 0] = 1e30
     t = monotonic_times(mixed)
-    assert torch.isfinite(t).all() and torch.all(t[:, 1:] >= t[:, :-1])
-
-    # Fully underflowed r is 0/0. Eq. (1) has no answer here and the head does not
-    # invent one: _e_step's isfinite check turns it into a raise, which is the intended
-    # outcome -- a floor would keep a diverging run silently training on a fake grid.
-    assert torch.isnan(monotonic_times(torch.full((1, 160), -1e30))).any()
-    print("ok: equation (1) is ordered at overflow-scale r and loud when underflowed")
+    assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
+    assert torch.allclose(t[0, 1:], centre[1:], atol=1e-6)
+    print("ok: bounded offset is ordered and finite at overflow-scale r of either sign")
 
 
 def test_non_finite_cost_raises_rather_than_masking():

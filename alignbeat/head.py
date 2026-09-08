@@ -160,23 +160,32 @@ def sinusoidal(position, dim):
     return out[..., :dim]
 
 
-def monotonic_times(r):
-    """Equation (1), verbatim.
+# Largest displacement of a clock from its cell centre, as a fraction of one cell.
+# Below 1/2 no two clocks can cross, so ordering is architectural. At 0.45 a clock
+# reaches +-72 ms at N=188, past the cell's own half-width, and the seam between two
+# neighbours' reaches is 0.1 cell = 16 ms -- 8 ms from a clock, well inside the
+# 70 ms tolerance.
+MAX_OFFSET = 0.45
 
-    Every summand is strictly positive, so in exact arithmetic t_hat is strictly
-    increasing for any r and monotonicity is architectural rather than learned. Two
-    caveats hold in float32, both confined to states a healthy run never reaches:
 
-      spread  an increment below eps(1.0) ~ 1.19e-7 is swallowed by the cumsum and two
-              candidates land on the same time. This needs r spread ~ 10; the converged
-              model runs at ~1.3, and the only run that approached it was diverging
-              anyway (A_f0, which then died of a non-finite matching cost at epoch 47).
-      collapse  softplus(-120) underflows to 0.0, so all-negative r gives 0/0 = NaN.
+def monotonic_times(r, max_offset=MAX_OFFSET):
+    """Each clock is its cell centre plus a bounded offset read from its own feature.
 
-    Both surface loudly: _e_step's isfinite check raises rather than training on a
-    degenerate grid. That is preferred here to a floor that would keep a diverging run
-    quietly going.
+        t_hat_j = (j + 1/2) / N  +  max_offset * tanh(r_j) / N
+
+    Consecutive centres are 1/N apart and every offset lies in (-max_offset/N,
+    +max_offset/N), so t_hat_{j+1} - t_hat_j > (1 - 2 max_offset)/N > 0 for any r:
+    strictly increasing by construction, not learned, and with no state that can
+    fail it (tanh is bounded; there is no normaliser to underflow).
+
+    This replaces the cumsum of normalised increments. That form coupled every clock
+    to every increment before it: moving one clock 80 ms toward a beat meant its
+    neighbour giving up ~17 ms (measured corr -0.61), and the reach saturated at ~68 ms
+    however far the beat was (0.62 of the need beyond 100 ms). Here beat i's time
+    gradient reaches r_j and nothing else, and the reach is max_offset of a cell.
+    The price is that clocks can no longer bunch up inside one cell, which nothing
+    measured used.
     """
-    weights = F.softplus(r)
-    inc = weights / weights.sum(dim=-1, keepdim=True)
-    return torch.cumsum(inc, dim=-1)
+    N = r.shape[-1]
+    centre = (torch.arange(N, device=r.device, dtype=r.dtype) + 0.5) / N
+    return centre + max_offset * torch.tanh(r) / N

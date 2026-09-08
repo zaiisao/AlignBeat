@@ -55,7 +55,7 @@ def test_every_event_reported_exactly_once():
 
     assert torch.all(frames[1:] > frames[:-1]), "output must be sorted and duplicate-free"
     assert torch.all(frames >= 0) and torch.all(frames <= total), (
-        "the piece end itself is a legal detection time (t_hat_N == 1 exactly)")
+        "the piece end is a legal detection time (this fake grid puts t_hat_N at 1)")
     assert torch.all(classes == BEAT)
 
     # Each fragment contributes exactly the candidates landing in its keep region, and
