@@ -56,7 +56,8 @@ class SubsetCriterion(nn.Module):
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
                  meter_candidates=(), estep_gamma=None,
-                 beat_only_warmup=0, beat_only_confidence=0.0):
+                 beat_only_warmup=0, beat_only_confidence=0.0,
+                 hypothesis_class_prior=False):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
@@ -106,6 +107,15 @@ class SubsetCriterion(nn.Module):
         # here" before pi_{omega,L} starts asserting which kind. The confidence gate is
         # per event and permanent: where the posterior is undecided, fall back to the
         # marginal rather than train on a target that is barely better than a coin flip.
+        # Whether pi_C also weights the (omega, L) hypothesis scores. It must not:
+        # under a hypothesis every class is determined by c_i(omega, L), so there is no
+        # class uncertainty left for a prior to resolve, and pi_C(DB) = E[1/L] is
+        # derived from METER_PRIOR -- the same prior already applied once per hypothesis
+        # as log P(L). Charging it again per claimed downbeat double-counts the base
+        # rate, and does so in proportion to how many downbeats a hypothesis claims:
+        # exactly -1.008 * M/L nats, monotone in L, a standing push toward sparser
+        # meters. True restores the pre-fix form for A/B only.
+        self.hypothesis_class_prior = hypothesis_class_prior
         self.beat_only_warmup = beat_only_warmup
         self.beat_only_confidence = beat_only_confidence
 
@@ -118,6 +128,7 @@ class SubsetCriterion(nn.Module):
               f"estep_gamma={self.estep_gamma} "
               f"beat_only_warmup={self.beat_only_warmup} "
               f"beat_only_confidence={self.beat_only_confidence} "
+              f"hypothesis_class_prior={self.hypothesis_class_prior} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -452,8 +463,17 @@ class SubsetCriterion(nn.Module):
         if self._call_count < self.beat_only_warmup:
             return marginal
 
-        log_db = matched_log[:, DOWNBEAT] + self.log_class_prior[DOWNBEAT]
-        log_b = matched_log[:, BEAT] + self.log_class_prior[BEAT]
+        # Must match _hypothesis_log_scores exactly: pi_{omega,L} is frozen from those
+        # scores, and Fisher's identity only holds if the surrogate is the expectation
+        # of the same complete-data log-likelihood the marginal was built from. Drop
+        # pi_C in one and not the other and the M-step stops being an EM step for the
+        # E-step's own posterior (tests/test_phase.py catches it).
+        if self.hypothesis_class_prior:
+            log_db = matched_log[:, DOWNBEAT] + self.log_class_prior[DOWNBEAT]
+            log_b = matched_log[:, BEAT] + self.log_class_prior[BEAT]
+        else:
+            log_db = matched_log[:, DOWNBEAT]
+            log_b = matched_log[:, BEAT]
         log_norm = torch.logaddexp(log_db, log_b)
         weighted = -(r * (log_db - log_norm) + (1.0 - r) * (log_b - log_norm))
 
@@ -491,8 +511,19 @@ class SubsetCriterion(nn.Module):
 
         log_db = match_likelihood[:, DOWNBEAT] + self.log_class_prior[DOWNBEAT]
         log_b = match_likelihood[:, BEAT] + self.log_class_prior[BEAT]
-        # P_hat normalises over {DB, B}: one log Z_i per event, identical under every
-        # hypothesis, so it cancels in the posterior but not in the loss's own value.
+        if not self.hypothesis_class_prior:
+            # c_i(omega, L) is deterministic given the hypothesis, so the hypothesis is
+            # scored by the model's own likelihood of the class it asserts, with
+            # P(L, omega) as the only prior. Adding log pi_C here costs
+            # (log pi_C(DB) - log pi_C(B)) per claimed downbeat -- -1.008 nats, times
+            # M/L -- which is monotone in L and overtakes log P(4) - log P(8) = 6.92
+            # nats past M = 55 events. Measured on 993 held-out GTZAN clips with the
+            # labels masked: it turned 93 of 930 true 4/4 clips into L=8, and dropping
+            # it halves that to 49 (L overall 82.4% -> 84.9%).
+            log_db = match_likelihood[:, DOWNBEAT]
+            log_b = match_likelihood[:, BEAT]
+        # One log Z_i per event, identical under every hypothesis, so it cancels in the
+        # posterior but not in the loss's own value.
         log_norm = torch.logaddexp(log_db, log_b).sum()
 
         for meter in self.meter_candidates:

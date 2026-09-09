@@ -157,6 +157,7 @@ def main(args):
             "omega_downbeat": args.omega_db,
             "meter_candidates": meter_candidates,
             "estep_gamma": args.estep_gamma,
+            "hypothesis_class_prior": args.hypothesis_class_prior,
             "beat_only_warmup": args.beat_only_warmup,
             "beat_only_confidence": args.beat_only_confidence,
             "normalize_by_events": args.normalize_by_events,
@@ -406,6 +407,12 @@ if __name__ == "__main__":
     # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
+    parser.add_argument("--hypothesis_class_prior", action="store_true", default=False,
+                        help="restore the pre-fix (omega, L) scoring, which added "
+                             "log pi_C to each event's class term. That charges "
+                             "1.008 nats per claimed downbeat, i.e. -1.008*M/L, "
+                             "biasing the meter posterior toward sparse meters. "
+                             "For A/B only; the fixed form is the default")
     parser.add_argument("--beat_only_warmup", type=int, default=0,
                         help="hold the plain marginal (eq. 9) on beat-only fragments "
                              "for this many training steps before the EM surrogate "

@@ -28,12 +28,16 @@ def test_em_posterior_matches_brute_force_and_couples_events():
         matched_log = torch.log_softmax(torch.randn(M, 3, dtype=torch.float64) * 2, dim=-1)
         got, _, _ = criterion._compute_latent_posterior(matched_log)
 
-        # Each factor is the prior-combined P_hat(C_i = c_i(p, L)), not the raw head
-        # output: pi_C reweights hypotheses whenever they claim different numbers of
-        # downbeats, which happens for every L that does not divide M.
-        log_prior_c = criterion.log_class_prior.to(matched_log.dtype)
-        log_db = matched_log[:, DOWNBEAT] + log_prior_c[DOWNBEAT]
-        log_b = matched_log[:, BEAT] + log_prior_c[BEAT]
+        # Each factor is the raw head output p_hat(c_i(p, L) | x), NOT prior-combined.
+        # c_i(p, L) is deterministic given the hypothesis, so no class uncertainty is
+        # left for pi_C to resolve; and pi_C(DB) = E[1/L] comes from METER_PRIOR, which
+        # is already applied once per hypothesis as log P(L). Including it here charges
+        # (log pi_C(DB) - log pi_C(B)) = -1.008 nats per claimed downbeat, i.e.
+        # -1.008 * M/L, which is monotone in L and reweights hypotheses purely by how
+        # many downbeats they claim. This test pinned that behaviour before it was
+        # identified as a double-count.
+        log_db = matched_log[:, DOWNBEAT]
+        log_b = matched_log[:, BEAT]
         log_norm = torch.logaddexp(log_db, log_b)
         log_pi = [float(sum((log_db[i0] if (p + i0) % L == 0 else log_b[i0]) - log_norm[i0]
                             for i0 in range(M)))
