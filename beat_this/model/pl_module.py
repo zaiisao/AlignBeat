@@ -59,7 +59,6 @@ class PLBeatThis(LightningModule):
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
         class_attention_final_norm: bool = False,
-        meter_candidates=(2, 3, 4, 5, 6, 8),
         subset_kwargs: dict = None,
         tau_beat: float = 0.2,
         tau_downbeat: float = 0.2,
@@ -100,7 +99,6 @@ class PLBeatThis(LightningModule):
             class_attention_heads=class_attention_heads,
             class_attention_pos=class_attention_pos,
             class_attention_final_norm=class_attention_final_norm,
-            meter_candidates=meter_candidates,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -227,8 +225,7 @@ class PLBeatThis(LightningModule):
                 model_prediction["class_logits"].float(),
                 model_prediction["t_hat"].float(),
                 model_prediction["b_hat"].float(),
-                self._subset_targets(batch),
-                meter_logits=model_prediction["meter_logits"].float())
+                self._subset_targets(batch))
 
             # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
             # are unchanged; they carry the class and timing terms of loss (8).

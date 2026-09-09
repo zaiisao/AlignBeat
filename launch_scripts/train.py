@@ -145,7 +145,6 @@ def main(args):
         class_attention_heads=args.class_attention_heads,
         class_attention_pos=args.class_attention_pos,
         class_attention_final_norm=args.class_attention_final_norm,
-        meter_candidates=meter_candidates,
         tau_beat=args.tau_beat,
         tau_downbeat=args.tau_downbeat,
         db_margin=args.db_margin,
@@ -160,7 +159,6 @@ def main(args):
             "meter_candidates": meter_candidates,
             "meter_prior": args.meter_prior or None,
             "mu_meter": args.mu_meter,
-            "lambda_meter_head": args.lambda_meter_head,
             "normalize_by_events": args.normalize_by_events,
             "background_by_unmatched": args.background_by_unmatched,
         },
@@ -412,10 +410,6 @@ if __name__ == "__main__":
     parser.add_argument("--joint_phase", action="store_true", default=False)
     parser.add_argument("--mu_meter", type=float, default=0.0,
                         help="Section 4.2 eq. (6): known-meter spacing inside the selection")
-    parser.add_argument("--lambda_meter_head", type=float, default=0.0,
-                        help="weight on the cross-entropy of Remark 3's meter head "
-                             "against the annotated L (the modal gap between annotated "
-                             "downbeats), on labelled fragments. 0 disables it")
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")

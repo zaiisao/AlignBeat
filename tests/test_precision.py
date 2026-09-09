@@ -92,7 +92,7 @@ def test_head_bias_starts_at_the_tolerance():
 
 def test_head_emits_one_scale_per_candidate():
     head = SubsetSelectionHead(feature_size=16)
-    class_logits, t_hat, b_hat, _ = head(torch.randn(2, 16, 8))
+    class_logits, t_hat, b_hat = head(torch.randn(2, 16, 8))
     assert b_hat.shape == (2, 8), b_hat.shape
     assert float(b_hat.min()) > 0.0, "softplus must keep b_hat positive"
     print("ok: the head emits one positive b_hat per candidate")

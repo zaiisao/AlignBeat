@@ -42,7 +42,6 @@ class BeatThis(nn.Module):
         class_attention_heads: int = 4,
         class_attention_pos: str = "none",
         class_attention_final_norm: bool = False,
-        meter_candidates=(2, 3, 4, 5, 6, 8),
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -107,8 +106,7 @@ class BeatThis(nn.Module):
                 class_attention_layers=class_attention_layers,
                 class_attention_heads=class_attention_heads,
                 class_attention_pos=class_attention_pos,
-                class_attention_final_norm=class_attention_final_norm,
-                meter_candidates=meter_candidates)
+                class_attention_final_norm=class_attention_final_norm)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -326,8 +324,7 @@ class SubsetHead(nn.Module):
                  downsample_mode="learned", train_length=1500, fps=50,
                  downsample_stages=None,
                  class_attention_layers=0, class_attention_heads=4,
-                 class_attention_pos="none", class_attention_final_norm=False,
-                 meter_candidates=(2, 3, 4, 5, 6, 8)):
+                 class_attention_pos="none", class_attention_final_norm=False):
         super().__init__()
 
         self.downsample = Downsample(input_dim, num_candidates,
@@ -348,8 +345,7 @@ class SubsetHead(nn.Module):
             class_attention_layers=class_attention_layers,
             class_attention_heads=class_attention_heads,
             class_attention_pos=class_attention_pos,
-            class_attention_final_norm=class_attention_final_norm,
-            meter_candidates=meter_candidates)
+            class_attention_final_norm=class_attention_final_norm)
 
     def forward(self, x):
         z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
@@ -362,8 +358,7 @@ class SubsetHead(nn.Module):
         t_hat = out[1] if downsample_factor == 1.0 else out[1] * downsample_factor
         b_hat = out[2]
 
-        return {"class_logits": out[0], "t_hat": t_hat, "b_hat": b_hat,
-                "meter_logits": out[3]}
+        return {"class_logits": out[0], "t_hat": t_hat, "b_hat": b_hat}
 
 
 class SumHead(nn.Module):

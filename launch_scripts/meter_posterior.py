@@ -7,7 +7,7 @@ between downbeats, so report
 
   1  accuracy of argmax_L P(L | x) against L_true, and the confusion between meters;
   2  mean P(L_true | x) and mean -log P(L_true | x): the meter term's own value, so a
-     checkpoint trained with --lambda_meter can be compared with one trained without;
+     checkpoints trained under different meter terms can be compared;
   3  the share of fragments where P(L | x) is confident (max >= 0.9) and right / wrong.
 
 On beat-only fragments there is no L_true; report the argmax histogram, which is what

@@ -66,8 +66,7 @@ class SubsetCriterion(nn.Module):
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
                  meter_candidates=(),
-                 joint_phase=False, mu_meter=0.0,
-                 lambda_meter_head=0.0):
+                 joint_phase=False, mu_meter=0.0):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
@@ -107,7 +106,6 @@ class SubsetCriterion(nn.Module):
 
         self.joint_phase = joint_phase
         self.mu_meter = mu_meter
-        self.lambda_meter_head = lambda_meter_head
 
         self._call_count = 0
 
@@ -302,8 +300,7 @@ class SubsetCriterion(nn.Module):
             'meter_posterior': meter_posterior,
         }
 
-    def forward(self, class_logits, t_hat, b_hat, targets, train_precision=True,
-                meter_logits=None):
+    def forward(self, class_logits, t_hat, b_hat, targets, train_precision=True):
         """One EM step per fragment; returns (losses, stats)."""
         batch_size, num_candidates, _ = class_logits.shape
 
@@ -313,7 +310,6 @@ class SubsetCriterion(nn.Module):
         # JA: b_hat is the output of the precision head which is learnable
         laplace_scale = self.b_min + b_hat # y = b
         precision_terms = []
-        meter_terms = []
 
         class_terms, time_terms, background_terms = [], [], []
         matched_residuals = []
@@ -352,21 +348,6 @@ class SubsetCriterion(nn.Module):
                                 ('precision', precision_terms)):
                 if terms[key] is not None:
                     bucket.append(terms[key])
-            # Remark 3's head, supervised. L is read off the annotation (the modal gap
-            # between annotated downbeats), so this is an ordinary classification target
-            # -- not section 8.7's marginal, whose target is a softmax over hypothesis
-            # scores that are themselves sums of M log-probabilities: those are tens of
-            # nats apart and saturated, so the cheapest way to raise the target's share
-            # is to shrink every p_hat at once, a degree of freedom shared with the class
-            # term. Measured, that is what it did (0.923 -> 0.896 on true downbeats,
-            # 0.041 -> 0.059 on true beats). |M| free logits have no such shortcut.
-            if meter_logits is not None and terms['unlabelled'] == 0:
-                fragment_meter = self._fragment_meter(gt_class)
-                if fragment_meter in self.meter_candidates:
-                    meter_terms.append(F.cross_entropy(
-                        meter_logits[b],
-                        torch.tensor(self.meter_candidates.index(fragment_meter),
-                                     device=class_logits.device)))
 
             if terms['residual'] is not None:
                 matched_residuals.append(terms['residual'])
@@ -377,7 +358,7 @@ class SubsetCriterion(nn.Module):
 
         losses = self._aggregate(
             class_logits, class_terms, time_terms, background_terms,
-            precision_terms, meter_terms, num_contributing)
+            precision_terms, num_contributing)
 
         if self.training and matched_residuals:
             # Eq. (5) between steps, for the prior only.
@@ -402,7 +383,7 @@ class SubsetCriterion(nn.Module):
         return losses, stats
 
     def _aggregate(self, class_logits, class_terms, time_terms, background_terms,
-                   precision_terms, meter_terms, num_contributing):
+                   precision_terms, num_contributing):
         """Per-fragment terms -> the loss dict train.py unpacks."""
         zero = torch.nan_to_num(class_logits).sum() * 0.0
         total = lambda terms: torch.stack(terms).sum() if terms else zero
@@ -413,15 +394,8 @@ class SubsetCriterion(nn.Module):
             'time': total(time_terms) / n,
             'background': self.gamma * total(background_terms) / n,
         }
-        if self.lambda_meter_head > 0.0 and meter_terms:
-            # Cross-entropy of Remark 3's meter head against the annotated L, meaned
-            # over the labelled fragments that carry one. Absent, not zero, when
-            # disabled: the shipped loss is the three terms above.
-            losses['meter'] = self.lambda_meter_head * torch.stack(meter_terms).mean()
-
         losses['time'] = losses['time'] + total(precision_terms) / n
-        losses['total'] = sum(losses[k] for k in
-                              ('class', 'time', 'background', 'meter') if k in losses)
+        losses['total'] = sum(losses[k] for k in ('class', 'time', 'background'))
         return losses
 
     def _make_stats(self, losses, t_hat, num_candidates, matched_residuals, counts,
