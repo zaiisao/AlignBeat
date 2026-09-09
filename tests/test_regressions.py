@@ -53,13 +53,12 @@ def test_flags_reach_the_criterion():
     m = PLBeatThis(
         head_type="subset", transformer_dim=64, n_layers=2,
         num_candidates=188,
-        subset_kwargs=dict(mu_meter=1e5, joint_phase=True, meter_length=4,
-                           meter_candidates=(2, 3, 4, 6), omega_downbeat=4.0,
-                           beat_only_confidence=0.9))
+        subset_kwargs=dict(mu_meter=1e5, joint_phase=True,
+                           meter_candidates=(2, 3, 4, 6), omega_downbeat=4.0))
     c = m.subset_criterion
-    assert c.mu_meter == 1e5 and c.joint_phase and c.meter_length == 4
+    assert c.mu_meter == 1e5 and c.joint_phase
     assert c.meter_candidates == (2, 3, 4, 6)
-    assert c.omega_downbeat == 4.0 and c.beat_only_confidence == 0.9
+    assert c.omega_downbeat == 4.0
 
 
 def test_meter_dp_matches_brute_force():

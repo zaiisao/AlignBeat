@@ -16,4 +16,4 @@ F_MEASURE_TOLERANCE = 0.07
 # Meter distribution of the corpus, from docs/METER_DISTRIBUTION.md ("% of tracks with
 # downbeats", i.e. P(L | L was annotated) -- which is what the latent-meter posterior is
 # estimating for the beat-only sets). Renormalised over whichever candidates are offered.
-METER_PRIOR = {2: 0.0447, 3: 0.0838, 4: 0.8612, 6: 0.0068}
+METER_PRIOR = {2: 0.0447, 3: 0.0838, 4: 0.8612, 5: 0.0011, 6: 0.0068, 8: 0.0017}

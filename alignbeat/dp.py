@@ -227,69 +227,6 @@ def subset_select_dp_joint_phase(costs):
     return best_sigma, best_p
 
 
-def subset_select_dp_phase_segments(cost_fn, M, N, segments):
-    """Equation (20): the mixed-meter joint DP, phase carried as augmented state."""
-    if M == 0:
-        return np.empty(0, dtype=np.int64)
-    if M > N:
-        raise ValueError(
-            f"infeasible correspondence: {M} ground-truth events but only {N} candidates.")
-
-    segment_of, meter_of = np.empty(M, dtype=np.int64), np.empty(M, dtype=np.int64)
-    starts = [start for start, _ in segments]
-    for k, (start, meter) in enumerate(segments):
-        end = segments[k + 1][0] if k + 1 < len(segments) else M
-        segment_of[start:end] = k
-        meter_of[start:end] = meter
-    max_meter = int(meter_of.max())
-
-    # previous[phi, j] = D[i-1, j, phi]; phi >= L_k entries stay +inf and never win.
-    previous = np.zeros((max_meter, N + 1), dtype=np.float64)
-    choice = np.zeros((M + 1, max_meter, N + 1), dtype=np.int32)
-    back_phase = np.zeros((M + 1, max_meter, N + 1), dtype=np.int32)
-    candidate_index = np.arange(1, N + 1, dtype=np.int32)
-
-    for i0 in range(M):
-        meter = int(meter_of[i0])
-        starts_segment = i0 in starts
-        current = np.full((max_meter, N + 1), np.inf, dtype=np.float64)
-        for phi in range(meter):
-            if starts_segment:
-                # New segment: its phase origin is free, so the match branch may
-                # arrive from whatever phase the previous segment ended on.
-                source = previous[:, 0:N].min(axis=0)
-                source_phase = previous[:, 0:N].argmin(axis=0)
-            else:
-                previous_phase = (phi - 1) % meter
-                source = previous[previous_phase, 0:N]
-                source_phase = np.full(N, previous_phase, dtype=np.int64)
-            a = source + cost_fn(i0, phi)
-            accumulated = np.minimum.accumulate(a)
-            is_new_minimum = a <= accumulated
-            arg = np.maximum.accumulate(np.where(is_new_minimum, candidate_index, 0))
-            current[phi, 0] = np.inf
-            current[phi, 1:] = accumulated
-            choice[i0 + 1, phi, 1:] = arg
-            back_phase[i0 + 1, phi, 1:] = source_phase[np.maximum(arg - 1, 0)]
-        previous = current
-
-    final_meter = int(meter_of[M - 1])
-    phi = int(np.argmin(previous[:final_meter, N]))
-    if not np.isfinite(previous[phi, N]):
-        raise RuntimeError("backtracking failed; cost contains non-finite values")
-
-    sigma = np.empty(M, dtype=np.int64)
-    j = N
-    for i0 in range(M - 1, -1, -1):
-        j_star = int(choice[i0 + 1, phi, j])
-        if j_star < 1:
-            raise RuntimeError("backtracking failed; cost contains non-finite values")
-        sigma[i0] = j_star - 1
-        phi = int(back_phase[i0 + 1, phi, j])
-        j = j_star - 1
-    return sigma
-
-
 def subset_select_logsumexp(cost, lengths=None):
     """Equation (13) - the marginalised counterpart of the DP, log Z(theta, x)."""
     batched = cost.dim() == 3

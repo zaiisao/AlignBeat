@@ -142,7 +142,7 @@
             "cwd": "${workspaceFolder}",
             "env": {"PYTHONPATH": "${workspaceFolder}"},
             "args": [
-                "--checkpoints", "checkpoints/L1_base*.ckpt",
+                "--checkpoints", "checkpoints/T_aligned*epoch=079.ckpt",
                 "--songs", "100", "--gpu", "0", "--num-workers", "0"
             ],
             "console": "integratedTerminal",

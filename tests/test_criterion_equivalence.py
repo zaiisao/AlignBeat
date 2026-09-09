@@ -15,11 +15,10 @@ GOLDEN = os.path.join(os.path.dirname(__file__), '_criterion_golden.pt')
 CONFIGS = [
     ("default",        dict(gamma=0.5, omega_downbeat=2.0)),
     ("omega4",         dict(gamma=0.5, omega_downbeat=4.0)),
-    ("beat_only_em",   dict(gamma=0.5, meter_length=4, beat_only_warmup=0)),
-    ("joint_phase",    dict(gamma=0.5, meter_length=4, joint_phase=True, beat_only_warmup=0)),
-    ("latent_meter",   dict(gamma=0.5, meter_candidates=(2, 3, 4, 6), beat_only_warmup=0)),
-    ("meter_prior",    dict(gamma=0.5, meter_candidates=(2, 3, 4, 6), meter_prior="corpus",
-                            beat_only_warmup=0)),
+    ("beat_only_em",   dict(gamma=0.5, meter_candidates=(4,))),
+    ("joint_phase",    dict(gamma=0.5, meter_candidates=(4,), joint_phase=True)),
+    ("latent_meter",   dict(gamma=0.5, meter_candidates=(2, 3, 4, 6))),
+    ("meter_prior",    dict(gamma=0.5, meter_candidates=(2, 3, 4, 6), meter_prior="corpus")),
     ("no_normalize",   dict(gamma=0.5, normalize_by_events=False)),
 ]
 

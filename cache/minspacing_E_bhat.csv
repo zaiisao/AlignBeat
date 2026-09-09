@@ -1,0 +1,9 @@
+ckpt,min_gap_frac_of_ibi,n,F,CMLt,n_db,dbF,dbCMLt
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.0,571,0.885966,0.810847,469,0.882935,0.809467
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.2,571,0.889031,0.819399,469,0.886742,0.819625
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.3,571,0.890090,0.824717,469,0.888644,0.824600
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.4,571,0.891045,0.827420,469,0.890366,0.827498
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.5,571,0.891252,0.830276,469,0.890294,0.828775
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.6,571,0.891852,0.832638,469,0.890289,0.829361
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.7,571,0.891712,0.832652,469,0.889743,0.828681
+E_bhat S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.8,571,0.889301,0.828002,469,0.886699,0.815986

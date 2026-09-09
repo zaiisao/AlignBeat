@@ -23,11 +23,11 @@ class SubsetSelectionHead(nn.Module):
     def __init__(self, feature_size=256, hidden_size=256,
                  window_seconds=30.0,
                  class_attention_layers=0, class_attention_heads=4,
-                 class_attention_pos="none", class_attention_final_norm=False):
+                 class_attention_pos="none", class_attention_final_norm=False,
+                 meter_candidates=(2, 3, 4, 5, 6, 8)):
         super(SubsetSelectionHead, self).__init__()
 
         self.window_seconds = float(window_seconds)
-
         self.input_norm = nn.LayerNorm(feature_size)
 
         # JA: Trunk is from the tree metaphor: one shared trunk, then branches. Here
@@ -72,6 +72,24 @@ class SubsetSelectionHead(nn.Module):
         self.regression_head = nn.Linear(hidden_size, 1)
         self.precision_head = nn.Linear(hidden_size, 1)
 
+        # Remark 3's global head, which section 8.7 defers for want of an architecture
+        # that provides one: "a learned meter prior q_hat(L | x; theta), of the kind a
+        # dedicated meter-classification head could supply ... we do not introduce such
+        # a head here, since nothing in Section 3's architecture currently provides one".
+        # This is that head. L is a supervised output rather than the latent 8.7
+        # marginalises: it is observed on every downbeat-annotated corpus, and section
+        # 8's own scoping -- L is unobserved "whenever it is not reliably annotated" --
+        # is what leaves the annotated case open.
+        self.meter_candidates = tuple(meter_candidates)
+        self.meter_head = nn.Linear(hidden_size, len(self.meter_candidates))
+        # Remark 3's use of it: "use (L_hat, phi_hat) to bias the per-candidate downbeat
+        # logits directly rather than only regularizing predicted spacing after the
+        # fact." Only L_hat here; a global phi_hat is ill-posed under an arbitrary
+        # window crop, which is why section 8 marginalises phi_0 everywhere rather than
+        # predicting it. So this biases how SPARSE downbeats should be, not which
+        # candidates they are.
+        self.meter_bias = nn.Linear(len(self.meter_candidates), 3, bias=False)
+
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -97,6 +115,9 @@ class SubsetSelectionHead(nn.Module):
         nn.init.zeros_(self.regression_head.bias)
         nn.init.zeros_(self.class_head.weight)
         nn.init.zeros_(self.precision_head.weight)
+        # Zero-init: at step 0 the class logits are bit-identical to a head without the
+        # meter branch, so any measured difference is the head's and not a reinit's.
+        nn.init.zeros_(self.meter_bias.weight)
 
         # t_hat and the targets live on (0, 1] over the window, so the tolerance has to
         # cross into that unit before it can be a scale: 0.07 s of a 30 s window is
@@ -133,7 +154,12 @@ class SubsetSelectionHead(nn.Module):
 
             z_class = self.candidate_attention(z_class)
 
-        class_logits = self.class_head(z_class)         # (B, N, 3)
+        # Pooled before the bias is applied, so the head never reads its own output.
+        meter_logits = self.meter_head(z_class.mean(dim=1))              # (B, |M|)
+        # The soft posterior, not the argmax: differentiable, and no hard commitment to
+        # one meter. Section 8.7 writes q_hat(L | x; theta) as a distribution likewise.
+        class_logits = (self.class_head(z_class)
+                        + self.meter_bias(meter_logits.softmax(dim=-1)).unsqueeze(1))
 
         # b_j reads the trunk but never trains it: the precision term has no path into
         # the features the class and regression heads share (section 4.1.2's concern).
@@ -141,7 +167,7 @@ class SubsetSelectionHead(nn.Module):
         b_hat = nn.functional.softplus(b_hat_logit)
 
         # Raw output u_j; the criterion applies b_j = b_min + softplus(u_j).
-        return class_logits, t_hat, b_hat
+        return class_logits, t_hat, b_hat, meter_logits
 
 
 def sinusoidal(position, dim):

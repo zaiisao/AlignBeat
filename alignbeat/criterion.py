@@ -9,8 +9,7 @@ import torch.nn.functional as F
 
 from alignbeat.classes import (BACKGROUND, BEAT, CLASS_UNKNOWN, DOWNBEAT,
                                F_MEASURE_TOLERANCE, METER_PRIOR)
-from alignbeat.dp import (event_is_downbeat_under, phase_class_nll, phase_star,
-                          subset_select_dp, subset_select_dp_joint_phase,
+from alignbeat.dp import (event_is_downbeat_under, subset_select_dp,
                           subset_select_dp_meter)
 
 
@@ -24,8 +23,6 @@ FRAGMENT_SECONDS = 30.0       # 1500 frames at 50 fps; diagnostic display only.
 B_MIN = 1e-4
 NORMALIZE_BY_EVENTS = True
 DIAGNOSTIC_EVERY = 200
-BEAT_ONLY_WARMUP = 2000
-BEAT_ONLY_CONFIDENCE = 0.7
 # The tolerance in the units t_hat lives in: a fraction of the window.
 EPS = F_MEASURE_TOLERANCE / FRAGMENT_SECONDS
 
@@ -50,9 +47,12 @@ PRECISION_PRIOR_BETA = None
 
 class Match(NamedTuple):
     """What the E-step decided for one fragment."""
-    sigma: object          # (M,) numpy int array, the chosen candidates
-    phi: object            # phase of the first matched event, or None
-    meter: int             # L in force for this fragment, 0 if none
+    sigma: object                   # (M,) numpy int array, the chosen candidates
+    phi: object                     # phase of the first matched event, or None
+    meter: object                   # L in force for this fragment, 0 if none
+    r: object = None                # beat-only: P(event i is a downbeat), eq. (34)
+    meter_posterior: object = None  # beat-only: P(L | x) as a dict keyed by L, eq. (33)
+    prior_term: float = 0.0         # beat-only: -sum_h pi_h (log pi_M + log pi_psi)
 
 
 class SubsetCriterion(nn.Module):
@@ -65,11 +65,11 @@ class SubsetCriterion(nn.Module):
                  b_min=B_MIN, residual_ema_decay=0.99,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
-                 meter_length=0, meter_candidates=(), meter_prior=None,
+                 meter_candidates=(),
                  joint_phase=False, mu_meter=0.0,
-                 beat_only_warmup=BEAT_ONLY_WARMUP,
-                 beat_only_confidence=BEAT_ONLY_CONFIDENCE):
+                 lambda_meter_head=0.0):
         super(SubsetCriterion, self).__init__()
+
         self.omega_downbeat = omega_downbeat
         self.gamma = gamma
         self.normalize_by_events = normalize_by_events
@@ -84,32 +84,38 @@ class SubsetCriterion(nn.Module):
         self.precision_prior_alpha = precision_prior_alpha
         self.precision_prior_beta = precision_prior_beta
 
-        self.meter_length = meter_length
         self.meter_candidates = tuple(meter_candidates)
         # log P(L, phi_0) = log P(L) - log L: the hypotheses are (L, phi_0) pairs and
         # phase is uniform within a meter, so without the -log L a meter of L gets L
         # times its share and the posterior drifts toward large meters.
-        self.meter_prior = None
-        if meter_prior is not None:
-            table = METER_PRIOR if meter_prior == "corpus" else dict(meter_prior)
-            keys = tuple(meter_candidates) or tuple(table)
-            total = sum(table.get(L, 0.0) for L in keys)
-            if total <= 0.0:
-                raise ValueError(f"meter_prior has no mass on candidates {keys}")
-            self.meter_prior = {int(L): math.log(table.get(L, 0.0) / total) - math.log(L)
-                                for L in keys if table.get(L, 0.0) > 0.0}
+
+        meter_prior_sum = sum(METER_PRIOR.get(L, 0.0) for L in tuple(meter_candidates))
+        self.meter_prior = {int(L): math.log(METER_PRIOR.get(L, 0.0) / meter_prior_sum) - math.log(L)
+                            for L in tuple(meter_candidates) if METER_PRIOR.get(L, 0.0) > 0.0}
+
+        # pi_C(c) over {DB, B}: the base rate of downbeats among matched beats. No
+        # background entry -- matching already established the event is a beat, so
+        # "no beat" is not a live hypothesis for it. It is never configured, because
+        # the meter prior already fixes it: exp(meter_prior[L]) is P(L)/L, so summing
+        # over L is E[1/L], the chance an event drawn under that prior is a downbeat.
+        # Deriving it keeps the two priors consistent whatever meter_candidates is.
+        downbeat_share = sum(math.exp(v) for v in self.meter_prior.values())
+        if not 0.0 < downbeat_share < 1.0:
+            # No meter candidates, so no hypothesis is ever scored and pi_C is unused.
+            downbeat_share = 0.5
+        prior = torch.tensor([downbeat_share, 1.0 - downbeat_share], dtype=torch.float32)
+
         self.joint_phase = joint_phase
         self.mu_meter = mu_meter
+        self.lambda_meter_head = lambda_meter_head
 
-        self.beat_only_warmup = beat_only_warmup
-        self.beat_only_confidence = beat_only_confidence
         self._call_count = 0
 
+        self.register_buffer("log_class_prior", torch.log(prior / prior.sum()), persistent=False)
+
         print(f"[subset-criterion] omega_db={self.omega_downbeat} gamma={self.gamma} "
-              f"meter_L={self.meter_length} "
               f"meter_candidates={self.meter_candidates or 'off'} "
               f"joint_phase={self.joint_phase} mu_meter={self.mu_meter} "
-              f"beat_only_warmup={self.beat_only_warmup} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -117,7 +123,7 @@ class SubsetCriterion(nn.Module):
         """Eq. (3)'s time channel: plain L1 over the fixed E-step scale."""
         return (t_hat - t_target).abs() / self.estep_b
 
-    def build_cost(self, log_probabilities, t_hat, event_classes, event_times):
+    def build_cost(self, log_probabilities, t_hat, gt_class, gt_time):
         """Per-pair cost (3) plus the section 8.4 background correction.
 
         Both class terms are clamped at CLASS_COST_CAP: inside the cap the cost is the
@@ -125,42 +131,22 @@ class SubsetCriterion(nn.Module):
         confidence is not credited, since under hard EM it was trained on this cost's
         own earlier assignments.
         """
-        class_cost = self.class_nll(log_probabilities, event_classes).clamp(max=CLASS_COST_CAP)
-        time_cost = self.l1(t_hat[None, :], event_times[:, None])
+        class_cost = self.class_nll(log_probabilities, gt_class) #.clamp(max=CLASS_COST_CAP)
+        time_cost = self.l1(t_hat[None, :], gt_time[:, None])
 
-        background_nll = (-log_probabilities[:, BACKGROUND]).clamp(max=CLASS_COST_CAP)   # (N,)
+        background_nll = (-log_probabilities[:, BACKGROUND]) #.clamp(max=CLASS_COST_CAP)   # (N,)
 
         l_match = class_cost + time_cost                                        # eq. (3)
         return l_match - self.gamma * background_nll[None, :]                   # section 8.4
 
-    def build_phase_cost(self, log_probabilities, t_hat, event_classes,
-                         event_times, meter, p):
-        """Equation (18), and its section 8.5 background-corrected form L'^p_match."""
-        M = event_times.shape[0]
-        phase_cost = phase_class_nll(log_probabilities, M, meter, p)          # (M, N)
-        observed_cost = self.class_nll(log_probabilities, event_classes)      # (M, N)
-        empty = (event_classes == CLASS_UNKNOWN)[:, None]
-        class_cost = torch.where(empty, phase_cost, observed_cost).clamp(max=CLASS_COST_CAP)
-
-        # Same time channel as build_cost, so the phase hypotheses are ranked on the
-        # same quantity the phase-blind path uses.
-        time_cost = self.l1(t_hat[None, :], event_times[:, None])
-        background_nll = (-log_probabilities[:, BACKGROUND]).clamp(max=CLASS_COST_CAP)  # (N,)
-
-        l_match_p = class_cost + time_cost                                    # eq. (18)
-        return l_match_p - self.gamma * background_nll[None, :]               # section 8.5
-
-    def _fragment_meter(self, event_classes):
+    def _fragment_meter(self, gt_class):
         """The meter L in force for this fragment, or 0 if none is available."""
-        if self.meter_length > 0:
-            return int(self.meter_length)
-        positions = (event_classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
+        positions = (gt_class == DOWNBEAT).nonzero(as_tuple=False).flatten()
         if positions.numel() < 2:
             return 0
         return int(np.median(np.diff(positions.cpu().numpy())))
 
-    @staticmethod
-    def class_nll(log_probabilities, event_classes):
+    def class_nll(self, log_probabilities, gt_class):
         """-log p_j(c_i) for every (event, candidate) pair, handling unlabelled classes.
 
         A labelled event costs the NLL of its own class. An unlabelled one (beat-only
@@ -168,79 +154,78 @@ class SubsetCriterion(nn.Module):
         marginal -log(p_DB + p_B) instead, which steers the model toward neither.
         """
         # JA: CLASS_UNKNOWN is assigned to all events in the beat-only dataset
-        labelled = event_classes != CLASS_UNKNOWN
+        labelled = gt_class != CLASS_UNKNOWN
         
-        # JA: We first calculate the log-probability of the union of the downbeat and
-        # beat classes. The three classes are mutually exclusive and exhaustive, so
-        # summing two of them marginalizes out which kind of event it is and leaves
-        # log(1 - p_background): the log-probability that this candidate is an event
-        # at all.
-        cost = -torch.logsumexp(log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1,
-                                keepdim=True).repeat(1, len(event_classes))     # (N, M)
+        # JA: Algorithm 1 line 10. C_i is genuinely unknown here, so its own prior is
+        # combined in: the cost is -log sum_c pi_C(c) p_j(c), the pi_C-weighted mixture
+        # over {DB, B}. It stays phase- and meter-blind, since the DP needs Proposition
+        # 5.1's additive separability and sigma is resolved before L is ever considered.
+        mixture = torch.logsumexp(
+            log_probabilities[:, [DOWNBEAT, BEAT]] + self.log_class_prior[None, :],
+            dim=-1, keepdim=True)
+        cost = -mixture.repeat(1, len(gt_class))                           # (N, M)
 
-        cost[:, labelled] = -log_probabilities[:, event_classes[labelled]]
+        cost[:, labelled] = -log_probabilities[:, gt_class[labelled]]
 
         return cost.transpose(0, 1)                                             # (M, N)
 
-    def _e_step(self, log_probabilities_b, t_hat_b, event_classes, event_times):
+    def _e_step(self, log_probabilities, t_hat, gt_class, gt_time):
         """Algorithm 3 lines 1-9: the MAP estimate of sigma under the current theta."""
         with torch.no_grad():
-            corrected = self.build_cost(log_probabilities_b, t_hat_b,
-                                        event_classes, event_times)
-            fragment_meter = self._fragment_meter(event_classes)
+            corrected = self.build_cost(log_probabilities, t_hat, gt_class, gt_time)
+
+            fragment_meter = 0
+            if (gt_class != CLASS_UNKNOWN).all():
+                # JA: Calculate the meter from the downbeat annotation
+                fragment_meter = self._fragment_meter(gt_class)
 
             if not bool(torch.isfinite(corrected).all()):
                 # log p is floored at LOG_PROB_FLOOR and the time term is bounded, so a
                 # non-finite cost means the model emitted NaN/Inf. Raise rather than
                 # skip: a surviving batch would mask its own cause.
                 raise FloatingPointError(
-                    f"non-finite matching cost, M={event_classes.numel()}: the model "
+                    f"non-finite matching cost, M={gt_class.numel()}: the model "
                     f"produced NaN/Inf class logits or t_hat")
 
-            if self.joint_phase and fragment_meter > 1:
-                # JA: Section 8.3 eq. (19): rerun the DP once per phase hypothesis, keep the
-                # cheapest, so sigma is chosen WITH phase evidence rather than before it.
-                phase_costs = torch.stack([
-                    self.build_phase_cost(log_probabilities_b, t_hat_b,
-                                          event_classes, event_times, fragment_meter, p)
-                    for p in range(fragment_meter)])
+            # JA: Determine the value of latent variable sigma
+            sigma_np = subset_select_dp(corrected.cpu().numpy())
+            sigma = torch.from_numpy(sigma_np).to(log_probabilities.device)
 
-                sigma_np, phi_hat = subset_select_dp_joint_phase(phase_costs.cpu().numpy())
+            if bool((gt_class == CLASS_UNKNOWN).all()):
+                match_likelihood = log_probabilities[sigma] # JA: This is pi_p_i
 
-                return Match(sigma_np, phi_hat, fragment_meter)
-
-            cost_np = corrected.cpu().numpy()
-            if self.mu_meter > 0.0 and float(fragment_meter) >= 1.0:
-                downbeats = (event_classes == DOWNBEAT).nonzero(
-                    as_tuple=False).flatten().cpu().numpy()
-
-                sigma_np = subset_select_dp_meter(
-                    cost_np, downbeats, t_hat_b.cpu().numpy(), float(fragment_meter),
-                    self.mu_meter)
-            else:
-                sigma_np = subset_select_dp(cost_np)
+                # JA: Determine the value of latent variable L
+                posterior = self._compute_latent_posterior(match_likelihood)
+                if posterior is not None:
+                    r, meter_posterior, prior_term = posterior
+                    return Match(sigma_np, None, fragment_meter, r, meter_posterior,
+                                 prior_term)
 
             return Match(sigma_np, None, fragment_meter)
 
-    def _class_term(self, matched_log, event_classes, target, match):
-        """Loss (8)'s first bracket: -log p_sigma(i)(c_i), or section 8's marginal for B*."""
-        unknown = event_classes == CLASS_UNKNOWN
 
-        # JA: safe is event_classes with every CLASS_UNKNOWN (-1) replaced by 0, purely
-        # so gather gets a legal index.
-        safe = torch.where(unknown, torch.zeros_like(event_classes), event_classes)
+    def _class_term(self, matched_class_probs, gt_class, target, match):
+        """Algorithm 1 line 41's cls(theta; ind), branched on the supervision indicator.
 
-        # JA: Here 'event' in `event_classes` means beat events. `per_event_nll` is the
-        # class negative log-likelihood for each ground-truth event, shape (M,)
-        per_event_nll = -matched_log.gather(1, safe[:, None]).squeeze(1)
+        ind=0 (line 43) is an ordinary cross-entropy against the raw class head: the
+        label is observed, so pi_C has no uncertainty left to resolve. ind=1 (line 45)
+        is the EM surrogate under the frozen pi_{psi,L}.
+        """
 
-        if bool(unknown.any()):
-            # JA: This _beat_only_term function corresponds to Algorithm 5 (hard case)
-            beat_only, _ = self._beat_only_term(
-                matched_log, target.get('segments'), phi_hat=match.phi, meter=match.meter)
-            return torch.where(unknown, beat_only, per_event_nll), int(unknown.sum())
+        beat_only = bool((gt_class == CLASS_UNKNOWN).all())
+        num_unlabeled = 0
+        meter_posterior = None
+
+        if beat_only:
+            meter_posterior = match.meter_posterior
+            nll = self._beat_only_term(matched_class_probs, match.r)
+            num_unlabeled = len(gt_class)
         else:
-            return per_event_nll, 0
+            # JA: The input music has both downbeat and beat labels
+            event_indices = torch.arange(len(gt_class), device=gt_class.device)
+            nll = -matched_class_probs[event_indices, gt_class]
+
+        return nll, num_unlabeled, meter_posterior
 
     def _time_term(self, residual, laplace_scale, sigma, denominator):
         """Loss (8)'s second bracket, with section 4.1.2's per-candidate b_j if enabled.
@@ -260,7 +245,7 @@ class SubsetCriterion(nn.Module):
         """Algorithm 3 lines 10-15: sigma held fixed, loss (8) built from p and t.
         
         Both the sequential and joint E-steps use the same M-step."""
-        event_classes, event_times = target['classes'], target['times']
+        gt_class, gt_time = target['classes'], target['times']
 
         device = log_probabilities.device
         num_candidates = log_probabilities.shape[0]
@@ -268,23 +253,23 @@ class SubsetCriterion(nn.Module):
 
         sigma = torch.from_numpy(match.sigma).to(device)
 
-        M = int(event_classes.numel())
+        M = int(gt_class.numel())
         denominator = float(M) if self.normalize_by_events else 1.0
 
         omega = torch.where(
-            event_classes == DOWNBEAT,
-            torch.full_like(event_times, self.omega_downbeat),
-            torch.full_like(event_times, OMEGA_BEAT))
+            gt_class == DOWNBEAT,
+            torch.full_like(gt_time, self.omega_downbeat),
+            torch.full_like(gt_time, OMEGA_BEAT))
 
         # line 13, first bracket
-        per_event, unlabelled = self._class_term(
-            log_probabilities[sigma], event_classes, target, match)
+        per_event, unlabelled, meter_posterior = self._class_term(
+            log_probabilities[sigma], gt_class, target, match)
 
         # line 13, second bracket. The loss sees the true error: a pointed Laplace, no
         # flat core, so t_hat is pulled onto the onset rather than merely inside the
         # tolerance. (Under the flat core the clock stopped at the window edge: slope
         # 0.63 of the needed shift, 24 ms mean error, b_hat parked at its 73 ms init.)
-        matched_residual = (event_times - t_hat[sigma]).abs()            # (M,), raw
+        matched_residual = (gt_time - t_hat[sigma]).abs()            # (M,), raw
         residual = matched_residual
         time_term, precision_term = self._time_term(
             residual, laplace_scale, sigma, denominator)
@@ -302,16 +287,23 @@ class SubsetCriterion(nn.Module):
         if self.background_by_unmatched and self.normalize_by_events:
             background_denominator = float(max(num_candidates - M, 1))
 
+        # Line 45's bracket also carries log pi_M + log pi_psi. Those are constant in
+        # theta, so they change no gradient, but they belong to the reported cls(theta;
+        # 1) and are outside omega, which eq. (8) closes around the class term alone.
+        class_term = (omega * per_event).sum() + match.prior_term
+
         return {
-            'class': (omega * per_event).sum() / denominator,
+            'class': class_term / denominator,
             'time': time_term,
             'background': background_nll[unmatched].sum() / background_denominator,
             'precision': precision_term,
             'residual': matched_residual.detach(),
             'unlabelled': unlabelled,
+            'meter_posterior': meter_posterior,
         }
 
-    def forward(self, class_logits, t_hat, b_hat, targets, train_precision=True):
+    def forward(self, class_logits, t_hat, b_hat, targets, train_precision=True,
+                meter_logits=None):
         """One EM step per fragment; returns (losses, stats)."""
         batch_size, num_candidates, _ = class_logits.shape
 
@@ -321,18 +313,19 @@ class SubsetCriterion(nn.Module):
         # JA: b_hat is the output of the precision head which is learnable
         laplace_scale = self.b_min + b_hat # y = b
         precision_terms = []
+        meter_terms = []
 
         class_terms, time_terms, background_terms = [], [], []
         matched_residuals = []
 
         num_events, num_contributing, num_infeasible, num_unlabelled = 0, 0, 0, 0
 
-        for i in range(batch_size):
-            event_classes = targets[i]['classes']
-            event_times = targets[i]['times']
-            M = int(event_classes.numel())
+        for b in range(batch_size):
+            gt_class = targets[b]['classes']
+            gt_time = targets[b]['times']
+            M = int(gt_class.numel())
 
-            background_nll = -log_probabilities[i, :, BACKGROUND]
+            background_nll = -log_probabilities[b, :, BACKGROUND]
 
             if M == 0:
                 denominator = float(num_candidates) if self.normalize_by_events else 1.0
@@ -348,17 +341,32 @@ class SubsetCriterion(nn.Module):
                 continue
 
             # E-step: MAP estimate of sigma under the current theta (Alg. 3, 1-9)
-            match = self._e_step(log_probabilities[i], t_hat[i],
-                                 event_classes, event_times)
+            match = self._e_step(log_probabilities[b], t_hat[b],
+                                 gt_class, gt_time)
 
             # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15).
-            terms = self._m_step(match, log_probabilities[i], t_hat[i], targets[i], laplace_scale[i])
+            terms = self._m_step(match, log_probabilities[b], t_hat[b], targets[b], laplace_scale[b])
 
             for key, bucket in (('class', class_terms), ('time', time_terms),
                                 ('background', background_terms),
                                 ('precision', precision_terms)):
                 if terms[key] is not None:
                     bucket.append(terms[key])
+            # Remark 3's head, supervised. L is read off the annotation (the modal gap
+            # between annotated downbeats), so this is an ordinary classification target
+            # -- not section 8.7's marginal, whose target is a softmax over hypothesis
+            # scores that are themselves sums of M log-probabilities: those are tens of
+            # nats apart and saturated, so the cheapest way to raise the target's share
+            # is to shrink every p_hat at once, a degree of freedom shared with the class
+            # term. Measured, that is what it did (0.923 -> 0.896 on true downbeats,
+            # 0.041 -> 0.059 on true beats). |M| free logits have no such shortcut.
+            if meter_logits is not None and terms['unlabelled'] == 0:
+                fragment_meter = self._fragment_meter(gt_class)
+                if fragment_meter in self.meter_candidates:
+                    meter_terms.append(F.cross_entropy(
+                        meter_logits[b],
+                        torch.tensor(self.meter_candidates.index(fragment_meter),
+                                     device=class_logits.device)))
 
             if terms['residual'] is not None:
                 matched_residuals.append(terms['residual'])
@@ -369,7 +377,7 @@ class SubsetCriterion(nn.Module):
 
         losses = self._aggregate(
             class_logits, class_terms, time_terms, background_terms,
-            precision_terms, num_contributing)
+            precision_terms, meter_terms, num_contributing)
 
         if self.training and matched_residuals:
             # Eq. (5) between steps, for the prior only.
@@ -394,7 +402,7 @@ class SubsetCriterion(nn.Module):
         return losses, stats
 
     def _aggregate(self, class_logits, class_terms, time_terms, background_terms,
-                   precision_terms, num_contributing):
+                   precision_terms, meter_terms, num_contributing):
         """Per-fragment terms -> the loss dict train.py unpacks."""
         zero = torch.nan_to_num(class_logits).sum() * 0.0
         total = lambda terms: torch.stack(terms).sum() if terms else zero
@@ -405,10 +413,15 @@ class SubsetCriterion(nn.Module):
             'time': total(time_terms) / n,
             'background': self.gamma * total(background_terms) / n,
         }
+        if self.lambda_meter_head > 0.0 and meter_terms:
+            # Cross-entropy of Remark 3's meter head against the annotated L, meaned
+            # over the labelled fragments that carry one. Absent, not zero, when
+            # disabled: the shipped loss is the three terms above.
+            losses['meter'] = self.lambda_meter_head * torch.stack(meter_terms).mean()
 
         losses['time'] = losses['time'] + total(precision_terms) / n
         losses['total'] = sum(losses[k] for k in
-                              ('class', 'time', 'background'))
+                              ('class', 'time', 'background', 'meter') if k in losses)
         return losses
 
     def _make_stats(self, losses, t_hat, num_candidates, matched_residuals, counts,
@@ -439,103 +452,135 @@ class SubsetCriterion(nn.Module):
               f"min_gap={stats['min_gap']:.2e} events={stats['num_events']} "
               f"infeasible={stats['infeasible']}", flush=True)
 
-    def _beat_only_term(self, matched_log, segments=None, phi_hat=None, meter=0):
-        """Section 8 class term for events whose B/DB label was never observed."""
-        active = torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)     # log(1-p(empty))
-        marginal = -active
-        if self._call_count < self.beat_only_warmup:
-            return marginal, None
+    def _beat_only_term(self, matched_log, r):
+        """Algorithm 1 line 45's cls(theta; 1), per event, before the outer sum.
 
-        if phi_hat is not None and meter > 1:
-            with torch.no_grad():
-                r = event_is_downbeat_under(
-                    matched_log.shape[0], int(meter), int(phi_hat), matched_log.device
-                ).to(matched_log.dtype)
-            weighted = -(r * matched_log[:, DOWNBEAT] + (1.0 - r) * matched_log[:, BEAT])
-            return weighted, r
+        The EM surrogate, not the direct marginal: pi_{psi,L} is frozen at theta_old
+        and line 45 takes its expectation of the complete-data log-likelihood. That
+        expectation factorises per event -- for each i the hypotheses split into those
+        claiming DB and those claiming B, and pi summed over the first group is exactly
+        r_i -- so the two-term form below is the surrogate itself, not an approximation.
 
-        posterior = self._phase_posterior_marginal(matched_log, segments)
-        if posterior is None:
-            return marginal, None
-        r, valid = posterior
-
-        with torch.no_grad():
-            confident = valid & (torch.maximum(r, 1.0 - r) >= self.beat_only_confidence)
-        weighted = -(r * matched_log[:, DOWNBEAT] + (1.0 - r) * matched_log[:, BEAT])
-        return torch.where(confident, weighted, marginal), torch.where(
-            confident, r, torch.zeros_like(r))
-
-    def _span_phase_posterior(self, span, candidates, phases=None):
-        """Eqs. (12)/(14), generalised to eqs. (32)/(34) when several meters are given.
-
-        r_i = sum over hypotheses (L, p) of P(L, phi_0 = p | y, x; theta) for those under
-        which event i is a downbeat. With a single candidate exactly one p qualifies per
-        event, so this collapses to eq. (14)'s pi[p*_i] lookup.
-
-        phases restricts which phi_0 are considered. The window crop is arbitrary, so the
-        first span may begin anywhere in the bar and every p is open; a later span begins
-        where a time signature changes, which is a bar line, so phases=(0,) there.
+        The factors are P_hat(C_i = c | x; theta), prior-combined with pi_C and
+        normalised over {DB, B}, which is the quantity line 45 names. The raw head
+        appears only in the ind=0 branch, line 43.
         """
-        M = span.shape[0]
-        device = span.device
-        hypotheses, log_pi = [], []
-        for meter in candidates:
+        if r is None:
+            # No viable meter hypothesis, so there is no pi_{psi,L} to take an
+            # expectation under. Fall back to what the label alone asserts: the event
+            # is a beat of some kind.
+            return -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)
+
+        log_db = matched_log[:, DOWNBEAT] + self.log_class_prior[DOWNBEAT]
+        log_b = matched_log[:, BEAT] + self.log_class_prior[BEAT]
+        log_norm = torch.logaddexp(log_db, log_b)
+        return -(r * (log_db - log_norm) + (1.0 - r) * (log_b - log_norm))
+
+    def _log_hypothesis_prior(self, meter):
+        """log pi_M(L) + log pi_psi(psi), Algorithm 1 line 45's first two bracket terms.
+
+        pi_psi is uniform over the L phases, so log pi_psi = -log L and the pair is the
+        same under every psi of a given meter. meter_prior stores the two combined.
+        """
+        if self.meter_prior is None:
+            return -math.log(meter)
+        return self.meter_prior.get(meter, -float('inf'))
+
+    def _hypothesis_log_scores(self, match_likelihood):
+        """The log score of every (L, phi_0 = p) hypothesis: eq. (12)'s numerator in log space.
+
+        The window crop is arbitrary, so the span may begin anywhere in the bar and
+        every phi_0 in range(L) is open.
+
+        Vectorised over hypotheses: one (H, M) downbeat mask and one matmul, rather than
+        a where+sum per hypothesis. With gradient on, the per-hypothesis loop launched
+        ~56 kernels per labelled fragment and cost 45 ms per batch; this costs two.
+        """
+        M = match_likelihood.shape[0]
+        device = match_likelihood.device
+
+        i0 = torch.arange(M, device=device)
+        blocks = {}
+
+        log_db = match_likelihood[:, DOWNBEAT] + self.log_class_prior[DOWNBEAT]
+        log_b = match_likelihood[:, BEAT] + self.log_class_prior[BEAT]
+        # P_hat normalises over {DB, B}: one log Z_i per event, identical under every
+        # hypothesis, so it cancels in the posterior but not in the loss's own value.
+        log_norm = torch.logaddexp(log_db, log_b).sum()
+
+        for meter in self.meter_candidates:
             meter = int(meter)
+            # A meter of 1 makes every event a downbeat, so it carries no phase to
+            # infer. Requiring M >= L is a choice about short fragments rather than a
+            # well-definedness guard: c_i(omega, L) is defined for any L, but meters
+            # larger than the event count generate indistinguishable patterns, so they
+            # would only spread the prior's mass. It fires only on degenerate crops.
             if meter <= 1 or M < meter:
                 continue
-            allowed = range(meter) if phases is None else [
-                p for p in phases if 0 <= p < meter]
-            # Uniform over (L, phi_0) when no prior is given: -log L, not 0.
-            log_prior = (-math.log(meter) if self.meter_prior is None
-                         else self.meter_prior.get(meter, -float('inf')))
-            for p in allowed:
-                score = torch.where(event_is_downbeat_under(M, meter, p, device),
-                                    span[:, DOWNBEAT], span[:, BEAT]).sum() + log_prior
-                hypotheses.append((meter, p))
-                log_pi.append(score)
 
-        if not hypotheses:
+            log_prior = self._log_hypothesis_prior(meter)
+
+            phases = torch.arange(meter, device=device)
+            # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.
+            is_db = (((phases[:, None] + i0[None, :]) % meter) == 0).to(match_likelihood.dtype)
+
+            blocks[meter] = (is_db @ log_db + (1.0 - is_db) @ log_b + log_prior - log_norm)
+
+        if not blocks:
             return None
 
-        posterior = torch.softmax(torch.stack(log_pi), dim=0)          # P(L, phi_0 | x)
-        r = torch.zeros(M, device=device, dtype=span.dtype)
-        for (meter, p), weight in zip(hypotheses, posterior):
-            r += weight * event_is_downbeat_under(M, meter, p, device).to(r.dtype)
-        return r
+        return blocks
 
-    def _phase_posterior_marginal(self, matched_log, segments=None):
-        """r_i = P(phi_i = 0 | y, x; theta): one meter over the window, or eq. (17) per segment."""
-        M = matched_log.shape[0]
 
-        with torch.no_grad():
-            # JA: No meter change for this fragment; treat the whole window as one meter.
-            # It is not an assertion that the music has constant meter; it's the absence of
-            # any claim about meter changes. The code then does the only reasonable thing:
-            # one span covering all M events, one φ₀, with the meter taken from
-            # meter_candidates (latent) or meter_length (fixed).
-            if segments is None:
-                # A fixed meter_length is just a one-element candidate set; the meter is
-                # latent when several candidates are offered.
-                candidates = self.meter_candidates or (int(self.meter_length),)
-                r = self._span_phase_posterior(matched_log, candidates)
-                if r is None:
-                    return None
-                return r, torch.ones(M, dtype=torch.bool, device=matched_log.device)
+    def _meter_log_posterior(self, match_likelihood):
+        """Eq. (33), log P(L | x), for every viable L, differentiable in span."""
+        blocks = self._hypothesis_log_scores(match_likelihood)
+        if blocks is None:
+            return None
+        meters = list(blocks)
+        log_joint = torch.log_softmax(torch.cat([blocks[L] for L in meters]), dim=0)
+        out, start = {}, 0
+        for meter in meters:
+            out[meter] = log_joint[start:start + meter].logsumexp(dim=0)
+            start += meter
+        return out
 
-            r = torch.zeros(M, device=matched_log.device, dtype=matched_log.dtype)
-            valid = torch.zeros(M, device=matched_log.device, dtype=torch.bool)
-            for k, (start, meter) in enumerate(segments):
-                end = segments[k + 1][0] if k + 1 < len(segments) else M
-                # Each segment declares its own meter, so no marginalisation there. Only
-                # the first span's phase is free: the window crop lands anywhere in a bar,
-                # whereas a later span starts where the meter changes, i.e. on a bar line.
-                span_r = self._span_phase_posterior(matched_log[start:end], (meter,),
-                                                    phases=None if k == 0 else (0,))
-                if span_r is None:
-                    continue
-                r[start:end] = span_r
-                valid[start:end] = True
-        return r, valid
+
+    def _compute_latent_posterior(self, match_likelihood):
+        """Algorithm 1 lines 22-31: pi_{psi,L}, the E-step's joint responsibility.
+
+        Returns (r, meter_posterior, prior_term). r_i is pi_{psi,L} summed over the
+        hypotheses that call event i a downbeat, which is all the M-step needs: line
+        45's expectation factorises per event, since for each i the hypotheses split
+        into those claiming DB and those claiming B. prior_term is the bracket's own
+        first two terms, -sum_h pi_h (log pi_M + log pi_psi), constant in theta but
+        part of the reported loss.
+        """
+        blocks = self._hypothesis_log_scores(match_likelihood)
+        if blocks is None:
+            return None
+        M = match_likelihood.shape[0]
+        device = match_likelihood.device
+
+        meters = list(blocks)
+
+        # JA: This is pi_{psi,L} in log space
+        log_joint = torch.log_softmax(torch.cat([blocks[L] for L in meters]), dim=0)
+
+        i0 = torch.arange(M, device=device)
+        r = torch.zeros(M, device=device, dtype=match_likelihood.dtype)
+        meter_posterior, prior_term, start = {}, 0.0, 0
+        for meter in meters:
+            block = log_joint[start:start + meter]
+            start += meter
+            # Line 45's own singleton: within a meter exactly one psi calls event i a
+            # downbeat, namely psi = (-i) mod L, so no sum over psi is needed here.
+            r = r + block[(-i0) % meter].exp()
+            mass = float(block.logsumexp(dim=0).exp())
+            meter_posterior[meter] = mass
+            prior_term -= mass * self._log_hypothesis_prior(meter)
+
+        return r, meter_posterior, prior_term
 
     def _per_candidate_time_term(self, residual, b_j):
         """-log p(r | b_j) for the Laplace density exp(-r/b)/(2b), split per 4.1.3.

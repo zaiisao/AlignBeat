@@ -112,6 +112,8 @@ def main(args):
           f"{args.train_length} (tempo floor at {args.bpm_max} bpm: {tempo_floor})",
           flush=True)
 
+    meter_candidates = tuple(int(v) for v in args.meter_candidates.split(","))
+
     pl_model = PLBeatThis(
         spect_dim=128,
         fps=50,
@@ -143,6 +145,7 @@ def main(args):
         class_attention_heads=args.class_attention_heads,
         class_attention_pos=args.class_attention_pos,
         class_attention_final_norm=args.class_attention_final_norm,
+        meter_candidates=meter_candidates,
         tau_beat=args.tau_beat,
         tau_downbeat=args.tau_downbeat,
         db_margin=args.db_margin,
@@ -154,11 +157,10 @@ def main(args):
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
             "joint_phase": args.joint_phase,
-            "meter_length": args.meter_L,
-            "meter_candidates": (tuple(int(v) for v in args.meter_candidates.split(","))
-                                 if args.meter_candidates else ()),
+            "meter_candidates": meter_candidates,
             "meter_prior": args.meter_prior or None,
             "mu_meter": args.mu_meter,
+            "lambda_meter_head": args.lambda_meter_head,
             "normalize_by_events": args.normalize_by_events,
             "background_by_unmatched": args.background_by_unmatched,
         },
@@ -348,8 +350,8 @@ if __name__ == "__main__":
                         help="frames discarded either side of a chunk seam at whole-piece "
                              "inference; defaults to the dense arm's 2*tolerance so both "
                              "A/B arms decode under the same edge convention")
-    parser.add_argument("--meter_candidates", type=str, default="",
-                        help="latent meter: e.g. 2,3,4,6. Empty keeps L fixed at --meter_L")
+    parser.add_argument("--meter_candidates", type=str, default="2,3,4,5,6,8",
+                        help="meters to marginalise over, e.g. 2,3,4,6 (section 8.7)")
     parser.add_argument("--meter_prior", type=str, default="",
                         help="'corpus' uses the measured meter distribution from "
                              "docs/METER_DISTRIBUTION.md; empty is uniform over (L, phi_0)")
@@ -408,9 +410,12 @@ if __name__ == "__main__":
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
     parser.add_argument("--joint_phase", action="store_true", default=False)
-    parser.add_argument("--meter_L", type=int, default=0)
     parser.add_argument("--mu_meter", type=float, default=0.0,
                         help="Section 4.2 eq. (6): known-meter spacing inside the selection")
+    parser.add_argument("--lambda_meter_head", type=float, default=0.0,
+                        help="weight on the cross-entropy of Remark 3's meter head "
+                             "against the annotated L (the modal gap between annotated "
+                             "downbeats), on labelled fragments. 0 disables it")
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")

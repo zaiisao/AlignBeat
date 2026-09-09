@@ -470,6 +470,7 @@ class BeatDataModule(pl.LightningDataModule):
             self.predict_dataset, batch_size=1, num_workers=self.num_workers
         )
 
+
     def get_train_positive_weights(self, widen_target_mask=3):
         """
         Computes the relation of negative targets to positive targets.

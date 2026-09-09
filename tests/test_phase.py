@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alignbeat.classes import BEAT, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
-from alignbeat.dp import downbeat_marginal_from_phase_posterior, downbeat_marginal_over_meters, event_is_downbeat_under, joint_phase_log_partition, joint_phase_matching_marginals, joint_phase_posterior, meter_joint_log_partition, meter_posterior, phase_class_nll, phase_star, subset_select_dp_joint_phase, subset_select_dp_phase_segments
+from alignbeat.dp import downbeat_marginal_from_phase_posterior, downbeat_marginal_over_meters, event_is_downbeat_under, joint_phase_log_partition, joint_phase_matching_marginals, joint_phase_posterior, meter_joint_log_partition, meter_posterior, phase_class_nll, phase_star, subset_select_dp_joint_phase
 
 torch.manual_seed(0)
 
@@ -20,11 +20,11 @@ def injections(M, N):
     return list(itertools.combinations(range(N), M))
 
 
-def phase_costs(log_probabilities, event_times, t_hat, L, lambda_l1, gamma):
+def phase_costs(log_probabilities, gt_time, t_hat, L, lambda_l1, gamma):
     """L'^p_match (section 8.5): phase class term + timing - gamma * background."""
-    M = event_times.shape[0]
+    M = gt_time.shape[0]
     background = -log_probabilities[:, 2]
-    timing = lambda_l1 * (event_times[:, None] - t_hat[None, :]).abs()
+    timing = lambda_l1 * (gt_time[:, None] - t_hat[None, :]).abs()
     return torch.stack([
         phase_class_nll(log_probabilities, M, L, p) + timing - gamma * background[None, :]
         for p in range(L)
@@ -35,8 +35,8 @@ def random_case(M, N, seed):
     g = torch.Generator().manual_seed(seed)
     log_probabilities = torch.log_softmax(torch.randn(N, 3, generator=g, dtype=torch.float64), dim=-1)
     t_hat = torch.sort(torch.rand(N, generator=g, dtype=torch.float64)).values
-    event_times = torch.sort(torch.rand(M, generator=g, dtype=torch.float64)).values
-    return log_probabilities, t_hat, event_times
+    gt_time = torch.sort(torch.rand(M, generator=g, dtype=torch.float64)).values
+    return log_probabilities, t_hat, gt_time
 
 
 # --- phase bookkeeping -----------------------------------------------------
@@ -70,8 +70,8 @@ def test_joint_map_matches_brute_force():
     differed = 0
     for seed in range(40):
         M, N, L = 2, 3, 2
-        log_probabilities, t_hat, event_times = random_case(M, N, seed)
-        costs = phase_costs(log_probabilities, event_times, t_hat, L, 5.0, 0.5)
+        log_probabilities, t_hat, gt_time = random_case(M, N, seed)
+        costs = phase_costs(log_probabilities, gt_time, t_hat, L, 5.0, 0.5)
 
         best = min(
             ((p, sigma) for p in range(L) for sigma in injections(M, N)),
@@ -94,50 +94,14 @@ def test_joint_map_matches_brute_force():
           f"{differed}/40 cases")
 
 
-# --- section 8.3, equation (20), mixed meter -------------------------------
-
-def test_mixed_meter_dp_matches_brute_force():
-    """Equation (20) against enumeration over (sigma, per-segment phases)."""
-    for seed in range(20):
-        M, N = 4, 6
-        segments = [(0, 2), (2, 3)]          # events 0-1 in 2/4, events 2-3 in 3/4
-        log_probabilities, t_hat, event_times = random_case(M, N, seed)
-        lambda_l1, gamma = 4.0, 0.5
-        background = -log_probabilities[:, 2]
-
-        def cost_fn(i0, phi):
-            column = DOWNBEAT if phi == 0 else BEAT
-            klass = -log_probabilities[:, column]
-            timing = lambda_l1 * (event_times[i0] - t_hat).abs()
-            return (klass + timing - gamma * background).numpy()
-
-        got = subset_select_dp_phase_segments(cost_fn, M, N, segments)
-        got_cost = min(
-            sum(cost_fn(i0, phi_for(i0, p1, p2, segments))[got[i0]] for i0 in range(M))
-            for p1 in range(2) for p2 in range(3))
-
-        want = min(
-            (sum(cost_fn(i0, phi_for(i0, p1, p2, segments))[sigma[i0]] for i0 in range(M))
-             for sigma in injections(M, N) for p1 in range(2) for p2 in range(3)))
-        assert abs(want - got_cost) < 1e-9, (seed, want, got_cost)
-    print("ok: mixed-meter augmented DP (20) == brute force over (sigma, phases)")
-
-
-def phi_for(i0, p1, p2, segments):
-    """Phase of event i0 given each segment's own origin hypothesis."""
-    if i0 < segments[1][0]:
-        return (p1 + i0 - segments[0][0]) % segments[0][1]
-    return (p2 + i0 - segments[1][0]) % segments[1][1]
-
-
 # --- section 8.5, equations (25)-(29) --------------------------------------
 
 def test_joint_partition_matches_brute_force():
     """Equation (25) against enumeration, and eq. (26)-(27) posteriors with it."""
     for seed in range(30):
         M, N, L = 2, 3, 2
-        log_probabilities, t_hat, event_times = random_case(M, N, seed)
-        costs = phase_costs(log_probabilities, event_times, t_hat, L, 5.0, 0.5)
+        log_probabilities, t_hat, gt_time = random_case(M, N, seed)
+        costs = phase_costs(log_probabilities, gt_time, t_hat, L, 5.0, 0.5)
 
         want = torch.logsumexp(torch.stack([
             -sum(costs[p, i, sigma[i]] for i in range(M))
@@ -168,8 +132,8 @@ def test_joint_matching_marginal_matches_brute_force():
     """Equation (29) against enumeration of the full joint distribution."""
     for seed in range(20):
         M, N, L = 2, 4, 2
-        log_probabilities, t_hat, event_times = random_case(M, N, seed)
-        costs = phase_costs(log_probabilities, event_times, t_hat, L, 5.0, 0.5)
+        log_probabilities, t_hat, gt_time = random_case(M, N, seed)
+        costs = phase_costs(log_probabilities, gt_time, t_hat, L, 5.0, 0.5)
 
         weights = {}
         total = 0.0
@@ -197,10 +161,10 @@ def test_meter_marginalization_matches_brute_force():
     meters = [2, 3]
     for seed in range(30):
         M, N = 2, 3
-        log_probabilities, t_hat, event_times = random_case(M, N, seed)
+        log_probabilities, t_hat, gt_time = random_case(M, N, seed)
         lambda_l1, gamma = 5.0, 0.5
         background = -log_probabilities[:, 2]
-        timing = lambda_l1 * (event_times[:, None] - t_hat[None, :]).abs()
+        timing = lambda_l1 * (gt_time[:, None] - t_hat[None, :]).abs()
 
         def cost_builder(L, p):
             return (phase_class_nll(log_probabilities, M, L, p)
@@ -247,13 +211,19 @@ def test_em_posterior_matches_brute_force_and_couples_events():
     from alignbeat.criterion import SubsetCriterion
 
     for L, M in [(2, 6), (3, 7), (4, 9)]:
-        criterion = SubsetCriterion(meter_length=L, beat_only_warmup=0)
+        criterion = SubsetCriterion(meter_candidates=(L,))
         torch.manual_seed(L)
         matched_log = torch.log_softmax(torch.randn(M, 3, dtype=torch.float64) * 2, dim=-1)
-        got, got_valid = criterion._phase_posterior_marginal(matched_log)
-        assert bool(got_valid.all()), "a well-formed single-meter fragment must be valid everywhere"
+        got, _, _ = criterion._compute_latent_posterior(matched_log)
 
-        log_pi = [float(sum(matched_log[i0, DOWNBEAT if (p + i0) % L == 0 else BEAT]
+        # Each factor is the prior-combined P_hat(C_i = c_i(p, L)), not the raw head
+        # output: pi_C reweights hypotheses whenever they claim different numbers of
+        # downbeats, which happens for every L that does not divide M.
+        log_prior_c = criterion.log_class_prior.to(matched_log.dtype)
+        log_db = matched_log[:, DOWNBEAT] + log_prior_c[DOWNBEAT]
+        log_b = matched_log[:, BEAT] + log_prior_c[BEAT]
+        log_norm = torch.logaddexp(log_db, log_b)
+        log_pi = [float(sum((log_db[i0] if (p + i0) % L == 0 else log_b[i0]) - log_norm[i0]
                             for i0 in range(M)))
                   for p in range(L)]
         pi = np.exp(np.array(log_pi) - max(log_pi))
@@ -264,36 +234,35 @@ def test_em_posterior_matches_brute_force_and_couples_events():
         perturbed = matched_log.clone()
         perturbed[0] = torch.log_softmax(
             torch.tensor([5.0, -5.0, -5.0], dtype=torch.float64), dim=-1)
-        moved, _ = criterion._phase_posterior_marginal(perturbed)
+        moved, _, _ = criterion._compute_latent_posterior(perturbed)
         assert not np.allclose(got[1:].numpy(), moved[1:].numpy(), atol=1e-6), (
             "r_i is not coupled across events -- degenerated to the (9) failure mode")
     print("ok: EM posterior (12)/(14) == brute force, and r_i couples across events")
 
 
-def test_segment_posteriors_use_only_their_own_events():
-    """Equation (17): each segment's posterior sees its own events and nothing else, and
-    only the first segment's phase is free -- a later segment begins where the time
-    signature changes, which is a bar line, so its phi_0 is 0 by construction."""
+def test_em_surrogate_matches_the_direct_marginal_gradient():
+    """Algorithm 1 note 33's own claim: line 45's surrogate, under pi_{psi,L} frozen at
+    theta_old, has the same gradient at theta = theta_old as the direct marginal
+    log-likelihood -log sum_h exp(score_h). Fisher's identity. The two values differ --
+    the surrogate is a bound -- but only the gradient has to agree, and it does."""
     from alignbeat.criterion import SubsetCriterion
 
-    def criterion(meter):
-        return SubsetCriterion(meter_length=meter, beat_only_warmup=0)
-
+    crit = SubsetCriterion(meter_candidates=(2, 3, 4, 5, 6, 8))
     torch.manual_seed(0)
-    matched_log = torch.log_softmax(torch.randn(7, 3, dtype=torch.float64) * 2, dim=-1)
-    mixed, mixed_valid = criterion(0)._phase_posterior_marginal(matched_log, segments=[(0, 2), (3, 3)])
-    assert bool(mixed_valid.all())
-    # First segment: the window crop lands anywhere in a bar, so every phase is open and
-    # the result matches the standalone posterior over the same events.
-    assert torch.allclose(mixed[:3], criterion(2)._phase_posterior_marginal(matched_log[:3])[0])
-    # Later segment: phi_0 = 0 is the only hypothesis, so r is the deterministic pattern.
-    assert torch.allclose(mixed[3:], event_is_downbeat_under(4, 3, 0, None).to(mixed.dtype))
-    # ...and it still depends on nothing outside its own events.
-    shifted = matched_log.clone()
-    shifted[:3] = torch.log_softmax(torch.randn(3, 3, dtype=torch.float64) * 2, dim=-1)
-    again, _ = criterion(0)._phase_posterior_marginal(shifted, segments=[(0, 2), (3, 3)])
-    assert torch.allclose(again[3:], mixed[3:])
-    print("ok: mixed-meter segment posteriors (17) factor across segments, phi_0=0 after the first")
+    logits = (torch.randn(9, 3, dtype=torch.float64) * 2).requires_grad_(True)
+    matched = torch.log_softmax(logits, dim=-1)
+
+    blocks = crit._hypothesis_log_scores(matched)
+    direct = -torch.cat([blocks[L] for L in blocks]).logsumexp(dim=0)
+    g_direct, = torch.autograd.grad(direct, logits, retain_graph=True)
+
+    with torch.no_grad():
+        r, _, prior_term = crit._compute_latent_posterior(matched)
+    surrogate = crit._beat_only_term(matched, r).sum() + prior_term
+    g_surrogate, = torch.autograd.grad(surrogate, logits)
+
+    assert torch.allclose(g_direct, g_surrogate, atol=1e-12), (g_direct, g_surrogate)
+    print("ok: EM surrogate (45) and the direct marginal share a gradient (Fisher)")
 
 
 def test_joint_loss_is_differentiable():
@@ -301,9 +270,9 @@ def test_joint_loss_is_differentiable():
     M, N, L = 3, 8, 4
     logits = torch.randn(N, 3, dtype=torch.float64, requires_grad=True)
     t_hat = torch.sort(torch.rand(N, dtype=torch.float64)).values
-    event_times = torch.sort(torch.rand(M, dtype=torch.float64)).values
+    gt_time = torch.sort(torch.rand(M, dtype=torch.float64)).values
     log_probabilities = torch.log_softmax(logits, dim=-1)
-    costs = phase_costs(log_probabilities, event_times, t_hat, L, 5.0, 0.5)
+    costs = phase_costs(log_probabilities, gt_time, t_hat, L, 5.0, 0.5)
     loss = -joint_phase_log_partition(costs)[0]
     loss.backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
@@ -315,30 +284,27 @@ if __name__ == "__main__":
     test_phase_star_is_the_unique_downbeat_hypothesis()
     test_phase_class_nll_reads_the_right_class()
     test_joint_map_matches_brute_force()
-    test_mixed_meter_dp_matches_brute_force()
     test_joint_partition_matches_brute_force()
     test_joint_matching_marginal_matches_brute_force()
     test_meter_marginalization_matches_brute_force()
     test_em_posterior_matches_brute_force_and_couples_events()
-    test_segment_posteriors_use_only_their_own_events()
+    test_em_surrogate_matches_the_direct_marginal_gradient()
     test_joint_loss_is_differentiable()
     print("\nall phase tests passed")
 
 
-def test_degenerate_segment_falls_back_to_eq9_not_a_confident_beat():
-    """A segment with no usable meter must NOT be force-fitted to "beat"."""
+def test_degenerate_meter_falls_back_to_eq9_not_a_confident_beat():
+    """A fragment with no viable meter hypothesis must NOT be force-fitted to "beat"."""
     torch.manual_seed(0)
-    crit = SubsetCriterion(meter_length=4, beat_only_warmup=0, beat_only_confidence=0.7)
+    crit = SubsetCriterion(meter_candidates=(1,))
     matched_log = torch.log_softmax(torch.randn(6, 3), dim=-1)
-    # segment 0 has a degenerate meter (1), segment 1 is a normal 3
-    r, valid = crit._phase_posterior_marginal(matched_log, segments=[(0, 1), (3, 3)])
-    assert not bool(valid[:3].any()), "degenerate segment must be marked invalid"
-    assert bool(valid[3:].all()), "well-formed segment must stay valid"
+    assert crit._compute_latent_posterior(matched_log) is None, (
+        "a degenerate meter must yield no posterior")
 
-    term, _ = crit._beat_only_term(matched_log, segments=[(0, 1), (3, 3)])
+    term = crit._beat_only_term(matched_log, None)
     eq9 = -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)
-    assert torch.allclose(term[:3], eq9[:3]), "degenerate segment must use eq. (9)"
-    print("ok: degenerate segment meter falls back to eq (9), not a confident beat")
+    assert torch.allclose(term, eq9), "a fragment with no meter must use eq. (9)"
+    print("ok: degenerate meter falls back to eq (9), not a confident beat")
 
 
-test_degenerate_segment_falls_back_to_eq9_not_a_confident_beat()
+test_degenerate_meter_falls_back_to_eq9_not_a_confident_beat()

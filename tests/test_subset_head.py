@@ -276,7 +276,7 @@ def test_criterion_gradients_flow_only_where_expected():
 
 def test_head_shapes_and_monotonicity_end_to_end():
     head = SubsetSelectionHead(feature_size=32)
-    logits, t_hat, b_hat = head(torch.randn(2, 32, 160))
+    logits, t_hat, b_hat, meter_logits = head(torch.randn(2, 32, 160))
     assert logits.shape == (2, 160, 3)
     assert t_hat.shape == (2, 160)
     assert torch.all(t_hat[:, 1:] > t_hat[:, :-1])
@@ -336,22 +336,25 @@ def test_decode_no_duplicates_and_sorted():
 # --------------------------------------------------------------------------------
 
 def test_beat_only_events_use_the_marginal_not_a_fabricated_label():
-    """A CLASS_UNKNOWN event must be scored by -log(p(B)+p(DB)), never by pretending"""
+    """Line 10: a CLASS_UNKNOWN event is scored by the pi_C-weighted mixture over
+    {DB, B}, never by pretending one of the two labels was observed."""
     from alignbeat.classes import CLASS_UNKNOWN
     N = 8
     log_p = torch.log(torch.tensor([[0.25, 0.6, 0.15]]).repeat(N, 1))
     crit = SubsetCriterion()
+    pi_c = crit.log_class_prior.exp().tolist()
     unknown = crit.class_nll(log_p, torch.tensor([CLASS_UNKNOWN]))
-    expected = -np.log(0.25 + 0.6)
+    expected = -np.log(pi_c[0] * 0.25 + pi_c[1] * 0.6)
     assert np.isclose(float(unknown[0, 0]), expected, atol=1e-5), (float(unknown[0, 0]), expected)
     # and a known label still uses its own class
     known = crit.class_nll(log_p, torch.tensor([DOWNBEAT]))
     assert np.isclose(float(known[0, 0]), -np.log(0.25), atol=1e-5)
-    print("ok: beat-only events scored by the marginal (eq. 9), labelled ones unchanged")
+    print("ok: beat-only events scored by line 10's mixture, labelled ones unchanged")
 
 
 def test_marginal_is_invariant_to_b_db_split():
-    """Equation (9) depends only on p(B)+p(DB) - the paper's stated zero-gradient"""
+    """Under a uniform pi_C the mixture depends only on p(B)+p(DB): the matching cost
+    stays phase- and meter-blind, as line 14 requires."""
     from alignbeat.classes import CLASS_UNKNOWN
     crit = SubsetCriterion()
     a = torch.log(torch.tensor([[0.10, 0.75, 0.15]]))
@@ -370,7 +373,9 @@ def test_beat_only_end_to_end_trains_without_crashing():
     r = torch.randn(1, N, requires_grad=True)
     targets = [{'classes': torch.full((6,), CLASS_UNKNOWN, dtype=torch.long),
                 'times': torch.linspace(0.1, 0.9, 6)}]
-    crit = SubsetCriterion(beat_only_warmup=0)
+    # Beat-only fragments impute their class from the meter posterior (section 8.7),
+    # so the candidate set is part of the contract, as the CLI default supplies.
+    crit = SubsetCriterion(meter_candidates=(2, 3, 4, 5, 6, 8))
     t_hat_r = monotonic_times(r)
     losses, stats = crit(logits, t_hat_r, b_hat_like(t_hat_r), targets)
     losses['total'].backward()
