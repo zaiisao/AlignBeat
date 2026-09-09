@@ -155,10 +155,7 @@ def main(args):
         subset_kwargs={
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
-            "joint_phase": args.joint_phase,
             "meter_candidates": meter_candidates,
-            "meter_prior": args.meter_prior or None,
-            "mu_meter": args.mu_meter,
             "normalize_by_events": args.normalize_by_events,
             "background_by_unmatched": args.background_by_unmatched,
         },
@@ -349,10 +346,9 @@ if __name__ == "__main__":
                              "inference; defaults to the dense arm's 2*tolerance so both "
                              "A/B arms decode under the same edge convention")
     parser.add_argument("--meter_candidates", type=str, default="2,3,4,5,6,8",
-                        help="meters to marginalise over, e.g. 2,3,4,6 (section 8.7)")
-    parser.add_argument("--meter_prior", type=str, default="",
-                        help="'corpus' uses the measured meter distribution from "
-                             "docs/METER_DISTRIBUTION.md; empty is uniform over (L, phi_0)")
+                        help="candidate meters M the beat-only E-step marginalises "
+                             "over, e.g. 2,3,4,6; pi_M is the corpus table in "
+                             "docs/METER_DISTRIBUTION.md, renormalised over these")
     parser.add_argument("--downsample_mode", type=str, default="learned",
                         choices=["learned", "avg", "max"],
                         help="how T frames become N candidates: a strided conv "
@@ -407,9 +403,6 @@ if __name__ == "__main__":
     # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
-    parser.add_argument("--joint_phase", action="store_true", default=False)
-    parser.add_argument("--mu_meter", type=float, default=0.0,
-                        help="Section 4.2 eq. (6): known-meter spacing inside the selection")
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")

@@ -9,8 +9,7 @@ import torch.nn.functional as F
 
 from alignbeat.classes import (BACKGROUND, BEAT, CLASS_UNKNOWN, DOWNBEAT,
                                F_MEASURE_TOLERANCE, METER_PRIOR)
-from alignbeat.dp import (event_is_downbeat_under, subset_select_dp,
-                          subset_select_dp_meter)
+from alignbeat.dp import subset_select_dp
 
 
 # Nothing -- no CLI flag, no test -- ever sets these, so they are constants.
@@ -33,14 +32,6 @@ EPS = F_MEASURE_TOLERANCE / FRAGMENT_SECONDS
 # 73 -> 28 ms over one run and steepened the cost into a gate by itself (E_estep).
 ESTEP_B = EPS / 2.0
 
-# Cap on the class channel of the matching cost (3), stated as a DISTANCE: confidence
-# may relocate a match within the tolerance, never beyond it. In nats that is eps / b =
-# 2.0. Inside the cap the cost is the log-likelihood of observation model (2) term for
-# term; beyond it the head's -log p is not credited, since under hard EM it was trained
-# on this cost's own earlier assignments. Offline on E_bhat ep19: K=inf 4.9% off-tolerance
-# picks, K=2 3.3%, K=1.5 2.9% (E_cap), K=1 2.3% (E_detr), floor 1.7%. Loss (8) unclamped.
-CLASS_COST_CAP = EPS / ESTEP_B
-
 PRECISION_PRIOR_ALPHA = 2.0
 PRECISION_PRIOR_BETA = None
 
@@ -48,7 +39,6 @@ PRECISION_PRIOR_BETA = None
 class Match(NamedTuple):
     """What the E-step decided for one fragment."""
     sigma: object                   # (M,) numpy int array, the chosen candidates
-    phi: object                     # phase of the first matched event, or None
     meter: object                   # L in force for this fragment, 0 if none
     r: object = None                # beat-only: P(event i is a downbeat), eq. (34)
     meter_posterior: object = None  # beat-only: P(L | x) as a dict keyed by L, eq. (33)
@@ -65,8 +55,7 @@ class SubsetCriterion(nn.Module):
                  b_min=B_MIN, residual_ema_decay=0.99,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
-                 meter_candidates=(),
-                 joint_phase=False, mu_meter=0.0):
+                 meter_candidates=()):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
@@ -104,16 +93,12 @@ class SubsetCriterion(nn.Module):
             downbeat_share = 0.5
         prior = torch.tensor([downbeat_share, 1.0 - downbeat_share], dtype=torch.float32)
 
-        self.joint_phase = joint_phase
-        self.mu_meter = mu_meter
-
         self._call_count = 0
 
         self.register_buffer("log_class_prior", torch.log(prior / prior.sum()), persistent=False)
 
         print(f"[subset-criterion] omega_db={self.omega_downbeat} gamma={self.gamma} "
               f"meter_candidates={self.meter_candidates or 'off'} "
-              f"joint_phase={self.joint_phase} mu_meter={self.mu_meter} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -122,17 +107,11 @@ class SubsetCriterion(nn.Module):
         return (t_hat - t_target).abs() / self.estep_b
 
     def build_cost(self, log_probabilities, t_hat, gt_class, gt_time):
-        """Per-pair cost (3) plus the section 8.4 background correction.
-
-        Both class terms are clamped at CLASS_COST_CAP: inside the cap the cost is the
-        log-likelihood of observation model (2) term for term; beyond it the head's
-        confidence is not credited, since under hard EM it was trained on this cost's
-        own earlier assignments.
-        """
-        class_cost = self.class_nll(log_probabilities, gt_class) #.clamp(max=CLASS_COST_CAP)
+        """Per-pair cost (3) plus the section 8.4 background correction."""
+        class_cost = self.class_nll(log_probabilities, gt_class)
         time_cost = self.l1(t_hat[None, :], gt_time[:, None])
 
-        background_nll = (-log_probabilities[:, BACKGROUND]) #.clamp(max=CLASS_COST_CAP)   # (N,)
+        background_nll = -log_probabilities[:, BACKGROUND]                      # (N,)
 
         l_match = class_cost + time_cost                                        # eq. (3)
         return l_match - self.gamma * background_nll[None, :]                   # section 8.4
@@ -196,10 +175,10 @@ class SubsetCriterion(nn.Module):
                 posterior = self._compute_latent_posterior(match_likelihood)
                 if posterior is not None:
                     r, meter_posterior, prior_term = posterior
-                    return Match(sigma_np, None, fragment_meter, r, meter_posterior,
+                    return Match(sigma_np, fragment_meter, r, meter_posterior,
                                  prior_term)
 
-            return Match(sigma_np, None, fragment_meter)
+            return Match(sigma_np, fragment_meter)
 
 
     def _class_term(self, matched_class_probs, gt_class, target, match):
@@ -240,9 +219,7 @@ class SubsetCriterion(nn.Module):
                 self._precision_prior(b_j) / denominator)
 
     def _m_step(self, match, log_probabilities, t_hat, target, laplace_scale):
-        """Algorithm 3 lines 10-15: sigma held fixed, loss (8) built from p and t.
-        
-        Both the sequential and joint E-steps use the same M-step."""
+        """Algorithm 3 lines 10-15: sigma held fixed, loss (8) built from p and t."""
         gt_class, gt_time = target['classes'], target['times']
 
         device = log_probabilities.device

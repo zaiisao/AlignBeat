@@ -9,7 +9,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alignbeat.criterion import SubsetCriterion
-from alignbeat.dp import subset_posterior_marginals, subset_select_dp, subset_select_dp_meter, subset_select_logsumexp
+from alignbeat.dp import subset_posterior_marginals, subset_select_dp, subset_select_logsumexp
 
 
 def _targets(M=40, seed=0):
@@ -53,45 +53,10 @@ def test_flags_reach_the_criterion():
     m = PLBeatThis(
         head_type="subset", transformer_dim=64, n_layers=2,
         num_candidates=188,
-        subset_kwargs=dict(mu_meter=1e5, joint_phase=True,
-                           meter_candidates=(2, 3, 4, 6), omega_downbeat=4.0))
+        subset_kwargs=dict(meter_candidates=(2, 3, 4, 6), omega_downbeat=4.0))
     c = m.subset_criterion
-    assert c.mu_meter == 1e5 and c.joint_phase
     assert c.meter_candidates == (2, 3, 4, 6)
     assert c.omega_downbeat == 4.0
-
-
-def test_meter_dp_matches_brute_force():
-    """Section 4.2's augmented recursion is an EXACT minimizer, not a heuristic."""
-    rng = np.random.default_rng(7)
-    for _ in range(20):
-        M, N, L, mu = 5, 9, 2, 30.0
-        cost = rng.random((M, N)) * 3
-        t_hat = np.sort(rng.random(N))
-        downbeats = np.array([0, 2, 4])
-        # the implementation derives Delta_bar with one EM step off the plain DP;
-        # mirror that here so both score against the same target
-        target = L * float(np.mean(np.diff(t_hat[subset_select_dp(cost)])))
-
-        def total(sigma):
-            c = sum(cost[i, sigma[i]] for i in range(M))
-            for a, b in zip(downbeats, downbeats[1:]):
-                c += mu * (t_hat[sigma[b]] - t_hat[sigma[a]] - target) ** 2
-            return c
-
-        want = min(itertools.combinations(range(N), M), key=total)
-        got = subset_select_dp_meter(cost, downbeats, t_hat, L, mu)
-        assert abs(total(want) - total(tuple(got))) < 1e-9
-
-
-def test_meter_dp_reduces_to_plain_dp_and_is_monotone():
-    rng = np.random.default_rng(0)
-    cost = rng.random((30, 80)) * 2
-    t = np.linspace(0.0, 1.0, 80)
-    db = list(range(0, 30, 4))
-    assert np.array_equal(subset_select_dp(cost), subset_select_dp_meter(cost, db, t, 4.0, 0.0))
-    sigma = subset_select_dp_meter(cost, db, t, 4.0, 1e5)
-    assert np.all(np.diff(sigma) > 0), "order-preserving constraint violated"
 
 
 def test_posterior_matches_brute_force():
