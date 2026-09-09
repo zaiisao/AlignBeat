@@ -57,7 +57,7 @@ class SubsetCriterion(nn.Module):
                  precision_prior_beta=PRECISION_PRIOR_BETA,
                  meter_candidates=(), estep_gamma=None,
                  beat_only_warmup=0, beat_only_confidence=0.0,
-                 hypothesis_class_prior=False):
+                 hypothesis_class_prior=False, lambda_meter=0.0):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
@@ -116,6 +116,14 @@ class SubsetCriterion(nn.Module):
         # exactly -1.008 * M/L nats, monotone in L, a standing push toward sparser
         # meters. True restores the pre-fix form for A/B only.
         self.hypothesis_class_prior = hypothesis_class_prior
+        # Algorithm 2 line 30's q_hat, trained where it can be. L is annotated on the
+        # downbeat-labelled majority and latent on the rest, and nothing carried
+        # information between the two: pi_M was a static corpus table. This supervises
+        # eq. (33)'s own P(L | x) -- the same posterior the beat-only E-step relies on,
+        # computed from the matched span's class probabilities -- against the annotated
+        # L. No new parameters and no pooled head: it trains the mechanism that already
+        # exists rather than adding a second one beside it.
+        self.lambda_meter = lambda_meter
         self.beat_only_warmup = beat_only_warmup
         self.beat_only_confidence = beat_only_confidence
 
@@ -129,6 +137,7 @@ class SubsetCriterion(nn.Module):
               f"beat_only_warmup={self.beat_only_warmup} "
               f"beat_only_confidence={self.beat_only_confidence} "
               f"hypothesis_class_prior={self.hypothesis_class_prior} "
+              f"lambda_meter={self.lambda_meter} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -324,6 +333,7 @@ class SubsetCriterion(nn.Module):
         # JA: b_hat is the output of the precision head which is learnable
         laplace_scale = self.b_min + b_hat # y = b
         precision_terms = []
+        meter_terms = []
 
         class_terms, time_terms, background_terms = [], [], []
         matched_residuals = []
@@ -363,6 +373,16 @@ class SubsetCriterion(nn.Module):
                 if terms[key] is not None:
                     bucket.append(terms[key])
 
+            # eq. (33)'s P(L | x) supervised by the annotated L. match.meter is the
+            # modal gap between annotated downbeats, and is 0 on beat-only fragments,
+            # which is never a candidate -- so this fires exactly where L is known.
+            if self.lambda_meter > 0.0 and int(match.meter) in self.meter_candidates:
+                span = log_probabilities[b][
+                    torch.from_numpy(match.sigma).to(log_probabilities.device)]
+                posterior = self._meter_log_posterior(span)
+                if posterior is not None and int(match.meter) in posterior:
+                    meter_terms.append(-posterior[int(match.meter)])
+
             if terms['residual'] is not None:
                 matched_residuals.append(terms['residual'])
 
@@ -372,7 +392,7 @@ class SubsetCriterion(nn.Module):
 
         losses = self._aggregate(
             class_logits, class_terms, time_terms, background_terms,
-            precision_terms, num_contributing)
+            precision_terms, meter_terms, num_contributing)
 
         if self.training and matched_residuals:
             # Eq. (5) between steps, for the prior only.
@@ -397,7 +417,7 @@ class SubsetCriterion(nn.Module):
         return losses, stats
 
     def _aggregate(self, class_logits, class_terms, time_terms, background_terms,
-                   precision_terms, num_contributing):
+                   precision_terms, meter_terms, num_contributing):
         """Per-fragment terms -> the loss dict train.py unpacks."""
         zero = torch.nan_to_num(class_logits).sum() * 0.0
         total = lambda terms: torch.stack(terms).sum() if terms else zero
@@ -408,8 +428,14 @@ class SubsetCriterion(nn.Module):
             'time': total(time_terms) / n,
             'background': self.gamma * total(background_terms) / n,
         }
+        if self.lambda_meter > 0.0 and meter_terms:
+            # Meaned over the labelled fragments that carry a candidate meter, not
+            # divided by n: it is one term per fragment, not per event.
+            losses['meter'] = self.lambda_meter * torch.stack(meter_terms).mean()
+
         losses['time'] = losses['time'] + total(precision_terms) / n
-        losses['total'] = sum(losses[k] for k in ('class', 'time', 'background'))
+        losses['total'] = sum(losses[k] for k in
+                              ('class', 'time', 'background', 'meter') if k in losses)
         return losses
 
     def _make_stats(self, losses, t_hat, num_candidates, matched_residuals, counts,

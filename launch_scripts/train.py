@@ -158,6 +158,7 @@ def main(args):
             "meter_candidates": meter_candidates,
             "estep_gamma": args.estep_gamma,
             "hypothesis_class_prior": args.hypothesis_class_prior,
+            "lambda_meter": args.lambda_meter,
             "beat_only_warmup": args.beat_only_warmup,
             "beat_only_confidence": args.beat_only_confidence,
             "normalize_by_events": args.normalize_by_events,
@@ -407,6 +408,12 @@ if __name__ == "__main__":
     # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
+    parser.add_argument("--lambda_meter", type=float, default=0.0,
+                        help="weight on -log P(L_true | x), eq. (33)'s meter posterior "
+                             "from the matched candidates' class probabilities, on "
+                             "downbeat-labelled fragments only. Trains the q_hat the "
+                             "beat-only E-step marginalises over (Algorithm 2 line 30) "
+                             "without a separate meter head. 0 disables it")
     parser.add_argument("--hypothesis_class_prior", action="store_true", default=False,
                         help="restore the pre-fix (omega, L) scoring, which added "
                              "log pi_C to each event's class term. That charges "
