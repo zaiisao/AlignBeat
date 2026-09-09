@@ -157,6 +157,8 @@ def main(args):
             "omega_downbeat": args.omega_db,
             "meter_candidates": meter_candidates,
             "estep_gamma": args.estep_gamma,
+            "beat_only_warmup": args.beat_only_warmup,
+            "beat_only_confidence": args.beat_only_confidence,
             "normalize_by_events": args.normalize_by_events,
             "background_by_unmatched": args.background_by_unmatched,
         },
@@ -404,6 +406,14 @@ if __name__ == "__main__":
     # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
+    parser.add_argument("--beat_only_warmup", type=int, default=0,
+                        help="hold the plain marginal (eq. 9) on beat-only fragments "
+                             "for this many training steps before the EM surrogate "
+                             "takes over. Was 2000 until the beat-only rework")
+    parser.add_argument("--beat_only_confidence", type=float, default=0.0,
+                        help="per-event gate on the EM surrogate: where "
+                             "max(r, 1-r) is below this, use the marginal instead. "
+                             "Was 0.7 until the beat-only rework; 0 disables it")
     parser.add_argument("--estep_gamma", type=float, default=None,
                         help="weight on the background correction inside the MATCHING "
                              "cost, separate from --gamma's weight in the loss. Default "

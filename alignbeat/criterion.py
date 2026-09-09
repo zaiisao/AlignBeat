@@ -55,7 +55,8 @@ class SubsetCriterion(nn.Module):
                  b_min=B_MIN, residual_ema_decay=0.99,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
-                 meter_candidates=(), estep_gamma=None):
+                 meter_candidates=(), estep_gamma=None,
+                 beat_only_warmup=0, beat_only_confidence=0.0):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
@@ -99,6 +100,15 @@ class SubsetCriterion(nn.Module):
             downbeat_share = 0.5
         prior = torch.tensor([downbeat_share, 1.0 - downbeat_share], dtype=torch.float32)
 
+        # Two gates the beat-only term used to carry, both removed in the rework that
+        # has never been trained. Restored as knobs, off by default. Warmup holds the
+        # plain marginal for the first N steps, so the class head learns "a beat is
+        # here" before pi_{omega,L} starts asserting which kind. The confidence gate is
+        # per event and permanent: where the posterior is undecided, fall back to the
+        # marginal rather than train on a target that is barely better than a coin flip.
+        self.beat_only_warmup = beat_only_warmup
+        self.beat_only_confidence = beat_only_confidence
+
         self._call_count = 0
 
         self.register_buffer("log_class_prior", torch.log(prior / prior.sum()), persistent=False)
@@ -106,6 +116,8 @@ class SubsetCriterion(nn.Module):
         print(f"[subset-criterion] omega_db={self.omega_downbeat} gamma={self.gamma} "
               f"meter_candidates={self.meter_candidates or 'off'} "
               f"estep_gamma={self.estep_gamma} "
+              f"beat_only_warmup={self.beat_only_warmup} "
+              f"beat_only_confidence={self.beat_only_confidence} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -430,16 +442,26 @@ class SubsetCriterion(nn.Module):
         normalised over {DB, B}, which is the quantity line 45 names. The raw head
         appears only in the ind=0 branch, line 43.
         """
+        # What the label alone asserts: the event is a beat of some kind. Eq. (9).
+        marginal = -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)
+
         if r is None:
-            # No viable meter hypothesis, so there is no pi_{psi,L} to take an
-            # expectation under. Fall back to what the label alone asserts: the event
-            # is a beat of some kind.
-            return -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1)
+            # No viable meter hypothesis, so there is no pi_{omega,L} to take an
+            # expectation under.
+            return marginal
+        if self._call_count < self.beat_only_warmup:
+            return marginal
 
         log_db = matched_log[:, DOWNBEAT] + self.log_class_prior[DOWNBEAT]
         log_b = matched_log[:, BEAT] + self.log_class_prior[BEAT]
         log_norm = torch.logaddexp(log_db, log_b)
-        return -(r * (log_db - log_norm) + (1.0 - r) * (log_b - log_norm))
+        weighted = -(r * (log_db - log_norm) + (1.0 - r) * (log_b - log_norm))
+
+        if self.beat_only_confidence > 0.0:
+            with torch.no_grad():
+                confident = torch.maximum(r, 1.0 - r) >= self.beat_only_confidence
+            return torch.where(confident, weighted, marginal)
+        return weighted
 
     def _log_hypothesis_prior(self, meter):
         """log pi_M(L) + log pi_psi(psi), Algorithm 1 line 45's first two bracket terms.
