@@ -156,6 +156,7 @@ def main(args):
             "gamma": args.gamma,
             "omega_downbeat": args.omega_db,
             "meter_candidates": meter_candidates,
+            "estep_gamma": args.estep_gamma,
             "normalize_by_events": args.normalize_by_events,
             "background_by_unmatched": args.background_by_unmatched,
         },
@@ -403,6 +404,12 @@ if __name__ == "__main__":
     # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
     # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
     parser.add_argument("--omega_db", type=float, default=4.0)
+    parser.add_argument("--estep_gamma", type=float, default=None,
+                        help="weight on the background correction inside the MATCHING "
+                             "cost, separate from --gamma's weight in the loss. Default "
+                             "(unset) ties it to --gamma, which is what every arm to "
+                             "date ran; 0 gives algorithm5 v5-2's own match cost, "
+                             "-log p_j(c_i) + lambda_L1 |t_i - t_hat_j|")
     parser.add_argument("--quantize_targets", action="store_true", default=False,
                         help="round ground-truth event times to the frame grid, matching "
                              "what the dense head is necessarily trained on")

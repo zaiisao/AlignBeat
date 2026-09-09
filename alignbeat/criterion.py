@@ -55,11 +55,17 @@ class SubsetCriterion(nn.Module):
                  b_min=B_MIN, residual_ema_decay=0.99,
                  precision_prior_alpha=PRECISION_PRIOR_ALPHA,
                  precision_prior_beta=PRECISION_PRIOR_BETA,
-                 meter_candidates=()):
+                 meter_candidates=(), estep_gamma=None):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
         self.gamma = gamma
+        # The background correction inside the MATCHING cost, separately weighted from
+        # the loss's own gamma. algorithm5 v5-2 lines 15/17 write the match cost as
+        # -log p_j(c_i) + lambda_L1 |t_i - t_hat_j| and nothing else; the correction is
+        # the older draft's eq. (22). None keeps the two weights tied, which is what
+        # every arm to date ran; 0 is v5-2's own match cost.
+        self.estep_gamma = gamma if estep_gamma is None else estep_gamma
         self.normalize_by_events = normalize_by_events
         self.background_by_unmatched = background_by_unmatched
 
@@ -99,6 +105,7 @@ class SubsetCriterion(nn.Module):
 
         print(f"[subset-criterion] omega_db={self.omega_downbeat} gamma={self.gamma} "
               f"meter_candidates={self.meter_candidates or 'off'} "
+              f"estep_gamma={self.estep_gamma} "
               f"normalize_by_events={self.normalize_by_events}", flush=True)
 
 
@@ -107,14 +114,21 @@ class SubsetCriterion(nn.Module):
         return (t_hat - t_target).abs() / self.estep_b
 
     def build_cost(self, log_probabilities, t_hat, gt_class, gt_time):
-        """Per-pair cost (3) plus the section 8.4 background correction."""
+        """v5-2 lines 15/17's match cost, plus the older draft's background correction.
+
+        The correction is an opportunity cost: matching j spends it, so it no longer
+        pays the loss's own background penalty. Subtracting what j would have owed had
+        it stayed unmatched makes the DP see that. At estep_gamma=0 the cost is v5-2's
+        own, which chooses on target-class NLL and timing alone.
+        """
         class_cost = self.class_nll(log_probabilities, gt_class)
         time_cost = self.l1(t_hat[None, :], gt_time[:, None])
 
+        l_match = class_cost + time_cost                    # v5-2 lines 15/17
+        if self.estep_gamma == 0.0:
+            return l_match
         background_nll = -log_probabilities[:, BACKGROUND]                      # (N,)
-
-        l_match = class_cost + time_cost                                        # eq. (3)
-        return l_match - self.gamma * background_nll[None, :]                   # section 8.4
+        return l_match - self.estep_gamma * background_nll[None, :]
 
     def _fragment_meter(self, gt_class):
         """The meter L in force for this fragment, or 0 if none is available."""
