@@ -13,8 +13,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.classes import BEAT, DOWNBEAT
-from alignbeat.classes import METER_PRIOR
+from alignbeat.classes import BEAT, DOWNBEAT, METER_PRIOR
 from alignbeat.criterion import SubsetCriterion
 
 DATA_PRIOR = {"downbeat": 0.2853, "beat": 0.7147}   # fold-0 pi_data, measured
@@ -75,7 +74,11 @@ def test_surrogate_matches_the_direct_marginal_gradient():
         blocks = crit._hypothesis_log_scores(crit._class_log_posterior(log_p))
         return torch.cat([blocks[k] for k in blocks])
 
-    direct = -flat(matched).logsumexp(dim=0)
+    # The event-mass term line 52 omits is now carried by _beat_only_term. It does not
+    # depend on (omega, L), so it is additive on both sides and the identity is
+    # unchanged -- which is precisely what this test now confirms.
+    direct = (-flat(matched).logsumexp(dim=0)
+              - torch.logsumexp(matched[:, [DOWNBEAT, BEAT]], dim=-1).sum())
     g_direct, = torch.autograd.grad(direct, logits, retain_graph=True)
 
     with torch.no_grad():

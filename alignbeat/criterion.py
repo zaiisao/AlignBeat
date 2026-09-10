@@ -352,15 +352,35 @@ class SubsetCriterion(nn.Module):
         scores recomputed at theta. The EM structure is the two arguments -- pi carries
         no gradient, the scores carry all of it.
         """
+        # Line 50 decomposes exactly (verified to 1e-16):
+        #     -log p(c_i) = -log P_2(c_i)  +  -log(1 - p(empty))
+        #                   which class       is it an event at all
+        # Line 52 supplies only the first half: P_hat is normalised over {DB, B}, so
+        # cls(theta; 1) is INVARIANT to the background channel -- measured constant
+        # while P(event) swept 0.95 to 0.15. A beat-only annotation asserts two things,
+        # that an event is here and that its class is unknown, and the spec's surrogate
+        # uses only the second. Nothing then constrains p(empty) at a matched event on
+        # beat-only data, and it drifts: simac's detected/true events fall from 0.99 to
+        # 0.80 over 20 epochs, which is its entire gap to vanilla.
+        #
+        # This is line 20's own quantity, which the E-step already trusts to decide
+        # which candidates are events ("informative precisely because it is a proper
+        # subset of the head's own larger, three-way support"). Restoring it here makes
+        # ind=1 symmetric with ind=0. It does not depend on (omega, L), so it is purely
+        # additive and leaves Fisher's identity intact -- tests/test_fisher.py checks
+        # that rather than assuming it.
+        #
+        # DEVIATION from algorithm5_hard-1 line 52.
+        event = -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
+
         if pi is None:
             # No viable meter hypothesis, so there is no pi_{omega,L} to take an
-            # expectation under. Fall back to what the label alone asserts: the event
-            # is a beat of some kind.
-            return -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
+            # expectation under. What the label alone asserts is all that is left.
+            return event
 
         scores = self._hypothesis_log_scores(self._class_log_posterior(matched_log))
         flat = torch.cat([scores[L] for L in scores])
-        return -(pi * flat).sum()
+        return event - (pi * flat).sum()
 
     def infer_pattern(self, log_p):
         """Algorithm 3 lines 10-24: resolve one (omega, L) for these events and label
