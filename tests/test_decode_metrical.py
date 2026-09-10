@@ -130,3 +130,75 @@ def test_pattern_matches_the_hypothesis_that_won():
     assert torch.equal(classes, torch.where(((omega + i0) % meter) == 0,
                                             torch.full_like(i0, DOWNBEAT),
                                             torch.full_like(i0, BEAT)))
+
+
+# ---------------------------------------------------------------------------
+# Recovery: plant a known (omega, L) and check Algorithm 3 gets it back. The
+# guarantee tests above only prove the output is SOME valid pattern; these prove
+# it is the RIGHT one, which is a different claim.
+# ---------------------------------------------------------------------------
+
+def planted(M, omega, meter, confidence=0.9, N=188, seed=0):
+    """Head output whose class probabilities encode c_i(omega, meter) at `confidence`,
+    on the first M candidates, with the rest firmly background."""
+    g = torch.Generator().manual_seed(seed)
+    logits = torch.full((N, 3), -20.0)
+    logits[:, BACKGROUND] = 20.0
+    i0 = torch.arange(M)
+    is_db = ((omega + i0) % meter) == 0
+    p_db = torch.where(is_db, confidence, 1.0 - confidence)
+    probs = torch.stack([p_db, 1.0 - p_db, torch.full((M,), 1e-6)], dim=1)
+    logits[:M] = torch.log(probs / probs.sum(1, keepdim=True))
+    return logits, monotonic_times(torch.randn(N, generator=g))
+
+
+@pytest.mark.parametrize("meter", [2, 3, 4, 6, 8])
+@pytest.mark.parametrize("omega", [0, 1, 2])
+def test_recovers_the_planted_meter_and_phase(meter, omega):
+    """Unambiguous evidence: the argmax must land on exactly what was planted."""
+    if omega >= meter:
+        pytest.skip("phase must be below the meter")
+    M = 8 * meter
+    logits, t_hat = planted(M, omega, meter)
+    log_p = torch.log_softmax(logits, dim=-1)[:M]
+    resolved = criterion().infer_pattern(log_p)
+    assert resolved is not None
+    classes, got_omega, got_meter = resolved
+    assert (got_meter, got_omega) == (meter, omega)
+    i0 = torch.arange(M)
+    assert torch.equal(classes == DOWNBEAT, ((omega + i0) % meter) == 0)
+
+
+@pytest.mark.parametrize("meter,omega", [(4, 0), (4, 2), (3, 1), (6, 5)])
+def test_end_to_end_decode_recovers_the_pattern(meter, omega):
+    """The same, through decode_events_metrical: detection, ordering and stage 2
+    together must return the planted downbeat positions."""
+    M = 8 * meter
+    logits, t_hat = planted(M, omega, meter)
+    classes, times, _s = decode_events_metrical(logits, t_hat, criterion(), tau=0.5)
+    assert times.numel() == M, "stage 1 should detect exactly the planted events"
+    i0 = torch.arange(M)
+    assert torch.equal(classes == DOWNBEAT, ((omega + i0) % meter) == 0)
+
+
+def test_recovery_survives_a_wrong_event():
+    """One event's class evidence flipped must not move the argmax: line 17's product
+    is over the whole fragment, so a single dissenting event should be outvoted."""
+    M, meter, omega = 32, 4, 1
+    logits, t_hat = planted(M, omega, meter)
+    logits[5] = logits[5].flip(0) if False else torch.log(
+        torch.tensor([0.9, 0.1, 1e-6]) / torch.tensor([0.9, 0.1, 1e-6]).sum())
+    log_p = torch.log_softmax(logits, dim=-1)[:M]
+    _c, got_omega, got_meter = criterion().infer_pattern(log_p)
+    assert (got_meter, got_omega) == (meter, omega)
+
+
+def test_first_downbeat_index_matches_the_spec():
+    """The PDF states the first downbeat falls at i = (L - omega) mod L, not at omega.
+    A sign slip in the phase convention would pass every validity test above and fail
+    only here."""
+    M, meter, omega = 24, 4, 3
+    logits, _t = planted(M, omega, meter)
+    classes, _o, _m = criterion().infer_pattern(torch.log_softmax(logits, -1)[:M])
+    first = int((classes == DOWNBEAT).nonzero()[0])
+    assert first == (meter - omega) % meter == 1
