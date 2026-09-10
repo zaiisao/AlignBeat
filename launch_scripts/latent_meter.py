@@ -107,6 +107,9 @@ def main():
     loader = dm.test_dataloader() if args.split == "test" else dm.val_dataloader()
     # per dataset: L correct, L=4 correct, fragments, tp, fp, fn, tn, head correct
     per_ds = collections.defaultdict(lambda: [0] * 8)
+    # Selective prediction: is confidence calibrated enough to abstain on?
+    # per fragment (max_L P(L|x), L correct); per event (max(r,1-r), r right, head right)
+    L_conf, ev_conf = [], []
     for batch in loader:
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         # GTZAN clips run ~1519 frames; the head is built for one 1500-frame window.
@@ -164,6 +167,11 @@ def main():
             d[5] += int((~called & is_db).sum()); d[6] += int((~called & ~is_db).sum())
             d[7] += int((head == is_db).sum())
 
+            pmax = float(torch.softmax(torch.stack([post[L] for L in post]), 0).max())
+            L_conf.append((pmax, L_hat == L_true))
+            conf_r = torch.maximum(r, 1 - r)
+            ev_conf += list(zip(conf_r.tolist(), agree_r.tolist(), agree_h.tolist()))
+
     print(f"\n{'GTZAN' if args.split == 'test' else 'fold 0 validation'}, labels masked, {'UNIFORM' if args.uniform else 'corpus'} pi_M, "
           f"{'FLAT' if args.flat else 'corpus'} pi_C")
     print(f"checkpoint: {Path(path).name}")
@@ -205,8 +213,29 @@ def main():
     print(f"     events the 0.7 confidence gate would refuse: "
           f"{100*sum(1 for v in r_on_db+r_on_b if max(v,1-v)<0.7)/len(r_on_db+r_on_b):.1f}%")
 
+    def band(rows, edges, head=None):
+        print(f"     {'confidence':>14}{'n':>7}{'share':>8}{'accuracy':>10}"
+              + (f"{'head':>8}{'delta':>8}" if head else ""))
+        for lo, hi in zip(edges, edges[1:]):
+            sel = [x for x in rows if lo <= x[0] < hi]
+            if not sel:
+                continue
+            acc = 100 * sum(x[1] for x in sel) / len(sel)
+            line = (f"     [{lo:.2f}, {hi:.2f}){len(sel):>7}"
+                    f"{100*len(sel)/len(rows):>7.1f}%{acc:>9.1f}%")
+            if head:
+                h = 100 * sum(x[2] for x in sel) / len(sel)
+                line += f"{h:>7.1f}%{acc-h:>+8.1f}"
+            print(line)
+
+    print("\n5  is max_L P(L | x) calibrated?  (fragments)")
+    band(L_conf, [0.0, 0.5, 0.7, 0.9, 0.99, 1.01])
+
+    print("\n6  is max(r, 1-r) calibrated?  r_i vs the head within each band (events)")
+    band(ev_conf, [0.5, 0.7, 0.9, 0.99, 1.01], head=True)
+
     if per_ds:
-        print("\n5  per dataset -- L argmax vs always-4, and r_i vs the head")
+        print("\n7  per dataset -- L argmax vs always-4, and r_i vs the head")
         print(f"     {'dataset':<16}{'frag':>6}{'L acc':>8}{'always4':>9}"
               f"{'r_i acc':>9}{'head':>8}{'delta':>7}{'r_i rec':>9}")
         for ds in sorted(per_ds):
