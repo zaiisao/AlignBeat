@@ -16,7 +16,8 @@ from alignbeat.classes import NUM_CLASSES
 class SubsetSelectionHead(nn.Module):
     """Encoder features -> N candidates -> (class logits, monotone times)."""
 
-    def __init__(self, feature_size=256, hidden_size=256,
+    def __init__(self, feature_size=256, hidden_size=256, attention_layers=0,
+                 attention_heads=4,
                  window_seconds=30.0):
         super(SubsetSelectionHead, self).__init__()
 
@@ -33,6 +34,26 @@ class SubsetSelectionHead(nn.Module):
             nn.LayerNorm(hidden_size),
             nn.GELU(),
         )
+
+        # Candidate self-attention. The head is otherwise a per-candidate MLP, so
+        # candidate j cannot see what j+1 is doing -- and 82% of false fires are within
+        # two cells of a real one, i.e. the same beat claimed twice. DETR avoids NMS
+        # precisely because its queries attend to each other and can back off; this is
+        # that mechanism, on an anchored grid.
+        #
+        # The final LayerNorm is NOT optional here. norm_first normalises each
+        # sublayer's INPUT, leaving the residual stream itself unnormalised, so what
+        # class_head reads leaves the block several times longer than it entered
+        # (measured previously: token norm 11.7 -> 46.5 at one layer, compounding with
+        # depth). 42 of the 44 arms that ever ran this had it OFF. It is on here.
+        self.candidate_attention = None
+        if attention_layers > 0:
+            layer = nn.TransformerEncoderLayer(
+                d_model=hidden_size, nhead=attention_heads,
+                dim_feedforward=hidden_size * 2, dropout=0.0,
+                batch_first=True, norm_first=True)
+            self.candidate_attention = nn.TransformerEncoder(
+                layer, attention_layers, norm=nn.LayerNorm(hidden_size))
 
         self.class_head = nn.Linear(hidden_size, 3) # JA: 3 classes: downbeat, beat, background
         self.regression_head = nn.Linear(hidden_size, 1)
@@ -64,7 +85,21 @@ class SubsetSelectionHead(nn.Module):
         r = self.regression_head(z).squeeze(dim=2)      # (B, N)
         t_hat = monotonic_times(r)
 
-        class_logits = self.class_head(z)               # (B, N, 3)
+        # Only the classifier sees the contextualised features; regression already read
+        # z above, so timing is unaffected by the attention pass.
+        z_class = z
+        if self.candidate_attention is not None:
+            # Self-attention is permutation-equivariant, so without a position signal
+            # the classifier could see WHAT the other candidates look like but not
+            # WHERE they are -- and "is my neighbour claiming this beat" is a question
+            # about position. t_hat is already monotone in the index, so the index IS
+            # the time order; sinusoidal features of it are the cheaper of the two.
+            z_class = z + sinusoidal(
+                torch.arange(z.shape[1], device=z.device, dtype=z.dtype)
+                .unsqueeze(0).expand(z.shape[0], -1), z.shape[2])
+            z_class = self.candidate_attention(z_class)
+
+        class_logits = self.class_head(z_class)         # (B, N, 3)
         return class_logits, t_hat
 
 
@@ -97,3 +132,12 @@ def monotonic_times(r, max_offset=MAX_OFFSET):
     N = r.shape[-1]
     centre = (torch.arange(N, device=r.device, dtype=r.dtype) + 0.5) / N
     return centre + max_offset * torch.tanh(r) / N
+
+
+def sinusoidal(position, dim):
+    """Standard sinusoidal features of a (B, N) real position -> (B, N, dim)."""
+    half = dim // 2
+    freqs = torch.exp(torch.arange(half, device=position.device, dtype=position.dtype)
+                      * (-math.log(10000.0) / max(half - 1, 1)))
+    angles = position.unsqueeze(-1) * freqs
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)[..., :dim]

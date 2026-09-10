@@ -158,6 +158,7 @@ def main(args):
             "stitch_border": args.stitch_border,
             "tau": args.tau,
             "decode": args.decode,
+            "attention_layers": args.attention_layers,
             # criterion
             "gamma": args.gamma,
             "meter_prior": meter_prior,
@@ -347,6 +348,11 @@ if __name__ == "__main__":
     parser.add_argument("--tau", type=float, default=0.2,
                         help="detection threshold. algorithm5_hard-1 Algorithm 3 line 5 "
                              "keeps candidates whose 1 - p_j(empty) clears it")
+    parser.add_argument("--attention_layers", type=int, default=0,
+                        help="candidate self-attention layers in the classification "
+                             "branch. 0 = per-candidate MLP, each candidate blind to "
+                             "its neighbours. >0 lets them coordinate, which is how "
+                             "DETR avoids NMS; a final LayerNorm is always applied")
     parser.add_argument("--decode", choices=("argmax", "metrical"), default="argmax",
                         help="argmax: per-candidate argmax over {DB, B, empty}. "
                              "metrical: Algorithm 3, one (omega, L) resolved jointly "

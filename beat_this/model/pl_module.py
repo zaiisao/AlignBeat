@@ -29,7 +29,7 @@ from beat_this.utils import replace_state_dict_key
 # Architecture and decode settings that ride in subset_kwargs rather than in
 # PLBeatThis's own signature.
 SUBSET_ARCH_KEYS = ("num_candidates", "train_length", "downsample_stages",
-                    "stitch_border", "tau", "decode")
+                    "stitch_border", "tau", "decode", "attention_layers")
 
 
 def split_subset_kwargs(subset_kwargs):
@@ -90,6 +90,7 @@ class PLBeatThis(LightningModule):
         # "argmax": per-candidate argmax, decode_events. "metrical": Algorithm 3, one
         # (omega, L) resolved jointly across the detected events. Defaults to argmax so
         # existing checkpoints decode exactly as they were scored.
+        self.attention_layers = arch.pop("attention_layers", 0)
         self.decode = arch.pop("decode", "argmax")
         if self.decode not in ("argmax", "metrical"):
             raise ValueError(f"decode must be argmax or metrical, got {self.decode!r}")
@@ -116,6 +117,7 @@ class PLBeatThis(LightningModule):
             train_length=train_length,
             fps=fps,
             downsample_stages=downsample_stages,
+            attention_layers=self.attention_layers,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
