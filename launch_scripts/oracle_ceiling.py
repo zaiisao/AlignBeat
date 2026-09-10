@@ -7,6 +7,11 @@ above it by exactly one oracle, so the step between them is that stage's price:
 
   real      decode_events: the model picks its own events by threshold, then each
             candidate independently takes argmax over DB/B. What we ship.
+  real+lat  the model's OWN detected events, with downbeats from the bar-constrained
+            posterior instead of the per-candidate argmax. No ground truth of any kind
+            enters. This is what Algorithm 3 would actually buy; the "+latent" rung
+            below is the same idea handed an oracle event set AND oracle event times,
+            so it bounds this from above rather than predicting it.
   +detect   the event SET is oracled -- the time-only DP says which candidates are real
             events -- but classes still come from the head's argmax. The step from
             "real" is what detection and thresholding cost.
@@ -34,7 +39,7 @@ from alignbeat.classes import BEAT
 from alignbeat.dp import subset_select_dp
 
 # The rungs, in the order they are reported. Each adds one oracle to the one before.
-RUNGS = ("real", "+detect", "+latent", "+meter", "+class")
+RUNGS = ("real", "real+latent", "+detect", "+latent", "+meter", "+class")
 
 
 def load(ckpt_path, device):
@@ -89,6 +94,8 @@ def downbeat_call(model, log_p, t_hat, target, sigma, meter=None):
 @torch.no_grad()
 def run(model, loader, device):
     from alignbeat.decode import decode_events
+    # Deferred: latent_meter imports load() from here, so a module-level import cycles.
+    from launch_scripts.latent_meter import downbeat_mass
     rows = []
     for batch in loader:
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -116,6 +123,7 @@ def run(model, loader, device):
             true_is_db = gt_c == DOWNBEAT
 
             log_p = torch.log_softmax(pred["class_logits"][i].float(), dim=-1)
+            crit = model.subset_criterion
             span = log_p[torch.from_numpy(sigma).to(device)]
             head_is_db = (span[:, DOWNBEAT] > span[:, BEAT]).cpu().numpy()
 
@@ -126,6 +134,24 @@ def run(model, loader, device):
                                          target, sigma, meter=None)
             meter_is_db = downbeat_call(model, log_p, pred["t_hat"][i].float(),
                                         target, sigma, meter=L_true)
+
+            # ALGORITHM 3, honestly: score the bar hypotheses over the candidates the
+            # model itself emitted. Same arithmetic as the E-step after sigma, but
+            # sigma here is the decode's own keep-mask, so no gt time or count leaks in.
+            real_latent_is_db = None
+            probs = torch.softmax(pred["class_logits"][i].float(), dim=-1)
+            top, arg = probs.max(dim=-1)
+            keep = (arg != BACKGROUND) & (top >= model.tau)
+            if int(keep.sum()) >= 4:
+                span_r = log_p[keep]
+                scores_h = crit._hypothesis_log_scores(crit._class_log_posterior(span_r))
+                if scores_h:
+                    flat = torch.cat([scores_h[L] for L in scores_h])
+                    pi = torch.softmax(flat, dim=0)
+                    r = downbeat_mass(crit, pi, int(keep.sum()))
+                    real_latent_is_db = (r > 0.5).cpu().numpy()
+                    real_latent_sec = (pred["t_hat"][i].float()[keep]
+                                       * window).cpu().numpy()
 
             # REAL: the model's own decode, its own events and its own classes
             cls, times, _ = decode_events(pred["class_logits"][i].float(),
@@ -143,6 +169,9 @@ def run(model, loader, device):
                 if isdb is not None and has_db:
                     row[f"{tag}_acc"] = float((isdb == true_is_db).mean())
             for tag, sec, isdb in (("real", real_sec, real_is_db),
+                                   ("real+latent",
+                                    real_latent_sec if real_latent_is_db is not None
+                                    else None, real_latent_is_db),
                                    ("+detect", matched_sec, head_is_db),
                                    ("+latent", matched_sec, latent_is_db),
                                    ("+meter", matched_sec, meter_is_db),

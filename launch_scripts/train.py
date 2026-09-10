@@ -157,6 +157,7 @@ def main(args):
             "downsample_stages": downsample_stages,
             "stitch_border": args.stitch_border,
             "tau": args.tau,
+            "decode": args.decode,
             # criterion
             "gamma": args.gamma,
             "meter_prior": meter_prior,
@@ -346,6 +347,13 @@ if __name__ == "__main__":
     parser.add_argument("--tau", type=float, default=0.2,
                         help="detection threshold. algorithm5_hard-1 Algorithm 3 line 5 "
                              "keeps candidates whose 1 - p_j(empty) clears it")
+    parser.add_argument("--decode", choices=("argmax", "metrical"), default="argmax",
+                        help="argmax: per-candidate argmax over {DB, B, empty}. "
+                             "metrical: Algorithm 3, one (omega, L) resolved jointly "
+                             "across the detected events, so the emitted pattern is "
+                             "metrically consistent by construction (section 3.1). "
+                             "Note Algorithm 3 names tau=0.5 and thresholds event mass "
+                             "1 - p(empty), where argmax thresholds the winning class.")
     parser.add_argument("--stitch_border", type=int, default=None,
                         help="frames discarded either side of a chunk seam at whole-piece "
                              "inference; defaults to the dense arm's 2*tolerance so both "

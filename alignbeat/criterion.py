@@ -362,6 +362,48 @@ class SubsetCriterion(nn.Module):
         flat = torch.cat([scores[L] for L in scores])
         return -(pi * flat).sum()
 
+    def infer_pattern(self, log_p):
+        """Algorithm 3 lines 10-24: resolve one (omega, L) for these events and label
+        every one of them from it.
+
+        log_p is the head's log-probabilities at the DETECTED candidates only, already
+        ordered by increasing t_hat (line 7). Returns (classes, omega_hat, L_hat), or
+        None when no meter candidate is viable -- which on line 17's product means
+        there is no hypothesis to take an argmax over, not that the answer is beats.
+
+        Lines 11-14 are _class_log_posterior and line 17's numerator is
+        _hypothesis_log_scores: the same two functions the E-step uses, so inference and
+        training score a hypothesis identically by construction. Line 17's denominator
+        is constant in (omega, L), so line 20's argmax needs only the numerator.
+        """
+        blocks = self._hypothesis_log_scores(self._class_log_posterior(log_p))
+        if not blocks:
+            return None
+
+        meters = list(blocks)
+        flat = torch.cat([blocks[L] for L in meters])
+        best = int(torch.argmax(flat))                       # line 20
+
+        # Invert the concatenation: blocks[L] holds one entry per phase, in phase
+        # order, so the flat index decomposes into (L_hat, omega_hat) by walking it.
+        start = 0
+        for meter in meters:
+            width = blocks[meter].shape[0]
+            if best < start + width:
+                omega_hat, meter_hat = best - start, meter
+                break
+            start += width
+
+        # Line 23: c_i(omega_hat, L_hat), the same pattern _hypothesis_log_scores
+        # scored, so the emitted labels are exactly what won the argmax.
+        i0 = torch.arange(log_p.shape[0], device=log_p.device)
+        is_downbeat = ((omega_hat + i0) % meter_hat) == 0
+        classes = torch.where(is_downbeat,
+                              torch.full_like(i0, DOWNBEAT),
+                              torch.full_like(i0, BEAT))
+        return classes, int(omega_hat), int(meter_hat)
+
+
     def _log_hypothesis_prior(self, meter):
         """log pi_M(L) + log pi_omega(omega), Algorithm 2 line 52's first two brackets.
 

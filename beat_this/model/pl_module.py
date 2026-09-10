@@ -20,7 +20,7 @@ import numpy as np
 from beat_this.model.beat_tracker import BeatThis
 from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
-from alignbeat.decode import decode_events
+from alignbeat.decode import decode_events, decode_events_metrical
 from alignbeat.stitching import stitch_piece
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
@@ -29,7 +29,7 @@ from beat_this.utils import replace_state_dict_key
 # Architecture and decode settings that ride in subset_kwargs rather than in
 # PLBeatThis's own signature.
 SUBSET_ARCH_KEYS = ("num_candidates", "train_length", "downsample_stages",
-                    "stitch_border", "tau")
+                    "stitch_border", "tau", "decode")
 
 
 def split_subset_kwargs(subset_kwargs):
@@ -87,6 +87,12 @@ class PLBeatThis(LightningModule):
 
         self.stitch_border = arch.pop("stitch_border", None)
         self.tau = arch.pop("tau", 0.2)
+        # "argmax": per-candidate argmax, decode_events. "metrical": Algorithm 3, one
+        # (omega, L) resolved jointly across the detected events. Defaults to argmax so
+        # existing checkpoints decode exactly as they were scored.
+        self.decode = arch.pop("decode", "argmax")
+        if self.decode not in ("argmax", "metrical"):
+            raise ValueError(f"decode must be argmax or metrical, got {self.decode!r}")
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -157,16 +163,28 @@ class PLBeatThis(LightningModule):
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
     def _subset_decode(self, batch, model_prediction):
-        """Algorithm 10 per excerpt, returned as predicted TIMES in seconds."""
+        """Inference per excerpt, returned as predicted TIMES in seconds.
+
+        Either decoding rule, selected by self.decode: the per-candidate argmax of
+        decode_events, or Algorithm 3's two stages. Everything after the call -- the
+        seconds conversion, the padding-mask restriction, the sort -- is shared, so the
+        two rules differ in exactly one thing: which candidates are emitted with which
+        classes."""
         num_frames = batch["truth_beat"].shape[-1]
         window_seconds = num_frames / self.fps
         padding_mask = batch.get("padding_mask")
         beats, downbeats = [], []
         for index in range(len(batch["spect"])):
-            classes, times, _scores = decode_events(
-                model_prediction["class_logits"][index].float(),
-                model_prediction["t_hat"][index].float(),
-                self.tau)
+            logits = model_prediction["class_logits"][index].float()
+            candidate_times = model_prediction["t_hat"][index].float()
+            if self.decode == "metrical":
+                # Algorithm 3. One fragment per call is exactly the condition section 3
+                # states its stage 2 for: a single (omega, L) spans this window.
+                classes, times, _scores = decode_events_metrical(
+                    logits, candidate_times, self.subset_criterion, self.tau)
+            else:
+                classes, times, _scores = decode_events(
+                    logits, candidate_times, self.tau)
             seconds = (times * window_seconds).detach().cpu().numpy()
             classes = classes.detach().cpu().numpy()
             if padding_mask is not None:

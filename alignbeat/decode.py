@@ -114,3 +114,43 @@ def decode_events(class_logits, t_hat, tau=0.2):
     scores, predicted = probabilities.max(dim=-1)
     keep = (predicted != BACKGROUND) & (scores >= tau)
     return predicted[keep], t_hat[keep], scores[keep]
+
+
+def decode_events_metrical(class_logits, t_hat, criterion, tau=0.5):
+    """Algorithm 3: detect events, then resolve ONE (omega, L) across all of them.
+
+    Section 3.1's objection to decode_events is that per-candidate argmax can emit a
+    pattern no (omega, L) could produce -- two adjacent downbeats, say -- because
+    nothing in the head's own loss ties events to each other at inference. Here every
+    emitted label is c_i(omega_hat, L_hat) for one jointly-chosen hypothesis, so a
+    metrically valid output is guaranteed by construction rather than hoped for.
+
+    Two differences from decode_events, both from the spec and both deliberate:
+    line 5 thresholds the EVENT mass 1 - p(empty) rather than the winning class's own
+    probability, so a candidate split evenly between DB and B still counts as an event;
+    and tau defaults to 0.5, the value section 3's own note names, not 0.2.
+
+    criterion supplies pi_data, pi_C, pi_M and pi_omega, all of which ride in the
+    checkpoint. Returns (classes, times, scores) exactly as decode_events does.
+    """
+    probabilities = F.softmax(class_logits, dim=-1)
+    event_mass = 1.0 - probabilities[..., BACKGROUND]
+    keep = event_mass >= tau                                      # line 5
+    # Line 7 asks for the kept candidates in increasing t_hat. monotonic_times makes
+    # t_hat strictly increasing in the candidate index for any head output, so index
+    # order already IS time order and no sort is needed; see alignbeat.head.
+    index = torch.nonzero(keep, as_tuple=False).flatten()
+    if index.numel() == 0:
+        empty = index
+        return empty, t_hat[empty], event_mass[empty]
+
+    log_p = torch.log_softmax(class_logits, dim=-1)[index]
+    resolved = criterion.infer_pattern(log_p)                     # lines 10-24
+    if resolved is None:
+        # Fewer detected events than the smallest candidate meter, so no hypothesis
+        # exists to resolve. Fall back to the per-candidate call over {DB, B}: still a
+        # detection, just with no metrical structure available to constrain it.
+        classes = log_p[:, [DOWNBEAT, BEAT]].argmax(dim=-1)
+    else:
+        classes, _omega, _meter = resolved
+    return classes, t_hat[index], event_mass[index]

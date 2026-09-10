@@ -139,6 +139,9 @@ def main():
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--out", default="cache/fold0_subset_scores.csv")
+    ap.add_argument("--decode", choices=("argmax", "metrical"), default=None,
+                    help="override the checkpoint's own decoding rule")
+    ap.add_argument("--tau", type=float, default=None, help="override tau")
     args = ap.parse_args()
 
     device = f"cuda:{args.gpu}"
@@ -160,6 +163,10 @@ def main():
         model = load_model(c, device)
         if model is None:
             continue
+        if args.decode is not None:
+            model.decode = args.decode
+        if args.tau is not None:
+            model.tau = args.tau
         summary = summarize(score(model, loader, device))
         for group, v in summary.items():
             fh.write(f"{arm},{epoch},{group},{v[0]},{v[1]:.6f},{v[2]:.6f},{v[3]:.6f},"
