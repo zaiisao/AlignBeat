@@ -136,10 +136,14 @@ def decode_events_metrical(class_logits, t_hat, criterion, tau=0.5):
     probabilities = F.softmax(class_logits, dim=-1)
     event_mass = 1.0 - probabilities[..., BACKGROUND]
     keep = event_mass >= tau                                      # line 5
-    # Line 7 asks for the kept candidates in increasing t_hat. monotonic_times makes
-    # t_hat strictly increasing in the candidate index for any head output, so index
-    # order already IS time order and no sort is needed; see alignbeat.head.
+    # Line 7: relabel the kept candidates by increasing t_hat. monotonic_times is
+    # strictly increasing in the candidate index in fp32, but NOT under autocast: at
+    # N=188 fp16 collapses adjacent centres onto each other on ~6% of real fragments,
+    # and training runs precision="16-mixed". Since c_i(omega, L) is indexed by
+    # position, an inversion silently mislabels everything after it, so line 7 is
+    # performed rather than assumed.
     index = torch.nonzero(keep, as_tuple=False).flatten()
+    index = index[torch.argsort(t_hat[index], stable=True)]
     if index.numel() == 0:
         empty = index
         return empty, t_hat[empty], event_mass[empty]
