@@ -44,6 +44,8 @@ def main():
                          "log P(L), so charging it again per claimed event double-counts "
                          "the downbeat base rate -- and does so proportionally to how "
                          "many downbeats a hypothesis claims, i.e. biased toward large L")
+    ap.add_argument("--mixture", action="store_true",
+                    help="soft mixture over every candidate meter, the pre-argmax form")
     ap.add_argument("--uniform", action="store_true",
                     help="null pi_M, as meter_posterior.py does, to separate the "
                          "network's own evidence from the prior's contribution")
@@ -59,6 +61,7 @@ def main():
     path = sorted(glob.glob(args.checkpoint))[0]
     model = load(path, device)
     crit = model.subset_criterion
+    crit.meter_mixture = args.mixture
     if args.uniform:
         crit.meter_prior = None
     if args.flat:

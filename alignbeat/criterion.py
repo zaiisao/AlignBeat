@@ -57,7 +57,8 @@ class SubsetCriterion(nn.Module):
                  precision_prior_beta=PRECISION_PRIOR_BETA,
                  meter_candidates=(), estep_gamma=None,
                  beat_only_warmup=0, beat_only_confidence=0.0,
-                 hypothesis_class_prior=False, lambda_meter=0.0):
+                 hypothesis_class_prior=True, lambda_meter=0.0,
+                 meter_mixture=True, raw_beat_only_match=False):
         super(SubsetCriterion, self).__init__()
 
         self.omega_downbeat = omega_downbeat
@@ -114,7 +115,12 @@ class SubsetCriterion(nn.Module):
         # as log P(L). Charging it again per claimed downbeat double-counts the base
         # rate, and does so in proportion to how many downbeats a hypothesis claims:
         # exactly -1.008 * M/L nats, monotone in L, a standing push toward sparser
-        # meters. True restores the pre-fix form for A/B only.
+        # meters. Demonstrably wrong, but True remains the DEFAULT because it is what
+        # every trained arm ran and no experiment has yet shown the fix helps
+        # end-to-end. algorithm5_hard1 section 1.3 agrees it is a double-count but
+        # prescribes a different remedy -- divide by pi_data, then apply pi_C -- which
+        # needs pi_data measured. False is the interim fix: drop pi_C here, i.e. assume
+        # pi_C = pi_data.
         self.hypothesis_class_prior = hypothesis_class_prior
         # Algorithm 2 line 30's q_hat, trained where it can be. L is annotated on the
         # downbeat-labelled majority and latent on the rest, and nothing carried
@@ -124,6 +130,23 @@ class SubsetCriterion(nn.Module):
         # L. No new parameters and no pooled head: it trains the mechanism that already
         # exists rather than adding a second one beside it.
         self.lambda_meter = lambda_meter
+        # NOTE: True is the default because every arm to date ran it and nothing has
+        # shown otherwise; algorithm5_hard1 line 52 also keeps training soft, and puts
+        # the argmax at INFERENCE instead (Algorithm 3 line 20), which we do not have.
+        # False: marginalise the phases to get P(L | x), take the L that maximises it,
+        # and read r_i from that meter's phases alone. True: the old soft mixture over
+        # every candidate meter at once, which leaks the losing meters' downbeat
+        # patterns into r_i in proportion to their posterior mass. On beat-only
+        # fragments that mass is ~36% (L=2 0.178, L=6 0.066, L=8 0.064 against L=4's
+        # 0.637), so a third of every r_i came from a meter the posterior had rejected.
+        self.meter_mixture = meter_mixture
+        # algorithm5_hard1 line 20: the beat-only matching cost is -log(1 - p(empty)),
+        # the raw three-way head's own belief that j is a real event of either kind.
+        # Its note 24 rejects the prior-combined form we use, for the reason we found
+        # independently: sum_c P_hat(C=c | x, j) is identically 1, so that term is
+        # vacuous. Ours is the UNNORMALISED pi_C mixture, which is not vacuous but is
+        # not what the document asks for either. Off until an arm says otherwise.
+        self.raw_beat_only_match = raw_beat_only_match
         self.beat_only_warmup = beat_only_warmup
         self.beat_only_confidence = beat_only_confidence
 
@@ -183,9 +206,14 @@ class SubsetCriterion(nn.Module):
         # combined in: the cost is -log sum_c pi_C(c) p_j(c), the pi_C-weighted mixture
         # over {DB, B}. It stays phase- and meter-blind, since the DP needs Proposition
         # 5.1's additive separability and sigma is resolved before L is ever considered.
-        mixture = torch.logsumexp(
-            log_probabilities[:, [DOWNBEAT, BEAT]] + self.log_class_prior[None, :],
-            dim=-1, keepdim=True)
+        if self.raw_beat_only_match:
+            # -log(1 - p(empty)) == -log(p_DB + p_B), the raw head with no prior.
+            mixture = torch.logsumexp(
+                log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1, keepdim=True)
+        else:
+            mixture = torch.logsumexp(
+                log_probabilities[:, [DOWNBEAT, BEAT]] + self.log_class_prior[None, :],
+                dim=-1, keepdim=True)
         cost = -mixture.repeat(1, len(gt_class))                           # (N, M)
 
         cost[:, labelled] = -log_probabilities[:, gt_class[labelled]]
@@ -614,15 +642,26 @@ class SubsetCriterion(nn.Module):
         i0 = torch.arange(M, device=device)
         r = torch.zeros(M, device=device, dtype=match_likelihood.dtype)
         meter_posterior, prior_term, start = {}, 0.0, 0
+        chosen, best = None, None
         for meter in meters:
             block = log_joint[start:start + meter]
             start += meter
-            # Line 45's own singleton: within a meter exactly one psi calls event i a
-            # downbeat, namely psi = (-i) mod L, so no sum over psi is needed here.
-            r = r + block[(-i0) % meter].exp()
-            mass = float(block.logsumexp(dim=0).exp())
+            log_mass = block.logsumexp(dim=0)          # P(L | x): phases marginalised
+            mass = float(log_mass.exp())
             meter_posterior[meter] = mass
             prior_term -= mass * self._log_hypothesis_prior(meter)
+            # Within a meter exactly one psi calls event i a downbeat, namely
+            # psi = (-i) mod L, so no sum over psi is needed here.
+            if self.meter_mixture:
+                r = r + block[(-i0) % meter].exp()
+            elif best is None or float(log_mass) > best:
+                chosen, best = (meter, block), float(log_mass)
+
+        if not self.meter_mixture:
+            # The L that maximises P(L | x), with its own phases renormalised so they
+            # sum to 1 alone. Every other meter contributes nothing to r_i.
+            meter, block = chosen
+            r = (block - block.logsumexp(dim=0))[(-i0) % meter].exp()
 
         return r, meter_posterior, prior_term
 

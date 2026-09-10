@@ -28,16 +28,20 @@ def test_em_posterior_matches_brute_force_and_couples_events():
         matched_log = torch.log_softmax(torch.randn(M, 3, dtype=torch.float64) * 2, dim=-1)
         got, _, _ = criterion._compute_latent_posterior(matched_log)
 
-        # Each factor is the raw head output p_hat(c_i(p, L) | x), NOT prior-combined.
-        # c_i(p, L) is deterministic given the hypothesis, so no class uncertainty is
-        # left for pi_C to resolve; and pi_C(DB) = E[1/L] comes from METER_PRIOR, which
-        # is already applied once per hypothesis as log P(L). Including it here charges
-        # (log pi_C(DB) - log pi_C(B)) = -1.008 nats per claimed downbeat, i.e.
-        # -1.008 * M/L, which is monotone in L and reweights hypotheses purely by how
-        # many downbeats they claim. This test pinned that behaviour before it was
-        # identified as a double-count.
-        log_db = matched_log[:, DOWNBEAT]
-        log_b = matched_log[:, BEAT]
+        # The brute force must score hypotheses the same way the criterion is
+        # configured to. pi_C there is a double-count -- c_i(p, L) is deterministic
+        # given the hypothesis, and pi_C(DB) = E[1/L] is already applied as log P(L),
+        # so including it charges (log pi_C(DB) - log pi_C(B)) = -1.008 nats per
+        # claimed downbeat, i.e. -1.008 * M/L, monotone in L. It is still the default
+        # because no trained arm has shown the fix helps end-to-end; this test tracks
+        # the flag rather than asserting either form is the right one.
+        if criterion.hypothesis_class_prior:
+            log_prior_c = criterion.log_class_prior.to(matched_log.dtype)
+            log_db = matched_log[:, DOWNBEAT] + log_prior_c[DOWNBEAT]
+            log_b = matched_log[:, BEAT] + log_prior_c[BEAT]
+        else:
+            log_db = matched_log[:, DOWNBEAT]
+            log_b = matched_log[:, BEAT]
         log_norm = torch.logaddexp(log_db, log_b)
         log_pi = [float(sum((log_db[i0] if (p + i0) % L == 0 else log_b[i0]) - log_norm[i0]
                             for i0 in range(M)))
@@ -62,7 +66,17 @@ def test_em_surrogate_matches_the_direct_marginal_gradient():
     log-likelihood -log sum_h exp(score_h). Fisher's identity. The two values differ --
     the surrogate is a bound -- but only the gradient has to agree, and it does."""
 
+    # Fisher's identity is a property of SOFT EM. It needs the
+    # expectation under the FULL posterior, so it holds for the mixture over every
+    # (omega, L) -- the default, and what algorithm5_hard1 line 52 specifies for
+    # training -- and NOT for meter_mixture=False, which hard-selects argmax_L P(L | x).
+    # That is hard EM on the meter axis: exact in its own right, but optimising a
+    # MAP-conditioned surrogate rather than the marginal likelihood, so its gradient is
+    # deliberately not the marginal's. The second block pins that difference so it stays
+    # a choice, not an accident. (hard1 puts its own argmax at INFERENCE, Algorithm 3
+    # line 20, a decode path this repo does not have.)
     crit = SubsetCriterion(meter_candidates=(2, 3, 4, 5, 6, 8))
+    assert crit.meter_mixture, 'the soft mixture is the default; Fisher needs it'
     torch.manual_seed(0)
     logits = (torch.randn(9, 3, dtype=torch.float64) * 2).requires_grad_(True)
     matched = torch.log_softmax(logits, dim=-1)
@@ -74,10 +88,20 @@ def test_em_surrogate_matches_the_direct_marginal_gradient():
     with torch.no_grad():
         r, _, prior_term = crit._compute_latent_posterior(matched)
     surrogate = crit._beat_only_term(matched, r).sum() + prior_term
-    g_surrogate, = torch.autograd.grad(surrogate, logits)
+    g_surrogate, = torch.autograd.grad(surrogate, logits, retain_graph=True)
 
     assert torch.allclose(g_direct, g_surrogate, atol=1e-12), (g_direct, g_surrogate)
-    print("ok: EM surrogate (45) and the direct marginal share a gradient (Fisher)")
+
+    hard = SubsetCriterion(meter_candidates=(2, 3, 4, 5, 6, 8), meter_mixture=False)
+    with torch.no_grad():
+        r_h, _, prior_h = hard._compute_latent_posterior(matched)
+    g_hard, = torch.autograd.grad(
+        hard._beat_only_term(matched, r_h).sum() + prior_h, logits)
+    assert not torch.allclose(g_direct, g_hard, atol=1e-6), (
+        "hard meter selection must NOT reproduce the marginal's gradient; if it does, "
+        "the argmax is not actually restricting r_i to one meter")
+    print("ok: EM surrogate (45) shares a gradient with the direct marginal under the "
+          "soft mixture (Fisher), and deliberately does not under argmax L")
 
 
 def test_degenerate_meter_falls_back_to_eq9_not_a_confident_beat():
