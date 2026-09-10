@@ -1,0 +1,4 @@
+ckpt,min_gap_frac_of_ibi,n,F,CMLt,n_db,dbF,dbCMLt
+F_frozen S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.0,571,0.898433,0.826387,469,0.895430,0.824223
+F_frozen S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.5,571,0.904617,0.840581,469,0.902118,0.835682
+F_frozen S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=019.ckpt,0.7,571,0.904442,0.842117,469,0.902323,0.836459
