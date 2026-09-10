@@ -27,10 +27,18 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from alignbeat.classes import CLASS_UNKNOWN
+from alignbeat.classes import CLASS_UNKNOWN, DOWNBEAT
 from launch_scripts.oracle_ceiling import load
 
 CANDIDATES = (2, 3, 4, 5, 6, 8)
+
+
+def annotated_meter(gt_class):
+    """L read off the annotation: the modal gap between labelled downbeats. The
+    criterion used to carry this on Match, but nothing in the algorithm consumes L on a
+    labelled fragment, so it is computed here where it is actually wanted."""
+    pos = (gt_class == DOWNBEAT).nonzero(as_tuple=False).flatten().cpu().numpy()
+    return int(np.median(np.diff(pos))) if len(pos) >= 2 else 0
 
 
 @torch.no_grad()
@@ -60,9 +68,10 @@ def collect(model, loader, device, candidates):
             rows.append(dict(
                 dataset=batch["dataset"][i] if "dataset" in batch else "?",
                 M=M, beat_only=beat_only,
-                L_true=0 if beat_only else int(match.meter),
+                L_true=0 if beat_only else annotated_meter(gt_c),
                 L_hat=max(probs, key=probs.get), p_max=max(probs.values()),
-                p_true=(probs.get(int(match.meter), float("nan")) if not beat_only else float("nan")),
+                p_true=(probs.get(annotated_meter(gt_c), float("nan"))
+                        if not beat_only else float("nan")),
                 p4=probs.get(4, 0.0)))
     return rows
 

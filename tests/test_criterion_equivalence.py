@@ -5,7 +5,14 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
-from alignbeat.criterion import SubsetCriterion
+from alignbeat.classes import METER_PRIOR
+from alignbeat.criterion import LAMBDA_L1, SubsetCriterion
+
+DATA_PRIOR = {"downbeat": 0.2853, "beat": 0.7147}   # fold-0 pi_data, measured
+
+# pi_M restricted to a candidate set and renormalised, as the datamodule returns it.
+CORPUS = {L: METER_PRIOR[L] / sum(METER_PRIOR[c] for c in (2, 3, 4, 6))
+          for L in (2, 3, 4, 6)}
 
 GOLDEN = os.path.join(os.path.dirname(__file__), '_criterion_golden.pt')
 
@@ -13,12 +20,11 @@ GOLDEN = os.path.join(os.path.dirname(__file__), '_criterion_golden.pt')
 # v1 ships class + time + background. learn_b, the marginal objective (Alg. 4), the
 # periodicity term and the continuity term are all retired; git history has them.
 CONFIGS = [
-    ("default",        dict(gamma=0.5, omega_downbeat=2.0)),
-    ("omega4",         dict(gamma=0.5, omega_downbeat=4.0)),
-    ("beat_only_em",   dict(gamma=0.5, meter_candidates=(4,))),
-    ("latent_meter",   dict(gamma=0.5, meter_candidates=(2, 3, 4, 6))),
-    ("meter_prior",    dict(gamma=0.5, meter_candidates=(2, 3, 4, 6), meter_prior="corpus")),
-    ("no_normalize",   dict(gamma=0.5, normalize_by_events=False)),
+    ("default",        dict(gamma=0.5)),
+    ("gamma1",         dict(gamma=1.0)),
+    ("lambda_l1_2x",   dict(gamma=0.5, lambda_l1=2 * LAMBDA_L1)),
+    ("beat_only_em",   dict(gamma=0.5, meter_prior={4: 1.0})),
+    ("latent_meter",   dict(gamma=0.5, meter_prior=CORPUS)),
 ]
 
 # (label, batch, N, list of per-fragment M, label mode) -- includes the edge cases
@@ -56,8 +62,8 @@ def build(seed, batch, N, Ms, mode, device="cpu"):
 def run_case(cfg_kwargs, seed, shape):
     _, batch, N, Ms, mode = shape
     logits, t_hat, targets = build(seed, batch, N, Ms, mode)
-    crit = SubsetCriterion(**cfg_kwargs)
-    losses, stats = crit(logits, t_hat, torch.full_like(t_hat, 0.00233), targets)
+    crit = SubsetCriterion(DATA_PRIOR, **cfg_kwargs)
+    losses, stats = crit(logits, t_hat, targets)
     out = {k: v.detach().clone() for k, v in losses.items() if torch.is_tensor(v)}
     total = losses["total"]
     grad = torch.zeros_like(logits)

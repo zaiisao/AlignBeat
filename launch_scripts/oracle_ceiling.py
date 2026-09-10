@@ -65,8 +65,7 @@ def run(model, loader, device):
 
             # REAL: the model's own decode
             cls, times, _ = decode_events(pred["class_logits"][i].float(),
-                                          pred["t_hat"][i].float(),
-                                          model.tau_beat, model.tau_downbeat)
+                                          pred["t_hat"][i].float(), model.tau)
             real_sec = (times * window).cpu().numpy()
             real_is_db = (cls == DOWNBEAT).cpu().numpy()
 

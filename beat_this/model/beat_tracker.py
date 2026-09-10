@@ -34,14 +34,9 @@ class BeatThis(nn.Module):
         partial_transformers: bool = True,
         head_type: str = "dense",
         num_candidates: int = None,
-        downsample_mode: str = "learned",
         train_length: int = 1500,
         fps: int = 50,
         downsample_stages: int = None,
-        class_attention_layers: int = 0,
-        class_attention_heads: int = 4,
-        class_attention_pos: str = "none",
-        class_attention_final_norm: bool = False,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -101,12 +96,8 @@ class BeatThis(nn.Module):
             # JA: This is the bridge to our AlignBeat architecture
             self.task_heads = SubsetHead(
                 transformer_dim, num_candidates=num_candidates,
-                downsample_mode=downsample_mode, train_length=train_length, fps=fps,
-                downsample_stages=downsample_stages,
-                class_attention_layers=class_attention_layers,
-                class_attention_heads=class_attention_heads,
-                class_attention_pos=class_attention_pos,
-                class_attention_final_norm=class_attention_final_norm)
+                train_length=train_length, fps=fps,
+                downsample_stages=downsample_stages)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -117,7 +108,7 @@ class BeatThis(nn.Module):
 
         # ...then restore the subset head's own initialisation, which the generic pass
         # above would otherwise overwrite: the class prior on the classifier bias, the
-        # zeroed regression/class/precision weights, and the precision head's scale.
+        # zeroed regression and class weights.
         if isinstance(self.task_heads, SubsetHead):
             self.task_heads.head._initialize_weights()
 
@@ -321,14 +312,11 @@ class SubsetHead(nn.Module):
     """Progressive downsample T -> N, then the order-preserving alignment head."""
 
     def __init__(self, input_dim, num_candidates,
-                 downsample_mode="learned", train_length=1500, fps=50,
-                 downsample_stages=None,
-                 class_attention_layers=0, class_attention_heads=4,
-                 class_attention_pos="none", class_attention_final_norm=False):
+                 train_length=1500, fps=50,
+                 downsample_stages=None):
         super().__init__()
 
         self.downsample = Downsample(input_dim, num_candidates,
-                                     downsample_mode,
                                      fragment_frames=train_length,
                                      stages=downsample_stages)
 
@@ -341,11 +329,7 @@ class SubsetHead(nn.Module):
 
         self.head = SubsetSelectionHead(
             feature_size=input_dim,
-            window_seconds=train_length / float(fps),
-            class_attention_layers=class_attention_layers,
-            class_attention_heads=class_attention_heads,
-            class_attention_pos=class_attention_pos,
-            class_attention_final_norm=class_attention_final_norm)
+            window_seconds=train_length / float(fps))
 
     def forward(self, x):
         z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
@@ -356,9 +340,8 @@ class SubsetHead(nn.Module):
         # it as a fraction of what they passed in; candidates past 1.0 sit in the pad.
         downsample_factor = self.downsample.time_scale(x.shape[1])
         t_hat = out[1] if downsample_factor == 1.0 else out[1] * downsample_factor
-        b_hat = out[2]
 
-        return {"class_logits": out[0], "t_hat": t_hat, "b_hat": b_hat}
+        return {"class_logits": out[0], "t_hat": t_hat}
 
 
 class SumHead(nn.Module):

@@ -49,7 +49,7 @@ def fragment_offsets(total_frames, fragment_frames, border_frames):
 
 
 def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
-                 threshold_beat=0.2, threshold_downbeat=0.2, db_margin=0.0):
+                 tau=0.2):
     """Section 9.3 over one piece."""
     total_frames, num_mels = mel.shape
     fragments = fragment_offsets(total_frames, fragment_frames, border_frames)
@@ -75,8 +75,7 @@ def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
     all_classes, all_frames, all_scores = [], [], []
     for index, (offset, keep_start, keep_end) in enumerate(fragments):
         classes, times, scores = decode_events(
-            batched_class_logits[index], batched_t_hat[index],
-            threshold_beat, threshold_downbeat, db_margin=db_margin)
+            batched_class_logits[index], batched_t_hat[index], tau)
 
         if classes.numel() == 0:
             continue

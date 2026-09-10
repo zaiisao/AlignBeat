@@ -1,3 +1,4 @@
+import collections
 import concurrent.futures
 import itertools
 import json
@@ -470,6 +471,92 @@ class BeatDataModule(pl.LightningDataModule):
             self.predict_dataset, batch_size=1, num_workers=self.num_workers
         )
 
+
+    def get_train_class_prior(self, weight="stream"):
+        """pi_data: the DB:B balance in the data the class head is trained on, this fold.
+
+        Section 1.3's calibration assumption is that cross-entropy drives p_hat_j toward
+        the training set's own posterior, whose implicit prior is this. Measured from
+        train_dataset.items -- fold-excluded and oversampled, i.e. what the head
+        actually saw -- so no validation or test track informs a prior the model uses.
+
+        Only items carrying downbeat annotations are counted: those are the fragments
+        trained by plain cross-entropy against an observed class. Beat-only fragments
+        train the same head through the EM surrogate with soft r_i weights that move
+        during training, so the head's true implicit prior is a mixture and this is an
+        approximation of it -- a close one, labelled items being ~82% of the corpus.
+
+        weight: "stream" counts items as the loader presents them, with the length-based
+                oversampling; "track" counts each distinct piece once.
+        """
+        if weight not in ("stream", "track"):
+            raise ValueError(f"weight must be 'stream' or 'track', got {weight!r}")
+        downbeats = beats = 0
+        seen = set()
+        for item in self.train_dataset.items:
+            if not item["downbeat_mask"]:
+                continue
+            if weight == "track":
+                key = str(item["spect_path"])
+                if key in seen:
+                    continue
+                seen.add(key)
+            values = np.asarray(item["beat_value"]).astype(int)
+            downbeats += int((values == 1).sum())
+            beats += len(values)
+        if not beats:
+            raise ValueError("no labelled training beats; cannot estimate pi_data")
+        share = downbeats / beats
+        return {"downbeat": share, "beat": 1.0 - share}
+
+    def get_train_meter_prior(self, candidates=(2, 3, 4, 5, 6, 8),
+                              weight="stream", floor=1e-4):
+        """pi_M(L): the meter distribution of THIS fold's own training split.
+
+        weight:     "stream" counts train_dataset.items as they are, i.e. with the
+                    length-based oversampling the head actually sees; "track" counts
+                    each distinct piece once, as METER_DISTRIBUTION.md does.
+        floor:      every candidate's share is raised to at least this before
+                    renormalising, so a meter absent from a fold is improbable rather
+                    than impossible (an unfloored zero gives log pi_M = -inf, which
+                    removes it from the support outright).
+
+        Returns {L: probability} over `candidates`, summing to 1.
+        """
+        if weight not in ("stream", "track"):
+            raise ValueError(f"weight must be 'stream' or 'track', got {weight!r}")
+
+        counts = collections.Counter()
+        seen = set()
+        n_labelled = n_outside = 0
+        for item in self.train_dataset.items:
+            if not item["downbeat_mask"]:
+                continue
+            if weight == "track":
+                key = str(item["spect_path"])
+                if key in seen:
+                    continue
+                seen.add(key)
+            downbeats = np.flatnonzero(np.asarray(item["beat_value"]).astype(int) == 1)
+            if len(downbeats) < 2:
+                continue
+            meter = int(np.bincount(np.diff(downbeats)).argmax())
+            n_labelled += 1
+            if meter in candidates:
+                counts[meter] += 1
+            else:
+                n_outside += 1
+
+        if not counts:
+            raise ValueError(
+                "no training track has a modal meter among "
+                f"{tuple(candidates)}; cannot estimate pi_M")
+
+        observed = sum(counts[L] for L in candidates)
+        floored = {int(L): max(floor, counts[L] / observed) for L in candidates}
+        total = sum(floored.values())
+        prior = {L: p / total for L, p in floored.items()}
+        return prior
 
     def get_train_positive_weights(self, widen_target_mask=3):
         """

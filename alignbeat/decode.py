@@ -108,76 +108,9 @@ def estimate_beat_period(times, scores, threshold=0.2):
     return float(np.median(gaps)) if gaps.size else None
 
 
-def decode_events_coupled(class_logits, t_hat, beat_period, gamma=0.5, mu=1.0,
-                          threshold_beat=0.2, threshold_downbeat=0.2):
-    """Decoding that couples neighbouring candidates, in place of Algorithm 10."""
-    probabilities = F.softmax(class_logits, dim=-1)
-    log_probabilities = torch.log(probabilities.clamp_min(1e-12))
-    N = t_hat.shape[0]
-
-    if beat_period is None or N == 0:
-        return decode_events(class_logits, t_hat, threshold_beat, threshold_downbeat)
-
-    times = t_hat.detach().cpu().numpy().astype(np.float64)
-    logp = log_probabilities.detach().cpu().numpy().astype(np.float64)
-    # Fire as whichever active class the candidate itself prefers; the spacing term is
-    # about WHETHER a candidate fires, not which kind it is.
-    fire_class = np.where(logp[:, DOWNBEAT] >= logp[:, BEAT], DOWNBEAT, BEAT)
-    fire_cost = -logp[np.arange(N), fire_class]
-    stay_cost = -gamma * logp[:, BACKGROUND]
-
-    NONE = N                      # "nothing has fired yet" state
-    INF = np.inf
-    best = np.full(N + 1, INF)
-    best[NONE] = 0.0
-    back = np.full((N, N + 1), -1, dtype=np.int64)
-
-    for j in range(N):
-        gap = times[j] - np.concatenate([times, [0.0]])
-        penalty = mu * (gap - beat_period) ** 2
-        penalty[NONE] = 0.0       # the first event has no predecessor to be spaced from
-        fire_from = best + fire_cost[j] + penalty
-        source = int(np.argmin(fire_from))
-        new = best + stay_cost[j]                     # stay: last-fired index unchanged
-        back[j, :] = np.arange(N + 1)                 # provisional: everything stayed
-        if fire_from[source] < new[j]:
-            new[j] = fire_from[source]
-            back[j, j] = source
-        best = new
-
-    fired = []
-    k = int(np.argmin(best))
-    for j in range(N - 1, -1, -1):
-        if k == j:
-            fired.append(j)
-            k = int(back[j, j])
-    fired = np.array(sorted(fired), dtype=np.int64)
-    if fired.size == 0:
-        return decode_events(class_logits, t_hat, threshold_beat, threshold_downbeat)
-
-    keep = torch.as_tensor(fired, device=t_hat.device)
-    classes = torch.as_tensor(fire_class[fired], device=t_hat.device, dtype=torch.long)
-    scores = 1.0 - probabilities[keep, BACKGROUND]
-    return classes, t_hat[keep], scores
-
-
-def decode_events(class_logits, t_hat, threshold_beat=0.2, threshold_downbeat=0.2,
-                  db_margin=0.0):
-    """Algorithm 10 for one fragment: argmax per candidate, then threshold."""
+def decode_events(class_logits, t_hat, tau=0.2):
+    """Per-candidate argmax over {DB, B, empty}, kept when it clears tau."""
     probabilities = F.softmax(class_logits, dim=-1)
     scores, predicted = probabilities.max(dim=-1)
-
-    if db_margin != 0.0:
-        log_p = torch.log_softmax(class_logits, dim=-1)
-        relabelled = torch.where(
-            log_p[:, DOWNBEAT] - log_p[:, BEAT] > db_margin,
-            torch.full_like(predicted, DOWNBEAT), torch.full_like(predicted, BEAT))
-        predicted = torch.where(predicted == BACKGROUND, predicted, relabelled)
-        scores = probabilities.gather(1, predicted.unsqueeze(1)).squeeze(1)
-
-    thresholds = torch.where(
-        predicted == DOWNBEAT,
-        torch.full_like(scores, threshold_downbeat),
-        torch.full_like(scores, threshold_beat))
-    keep = (predicted != BACKGROUND) & (scores >= thresholds)
+    keep = (predicted != BACKGROUND) & (scores >= tau)
     return predicted[keep], t_hat[keep], scores[keep]

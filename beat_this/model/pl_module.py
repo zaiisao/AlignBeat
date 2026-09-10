@@ -26,6 +26,32 @@ from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
 
 
+# Architecture and decode settings that ride in subset_kwargs rather than in
+# PLBeatThis's own signature.
+SUBSET_ARCH_KEYS = ("num_candidates", "train_length", "downsample_stages",
+                    "stitch_border", "tau")
+
+
+def split_subset_kwargs(subset_kwargs):
+    """Split subset_kwargs into its (architecture/decode, criterion) halves.
+
+    Everything the subset head needs travels in one dict, so upstream PLBeatThis's own
+    18 arguments stay 18 plus head_type and subset_kwargs, rather than spreading our
+    additions across the signature. Keys SubsetCriterion accepts go to it; the caller
+    pops what it needs from the rest, which is checked here against SUBSET_ARCH_KEYS
+    so a typo or a retired knob fails loudly instead of being silently ignored.
+    """
+    sk = dict(subset_kwargs or {})
+    criterion_keys = set(inspect.signature(SubsetCriterion.__init__).parameters)
+    arch = {k: v for k, v in sk.items() if k not in criterion_keys}
+
+    unknown = set(arch) - set(SUBSET_ARCH_KEYS)
+    if unknown:
+        raise TypeError(f"unknown subset_kwargs: {', '.join(sorted(unknown))}")
+
+    return arch, {k: v for k, v in sk.items() if k in criterion_keys}
+
+
 class PLBeatThis(LightningModule):
     def __init__(
         self,
@@ -48,36 +74,26 @@ class PLBeatThis(LightningModule):
         sum_head=True,
         partial_transformers=True,
         head_type: str = "dense",
-        head_lr: float = 0.0,
-        quantize_targets: bool = False,
-        stitch_border: int = None,
-        num_candidates: int = None,
-        downsample_mode: str = "learned",
-        train_length: int = 1500,
-        downsample_stages: int = None,
-        class_attention_layers: int = 0,
-        class_attention_heads: int = 4,
-        class_attention_pos: str = "none",
-        class_attention_final_norm: bool = False,
         subset_kwargs: dict = None,
-        tau_beat: float = 0.2,
-        tau_downbeat: float = 0.2,
-        db_margin: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
+
+        arch, subset_kwargs = split_subset_kwargs(subset_kwargs)
+
+        num_candidates = arch.pop("num_candidates", None)
+        train_length = arch.pop("train_length", 1500)
+        downsample_stages = arch.pop("downsample_stages", None)
+
+        self.stitch_border = arch.pop("stitch_border", None)
+        self.tau = arch.pop("tau", 0.2)
+
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
-        self.quantize_targets = quantize_targets
-        self.stitch_border = stitch_border
-        self.head_lr = head_lr
-        self.tau_beat = tau_beat
-        self.tau_downbeat = tau_downbeat
         # Decode-time Bayes correction for omega_DB-weighted training; see
         # decode_events. Enters through __init__ with a default so old checkpoints
         # still load, and can be overridden at load_from_checkpoint time.
-        self.db_margin = db_margin
         # create model
         self.model = BeatThis(
             head_type=head_type,
@@ -91,14 +107,9 @@ class PLBeatThis(LightningModule):
             sum_head=sum_head,
             partial_transformers=partial_transformers,
             num_candidates=num_candidates,
-            downsample_mode=downsample_mode,
             train_length=train_length,
             fps=fps,
             downsample_stages=downsample_stages,
-            class_attention_layers=class_attention_layers,
-            class_attention_heads=class_attention_heads,
-            class_attention_pos=class_attention_pos,
-            class_attention_final_norm=class_attention_final_norm,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -109,17 +120,7 @@ class PLBeatThis(LightningModule):
         # selection. Nothing frame-wise applies, so the BCE variants below are skipped.
         self.subset_criterion = None
         if head_type == "subset":
-            # Checkpoints written before a knob was retired still carry it in their
-            # saved hyper_parameters, so drop anything the criterion no longer takes
-            # rather than refusing to load the run.
-            kwargs = dict(subset_kwargs or {})
-            accepted = set(inspect.signature(SubsetCriterion.__init__).parameters)
-            dropped = sorted(k for k in kwargs if k not in accepted)
-            if dropped:
-                print(f"[subset] ignoring retired criterion arguments from this "
-                      f"checkpoint: {', '.join(dropped)}", flush=True)
-                kwargs = {k: v for k, v in kwargs.items() if k in accepted}
-            self.subset_criterion = SubsetCriterion(**kwargs)
+            self.subset_criterion = SubsetCriterion(**subset_kwargs)
         elif loss_type == "shift_tolerant_weighted_bce":
             self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
                 pos_weight=pos_weights["beat"]
@@ -165,8 +166,7 @@ class PLBeatThis(LightningModule):
             classes, times, _scores = decode_events(
                 model_prediction["class_logits"][index].float(),
                 model_prediction["t_hat"][index].float(),
-                self.tau_beat, self.tau_downbeat,
-                db_margin=self.db_margin)
+                self.tau)
             seconds = (times * window_seconds).detach().cpu().numpy()
             classes = classes.detach().cpu().numpy()
             if padding_mask is not None:
@@ -197,21 +197,11 @@ class PLBeatThis(LightningModule):
             # unreachable by construction and would be an unmatchable event.
             keep = (beats > 0) & (beats <= window_seconds)
             beats = np.unique(beats[keep])   # unique, not just sorted: Definition 1
-            if self.quantize_targets:
-                # Round to the frame grid, which is what the DENSE head is necessarily
-                # trained on (its output is per-frame, so it cannot represent sub-frame
-                # targets). Off by default: eq. (1) produces a continuous time and
-                # Definition 1 is stated over continuous ground truth, so quantizing
-                # would degrade this head to match a limitation of the other one.
-                # Exposed as a flag because it is a real asymmetry in the A/B -- the
-                # subset arm otherwise sees ground truth up to 1/(2*fps) = 10 ms more
-                # precise than the dense arm does -- and its size should be measured
-                # rather than argued about.
-                beats = np.round(beats * self.fps) / self.fps
             if has_downbeats:
                 classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
             else:
                 classes = np.full(len(beats), CLASS_UNKNOWN)
+
             targets.append({
                 "times": torch.as_tensor(beats / window_seconds,
                                          dtype=torch.float32, device=device),
@@ -224,7 +214,6 @@ class PLBeatThis(LightningModule):
             losses, _stats = self.subset_criterion(
                 model_prediction["class_logits"].float(),
                 model_prediction["t_hat"].float(),
-                model_prediction["b_hat"].float(),
                 self._subset_targets(batch))
 
             # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
@@ -331,19 +320,6 @@ class PLBeatThis(LightningModule):
                 sync_dist=True,
             )
 
-    def on_before_optimizer_step(self, optimizer):
-        """Formerly held b_j at its init for the first 30% of the run.
-
-        Removed: b_j is detached from t_hat's gradient, from the DP (global b), and from
-        the trunk (z.detach()), so the warm-up has nothing left to guard. Kept as a hook
-        so the gate can be reinstated if b_hat's trajectory says it was needed. If it is,
-        drop the gradient (set it to None) rather than zeroing it: AdamW skips a
-        parameter whose grad is None, but would still apply weight decay and momentum
-        to a zero one.
-        """
-        if self.subset_criterion is None:
-            return
-
     def training_step(self, batch, batch_idx):
         # run the model
         model_prediction = self.model(batch["spect"])
@@ -449,8 +425,7 @@ class PLBeatThis(LightningModule):
             border = 2 * getattr(getattr(self, "beat_loss", None), "tolerance", 3)
 
         classes, frames, _scores = stitch_piece(
-            batch["spect"][0], forward_fn, chunk_size, border,
-            self.tau_beat, self.tau_downbeat, db_margin=self.db_margin)
+            batch["spect"][0], forward_fn, chunk_size, border, self.tau)
 
         seconds = (frames / self.fps).detach().cpu().numpy()
         classes = classes.detach().cpu().numpy()
@@ -472,19 +447,16 @@ class PLBeatThis(LightningModule):
         # suits it while the head keeps the rate that keeps it stable.
         def _is_head(name):
             return name.startswith("model.task_heads") or name.startswith("subset_criterion")
-        head_lr = self.head_lr if self.head_lr > 0 else self.lr
+        head_lr = self.lr
         groups, seen = [], set()
         for tag, pred, lr in (("encoder", lambda n: not _is_head(n), self.lr),
                               ("head",    _is_head,                  head_lr)):
             for decay, keep in (("decay", lambda p: p.ndim >= 2), ("nodecay", lambda p: p.ndim <= 1)):
                 # No requires_grad filter: configure_optimizers runs once, at fit
-                # start, so filtering here permanently excludes anything frozen at
-                # construction -- the precision head was, and the epoch-30 thaw in
-                # training_step then flipped a flag on a tensor no optimizer owned, so
-                # b_hat never moved off its init in any run. requires_grad already
-                # controls whether a parameter RECEIVES a gradient; a frozen one keeps
-                # p.grad = None and AdamW skips it, so freezing still works and thawing
-                # now takes effect.
+                # start, so filtering here would permanently exclude anything frozen at
+                # construction. requires_grad already controls whether a parameter
+                # RECEIVES a gradient; a frozen one keeps p.grad = None and AdamW skips
+                # it, so freezing still works and thawing takes effect.
                 ps = [p for n, p in self.named_parameters()
                       if pred(n) and keep(p) and id(p) not in seen]
                 for p in ps: seen.add(id(p))

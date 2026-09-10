@@ -24,6 +24,24 @@ from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
 from launch_scripts.oracle_ceiling import load
 
 
+def downbeat_mass(crit, pi, M):
+    """r_i = P(event i is a downbeat): pi_{omega,L} summed over the hypotheses whose
+    pattern c_i(omega, L) calls i a downbeat. The criterion no longer forms this --
+    line 52 is a dot product over hypotheses -- but a per-event probability is what a
+    diagnostic wants, so rebuild it here from the E-step's own pi."""
+    i0 = torch.arange(M, device=pi.device)
+    r = torch.zeros(M, device=pi.device, dtype=pi.dtype)
+    start = 0
+    for meter in crit.meter_candidates:
+        meter = int(meter)
+        if meter <= 1 or M < meter:
+            continue
+        block = pi[start:start + meter]
+        start += meter
+        r = r + block[(-i0) % meter]
+    return r
+
+
 def true_meter(classes):
     """The annotated L: the modal gap between consecutive downbeats."""
     pos = (classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
@@ -44,8 +62,6 @@ def main():
                          "log P(L), so charging it again per claimed event double-counts "
                          "the downbeat base rate -- and does so proportionally to how "
                          "many downbeats a hypothesis claims, i.e. biased toward large L")
-    ap.add_argument("--mixture", action="store_true",
-                    help="soft mixture over every candidate meter, the pre-argmax form")
     ap.add_argument("--uniform", action="store_true",
                     help="null pi_M, as meter_posterior.py does, to separate the "
                          "network's own evidence from the prior's contribution")
@@ -61,7 +77,6 @@ def main():
     path = sorted(glob.glob(args.checkpoint))[0]
     model = load(path, device)
     crit = model.subset_criterion
-    crit.meter_mixture = args.mixture
     if args.uniform:
         crit.meter_prior = None
     if args.flat:
@@ -96,18 +111,19 @@ def main():
             # branch of class_nll exactly as it is on real beat-only data.
             masked = torch.full_like(gt_c, CLASS_UNKNOWN)
             m = crit._e_step(log_p, pred["t_hat"][i], masked, gt_t)
-            if m.r is None:
+            if m.pi is None:
                 continue
+            r = downbeat_mass(crit, m.pi, gt_c.numel())
             n_frag += 1
             post = crit._meter_log_posterior(log_p[torch.from_numpy(m.sigma).to(device)])
             L_hat = max(post, key=lambda L: float(post[L]))
             conf[(L_true, L_hat)] += 1
 
             is_db = (gt_c == DOWNBEAT)
-            called = m.r > 0.5
+            called = r > 0.5
             ev_tp += int((called & is_db).sum());  ev_fp += int((called & ~is_db).sum())
             ev_fn += int((~called & is_db).sum()); ev_tn += int((~called & ~is_db).sum())
-            r_on_db += m.r[is_db].tolist(); r_on_b += m.r[~is_db].tolist()
+            r_on_db += r[is_db].tolist(); r_on_b += r[~is_db].tolist()
 
     print(f"\nGTZAN, labels masked, {'UNIFORM' if args.uniform else 'corpus'} pi_M, "
           f"{'FLAT' if args.flat else 'corpus'} pi_C")

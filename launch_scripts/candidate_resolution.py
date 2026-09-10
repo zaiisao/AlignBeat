@@ -51,7 +51,6 @@ def collect(model, loader, device):
             if M < 2 or M > N:
                 continue
             logp = F.log_softmax(pred["class_logits"][i], -1)
-            b_j = crit.b_min + pred["b_hat"][i]
             cost = crit.build_cost(logp, pred["t_hat"][i], gt_c, gt_t)
             frags.append(dict(
                 time_scale=model.model.task_heads.downsample.time_scale(batch["spect"].shape[1]),

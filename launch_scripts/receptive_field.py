@@ -54,7 +54,7 @@ def main():
         T = x.shape[1]
         x = x.detach().requires_grad_(True)
         out = net.task_heads(x)
-        logits, t_hat, b_hat = out["class_logits"][0], out["t_hat"][0], out["b_hat"][0]
+        logits, t_hat = out["class_logits"][0], out["t_hat"][0]
         N = logits.shape[0]
         stride = T / N
         logp = F.log_softmax(logits, -1)

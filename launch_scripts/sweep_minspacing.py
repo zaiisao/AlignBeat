@@ -52,9 +52,7 @@ def cache_forward(model, loader, device):
             truth = np.frombuffer(batch["truth_orig_beat"][i])
             if len(truth) < 3:
                 continue
-            cls, times, score = decode_events(pred["class_logits"][i], pred["t_hat"][i],
-                                              model.tau_beat, model.tau_downbeat,
-                                              db_margin=model.db_margin)
+            cls, times, score = decode_events(pred["class_logits"][i], pred["t_hat"][i], model.tau)
             sec = (times * window).cpu().numpy()
             cls = cls.cpu().numpy(); score = score.cpu().numpy()
             if pad is not None:

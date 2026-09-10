@@ -32,7 +32,7 @@ from launch_scripts.oracle_ceiling import load
 
 
 @torch.no_grad()
-def run(model, loader, device, legacy=False):
+def run(model, loader, device):
     from alignbeat.decode import decode_events
     crit = model.subset_criterion
     rows = []
@@ -67,18 +67,9 @@ def run(model, loader, device, legacy=False):
             # --- matchings -------------------------------------------------------
             sigma_time = subset_select_dp(np.abs(gt_t[:, None] - t_hat[None, :]))
             logp = F.log_softmax(logits, dim=-1)
-            if legacy:
-                # the pre-eq.(5) E-step: eps-insensitive L1 over the per-candidate b_j
-                from alignbeat.criterion import EPS
-                laplace = crit.b_min + pred["b_hat"][i]
-                class_cost = crit.class_nll(logp, target["classes"])
-                time_cost = ((t_hat_t[None, :] - target["times"][:, None]).abs()
-                             .sub(EPS).clamp(min=0.0) / laplace)
-                full_cost = class_cost + time_cost - crit.gamma * (-logp[:, BACKGROUND])[None, :]
-            else:
-                full_cost = crit.build_cost(logp, t_hat_t, target["classes"], target["times"])
-                class_cost = crit.class_nll(logp, target["classes"])
-                time_cost = crit.l1(t_hat_t[None, :], target["times"][:, None])
+            full_cost = crit.build_cost(logp, t_hat_t, target["classes"], target["times"])
+            class_cost = crit.class_nll(logp, target["classes"])
+            time_cost = crit.l1(t_hat_t[None, :], target["times"][:, None])
             sigma_full = subset_select_dp(full_cost.cpu().numpy())
 
             argmax = logits.argmax(-1).cpu().numpy()
@@ -86,7 +77,7 @@ def run(model, loader, device, legacy=False):
             score, _ = probs.max(-1)
             score = score.cpu().numpy()
             fires_thresh = (argmax != BACKGROUND) & (
-                score >= np.where(argmax == DOWNBEAT, model.tau_downbeat, model.tau_beat))
+                score >= model.tau)
 
             differ = sigma_time != sigma_full
             if differ.any():
@@ -115,10 +106,9 @@ def run(model, loader, device, legacy=False):
             matched = np.zeros(N, dtype=bool); matched[sigma_time] = True
             true_class = np.full(N, BEAT); true_class[sigma_time] = np.where(
                 gt_c == DOWNBEAT, DOWNBEAT, BEAT)
-            model_db = (logp[:, DOWNBEAT] - logp[:, BEAT] > model.db_margin).cpu().numpy()
+            model_db = (logp[:, DOWNBEAT] > logp[:, BEAT]).cpu().numpy()
 
-            cls, times, _ = decode_events(logits, t_hat_t, model.tau_beat,
-                                          model.tau_downbeat, db_margin=model.db_margin)
+            cls, times, _ = decode_events(logits, t_hat_t, model.tau)
             real_sec = (times * window).cpu().numpy()
             real_db = (cls == DOWNBEAT).cpu().numpy()
             fired = np.zeros(N, dtype=bool)
@@ -173,7 +163,6 @@ def main():
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--legacy", action="store_true", help="score the E-step as before eq. (5)")
     args = ap.parse_args()
 
     from beat_this.dataset import BeatDataModule
@@ -184,7 +173,7 @@ def main():
     dm.setup(stage="fit")
     device = f"cuda:{args.gpu}"
     rows, agg = run(load(sorted(glob.glob(args.checkpoint))[0], device),
-                    dm.val_dataloader(), device, legacy=args.legacy)
+                    dm.val_dataloader(), device)
 
     def show(name, sel):
         if not sel: return

@@ -53,7 +53,7 @@ def main():
             with torch.autocast("cuda", dtype=torch.float16):
                 pred = model.model(batch["spect"])
             cls_pred, _, _ = decode_events(pred["class_logits"][0].float(),
-                                           pred["t_hat"][0].float(), 0.2, 0.2)
+                                           pred["t_hat"][0].float(), 0.2)
             gt_c = model._subset_targets(batch)[0]["classes"].cpu().numpy()
             Lp, Lt = bar_lengths(cls_pred.cpu().numpy()), bar_lengths(gt_c)
             if len(Lt) < 2 or len(Lp) < 2:

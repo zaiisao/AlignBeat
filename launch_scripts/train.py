@@ -73,7 +73,6 @@ def main(args):
     datamodule = BeatDataModule(
         data_dir,
         batch_size=args.batch_size,
-        train_length=args.train_length,
         spect_fps=args.fps,
         num_workers=args.num_workers,
         test_dataset="gtzan",
@@ -84,18 +83,33 @@ def main(args):
         fold=args.fold,
     )
 
-    if args.dbn and args.head_type == "subset":
-        # The DBN postprocessor consumes frame-wise activations; the alignment head
-        # emits per-candidate events and never builds them, so use_dbn would be silently
-        # ignored. Refuse rather than report DBN numbers that were not produced by one.
-        parser.error("--dbn is not supported with --head_type subset: the alignment "
-                     "head emits events, not the frame-wise activations a DBN needs.")
+    # Parsed before setup so the meter prior below is measured over exactly the
+    # candidate set the criterion will marginalise over.
+    meter_candidates = tuple(int(v) for v in args.meter_candidates.split(","))
 
     datamodule.setup(stage="fit")
 
     # compute positive weights
     pos_weights = datamodule.get_train_positive_weights(widen_target_mask=3)
     print("Using positive weights: ", pos_weights)
+
+    meter_prior = data_prior = None
+    if args.head_type == "subset":
+        if args.dbn:
+            # The DBN postprocessor consumes frame-wise activations; the alignment head
+            # emits per-candidate events and never builds them, so use_dbn would be
+            # silently ignored. Refuse rather than report DBN numbers that were not
+            # produced by one.
+            parser.error("--dbn is not supported with --head_type subset: the alignment "
+                         "head emits events, not the frame-wise activations a DBN needs.")
+
+        # pi_M from THIS fold's training split, so no validation or test track informs a
+        # prior the model then uses.
+        meter_prior = datamodule.get_train_meter_prior(candidates=meter_candidates)
+        data_prior = datamodule.get_train_class_prior()
+        print("Using meter prior: ", {L: round(p, 5) for L, p in sorted(meter_prior.items())})
+        print("Using data prior:  ", {k: round(v, 5) for k, v in data_prior.items()})
+
     if args.lr is None:
         args.lr = 3e-4 if args.head_type == "subset" else 8e-4
         print(f"[lr] {args.lr:g} resolved from head_type={args.head_type}", flush=True)
@@ -111,8 +125,6 @@ def main(args):
     print(f"[subset] N={num_candidates} from {downsample_stages} halvings of "
           f"{args.train_length} (tempo floor at {args.bpm_max} bpm: {tempo_floor})",
           flush=True)
-
-    meter_candidates = tuple(int(v) for v in args.meter_candidates.split(","))
 
     pl_model = PLBeatThis(
         spect_dim=128,
@@ -134,37 +146,21 @@ def main(args):
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
         head_type=args.head_type,
-        head_lr=args.head_lr,
-        quantize_targets=args.quantize_targets,
-        num_candidates=num_candidates,
-        stitch_border=args.stitch_border,
-        downsample_mode=args.downsample_mode,
-        train_length=args.train_length,
-        downsample_stages=downsample_stages,
-        class_attention_layers=args.class_attention_layers,
-        class_attention_heads=args.class_attention_heads,
-        class_attention_pos=args.class_attention_pos,
-        class_attention_final_norm=args.class_attention_final_norm,
-        tau_beat=args.tau_beat,
-        tau_downbeat=args.tau_downbeat,
-        db_margin=args.db_margin,
-        # Every SubsetCriterion knob is passed explicitly. A construction that is
-        # implemented but has no path from the CLI is worse than one that is absent:
-        # an ablation of it shows no difference and reads as "the idea does not help",
-        # when in fact it never ran.
+        # Everything the subset head needs travels in one dict; pl_module splits it
+        # into architecture and criterion halves. A knob implemented but with no path
+        # from the CLI is worse than one that is absent: an ablation of it shows no
+        # difference and reads as "the idea does not help", when in fact it never ran.
         subset_kwargs={
+            # architecture and decode
+            "num_candidates": num_candidates,
+            "train_length": args.train_length,
+            "downsample_stages": downsample_stages,
+            "stitch_border": args.stitch_border,
+            "tau": args.tau,
+            # criterion
             "gamma": args.gamma,
-            "omega_downbeat": args.omega_db,
-            "meter_candidates": meter_candidates,
-            "estep_gamma": args.estep_gamma,
-            "hypothesis_class_prior": args.hypothesis_class_prior,
-            "lambda_meter": args.lambda_meter,
-            "meter_mixture": args.meter_mixture,
-            "raw_beat_only_match": args.raw_beat_only_match,
-            "beat_only_warmup": args.beat_only_warmup,
-            "beat_only_confidence": args.beat_only_confidence,
-            "normalize_by_events": args.normalize_by_events,
-            "background_by_unmatched": args.background_by_unmatched,
+            "meter_prior": meter_prior,
+            "data_prior": data_prior,
         },
     )
     # --- frozen-encoder head swap -------------------------------------------------
@@ -305,8 +301,7 @@ if __name__ == "__main__":
     # No single default is right for both heads: the dense control loses 0.025 joint at
     # 3e-4 (0.894 vs 0.919), while the subset head collapses at 8e-4 (0.617 at ep4 ->
     # 0.545 at ep9). Left unset, the rate is resolved from --head_type in main(); an
-    # explicit --lr still wins. Do NOT pair 8e-4 with --head_lr 3e-4: that is the
-    # disc_lr2 arm, 0.649 at ep17, killed (docs/ABLATIONS.md).
+    # explicit --lr still wins.
     parser.add_argument("--lr", type=float, default=None,
                         help="default: 3e-4 for --head_type subset, 8e-4 for dense")
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -348,6 +343,9 @@ if __name__ == "__main__":
                         choices=["dense", "subset"])
     parser.add_argument("--train_length", type=int, default=1500,
                         help="T, the excerpt length in frames; N is derived from it")
+    parser.add_argument("--tau", type=float, default=0.2,
+                        help="detection threshold. algorithm5_hard-1 Algorithm 3 line 5 "
+                             "keeps candidates whose 1 - p_j(empty) clears it")
     parser.add_argument("--stitch_border", type=int, default=None,
                         help="frames discarded either side of a chunk seam at whole-piece "
                              "inference; defaults to the dense arm's 2*tolerance so both "
@@ -356,100 +354,18 @@ if __name__ == "__main__":
                         help="candidate meters M the beat-only E-step marginalises "
                              "over, e.g. 2,3,4,6; pi_M is the corpus table in "
                              "docs/METER_DISTRIBUTION.md, renormalised over these")
-    parser.add_argument("--downsample_mode", type=str, default="learned",
-                        choices=["learned", "avg", "max"],
-                        help="how T frames become N candidates: a strided conv "
-                             "(learned, best so far), or parameter-free avg/max pooling")
     parser.add_argument("--bpm_max", type=float, default=BPM_MAX,
                         help=f"fastest tempo the corpus contains (default {BPM_MAX:g}); "
                              "N is derived from it and the window length")
-    # Section 10.2. Defaults follow the best recorded arms (docs/ABLATIONS.md): the
-    # frozen screen at 0.899 and final100_subset at 0.892 both ran one attention layer
-    # with index positions. Pass 0 to ablate it back out.
-    parser.add_argument("--class_attention_layers", type=int, default=1)
-    parser.add_argument("--class_attention_heads", type=int, default=4)
-    parser.add_argument("--class_attention_final_norm", action="store_true", default=False,
-                        help="add the pre-LN transformer's missing final LayerNorm to "
-                             "the candidate-attention stack (see alignbeat/head.py)")
-    parser.add_argument("--class_attention_pos", type=str, default="index",
-                        choices=("none", "index", "time"),
-                        help="positional signal for the candidate attention: "
-                             "ordinal beat number, or t_hat")
-    parser.add_argument("--tau_beat", type=float, default=0.2)
-    parser.add_argument("--tau_downbeat", type=float, default=0.2)
     parser.add_argument("--init_encoder_from", type=str, default="",
                         help="checkpoint to copy frontend+transformer_blocks from; "
                              "the head is always freshly initialised")
-    parser.add_argument("--head_lr", type=float, default=0.0,
-                        help="separate lr for the head (task_heads + criterion); 0 = use --lr "
-                             "for everything. Lets the encoder train at the rate that suits "
-                             "it while the head keeps a rate it is stable at.")
     parser.add_argument("--init_all_from", type=str, default="",
                         help="load the FULL model (encoder+head) from a checkpoint, with a "
                              "fresh optimizer and schedule; for thawing a converged pair")
     parser.add_argument("--freeze_encoder", action="store_true",
                         help="train only task_heads, with the encoder held fixed")
-    parser.add_argument("--db_margin", type=float, default=0.0,
-                        help="B-vs-DB decode margin: call DOWNBEAT only if "
-                             "log p(DB) - log p(B) exceeds this. log(omega_db) "
-                             "undoes the class-weighted training bias; 0 keeps "
-                             "Algorithm 10's plain argmax. See decode_events.")
     parser.add_argument("--gamma", type=float, default=0.5)
-    # Loss (8) is a plain sum; dividing by M is a local addition. It makes a fragment's
-    # background term weigh gamma*(N-M)/M against its class term, which runs from 3.3 at
-    # 25 events to 0.5 at 92 -- so slow fragments carry ~6x the loss of fast ones and
-    # dominate the batch gradient. --no_normalize_by_events restores eq. (8) verbatim.
-    parser.add_argument("--no_normalize_by_events", dest="normalize_by_events",
-                        action="store_false", default=True,
-                        help="divide loss (8) by nothing, as the paper writes it, "
-                             "instead of by the fragment's event count M")
-    parser.add_argument("--background_by_unmatched", action="store_true", default=False,
-                        help="divide the background term by N-M rather than M, so it is "
-                             "a mean like the class term; removes the tempo-dependent "
-                             "gamma*(N-M)/M weight without rescaling the loss")
-    # 4.0, not the criterion's own 2.0: every recorded subset result used 4 (see the
-    # base command in docs/ABLATIONS.md). No 2-vs-4 comparison has been run.
-    parser.add_argument("--omega_db", type=float, default=4.0)
-    parser.add_argument("--meter_argmax", dest="meter_mixture", action="store_false",
-                        default=True,
-                        help="beat-only r_i from argmax_L P(L | x) alone instead of the "
-                             "soft mixture over every candidate meter. Untested; the "
-                             "mixture is the default and is what algorithm5_hard1 line "
-                             "52 specifies for training (its argmax is at inference)")
-    parser.add_argument("--raw_beat_only_match", action="store_true", default=False,
-                        help="beat-only matching cost as -log(1 - p_j(empty)), the raw "
-                             "three-way head (algorithm5_hard1 line 20), instead of the "
-                             "pi_C-weighted mixture over {DB, B}")
-    parser.add_argument("--lambda_meter", type=float, default=0.0,
-                        help="weight on -log P(L_true | x), eq. (33)'s meter posterior "
-                             "from the matched candidates' class probabilities, on "
-                             "downbeat-labelled fragments only. Trains the q_hat the "
-                             "beat-only E-step marginalises over (Algorithm 2 line 30) "
-                             "without a separate meter head. 0 disables it")
-    parser.add_argument("--no_hypothesis_class_prior", dest="hypothesis_class_prior",
-                        action="store_false", default=True,
-                        help="drop pi_C from the (omega, L) scoring. It is there by "
-                             "log pi_C to each event's class term. That charges "
-                             "1.008 nats per claimed downbeat, i.e. -1.008*M/L, "
-                             "biasing the meter posterior toward sparse meters. "
-                             "For A/B only; the fixed form is the default")
-    parser.add_argument("--beat_only_warmup", type=int, default=0,
-                        help="hold the plain marginal (eq. 9) on beat-only fragments "
-                             "for this many training steps before the EM surrogate "
-                             "takes over. Was 2000 until the beat-only rework")
-    parser.add_argument("--beat_only_confidence", type=float, default=0.0,
-                        help="per-event gate on the EM surrogate: where "
-                             "max(r, 1-r) is below this, use the marginal instead. "
-                             "Was 0.7 until the beat-only rework; 0 disables it")
-    parser.add_argument("--estep_gamma", type=float, default=None,
-                        help="weight on the background correction inside the MATCHING "
-                             "cost, separate from --gamma's weight in the loss. Default "
-                             "(unset) ties it to --gamma, which is what every arm to "
-                             "date ran; 0 gives algorithm5 v5-2's own match cost, "
-                             "-log p_j(c_i) + lambda_L1 |t_i - t_hat_j|")
-    parser.add_argument("--quantize_targets", action="store_true", default=False,
-                        help="round ground-truth event times to the frame grid, matching "
-                             "what the dense head is necessarily trained on")
     # NOTE: --train_length (underscore) is defined above and owns dest=train_length.
     # A second "--train-length" action used to be declared here with its own default;
     # both wrote the same dest, so whichever was declared later silently won. Kept as a
