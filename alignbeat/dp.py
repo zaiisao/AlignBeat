@@ -162,3 +162,37 @@ def subset_posterior_marginals(cost):
         w[i - 1] = D[i - 1, 0:N] - cost[i - 1] + E[i, 1:] - log_z
     return w.exp()
 
+
+
+def subset_select_logz(cost):
+    """log sum_sigma exp(-cost(sigma)): the partition function over ALL order-preserving
+    injections, by the same recursion as subset_select_dp with min replaced by logsumexp.
+
+    Section 4.1's denominator. subset_select_dp returns the single cheapest sigma; this
+    returns what that sigma is competing against, so the two together give section 4.2's
+
+        log m(theta, x) = -cost(sigma_hat) - log Z
+
+    i.e. sigma_hat's own share of the timing posterior. cost must be the TIMING cost
+    alone -- P_1 is defined under timing evidence only -- so pass lambda_l1 * |t - t_hat|
+    without the class term.
+    """
+    M, N = cost.shape
+    if M == 0:
+        return 0.0
+    if M > N:
+        return float("-inf")
+
+    # previous[j] = log sum over ways to match the first i events into candidates < j.
+    # The empty prefix has exactly one such way (the empty matching) at every j.
+    previous = np.zeros(N + 1, dtype=np.float64)
+    current = np.empty(N + 1, dtype=np.float64)
+    for i in range(1, M + 1):
+        running = -np.inf
+        for j in range(N):
+            # Either event i-1 takes candidate j, or it does not and j is skipped.
+            running = np.logaddexp(running, previous[j] - cost[i - 1, j])
+            current[j + 1] = running
+        current[0] = -np.inf
+        previous, current = current, previous
+    return float(previous[N])
