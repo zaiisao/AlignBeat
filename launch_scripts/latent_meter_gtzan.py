@@ -84,6 +84,8 @@ def main():
 
     conf = collections.Counter(); n_frag = 0
     ev_tp = ev_fp = ev_fn = ev_tn = 0
+    hd_tp = hd_fp = hd_fn = hd_tn = 0     # the head's own DB/B argmax, what decode uses
+    both_right = r_only = head_only = 0
     r_on_db, r_on_b = [], []
     for batch in dm.test_dataloader():
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -125,6 +127,17 @@ def main():
             ev_fn += int((~called & is_db).sum()); ev_tn += int((~called & ~is_db).sum())
             r_on_db += r[is_db].tolist(); r_on_b += r[~is_db].tolist()
 
+            # What decode_events does today: each matched candidate independently takes
+            # argmax over DB/B, with no bar-phase constraint tying the events together.
+            span = log_p[torch.from_numpy(m.sigma).to(device)]
+            head = span[:, DOWNBEAT] > span[:, BEAT]
+            hd_tp += int((head & is_db).sum());  hd_fp += int((head & ~is_db).sum())
+            hd_fn += int((~head & is_db).sum()); hd_tn += int((~head & ~is_db).sum())
+            agree_r = (called == is_db); agree_h = (head == is_db)
+            both_right += int((agree_r & agree_h).sum())
+            r_only += int((agree_r & ~agree_h).sum())
+            head_only += int((agree_h & ~agree_r).sum())
+
     print(f"\nGTZAN, labels masked, {'UNIFORM' if args.uniform else 'corpus'} pi_M, "
           f"{'FLAT' if args.flat else 'corpus'} pi_C")
     print(f"checkpoint: {Path(path).name}")
@@ -152,7 +165,15 @@ def main():
     print(f"\n2  r_i as a downbeat call, over {ev} events")
     print(f"     accuracy {acc:.1f}%   |  always-B baseline {base:.1f}%   -> {acc-base:+.1f} pts")
     print(f"     precision {prec:.1f}%   recall {rec:.1f}%   (tp {ev_tp} fp {ev_fp} fn {ev_fn})")
-    print(f"\n3  mean r_i on true downbeats {np.mean(r_on_db):.3f} "
+    hacc = 100 * (hd_tp + hd_tn) / max(ev, 1)
+    hprec = 100 * hd_tp / max(hd_tp + hd_fp, 1); hrec = 100 * hd_tp / max(hd_tp + hd_fn, 1)
+    print(f"\n3  the head's own argmax on the same events -- what decode_events uses")
+    print(f"     accuracy {hacc:.1f}%   precision {hprec:.1f}%   recall {hrec:.1f}%"
+          f"   (tp {hd_tp} fp {hd_fp} fn {hd_fn})")
+    print(f"     r_i - head: {acc - hacc:+.1f} pts")
+    print(f"     r_i right where head wrong: {r_only}   head right where r_i wrong: {head_only}")
+
+    print(f"\n4  mean r_i on true downbeats {np.mean(r_on_db):.3f} "
           f"(should approach 1) | on true beats {np.mean(r_on_b):.3f} (should approach 0)")
     und = np.mean([1.0 for v in r_on_db + r_on_b if max(v, 1 - v) < 0.7])
     print(f"     events the 0.7 confidence gate would refuse: "
