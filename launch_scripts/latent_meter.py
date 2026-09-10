@@ -1,4 +1,11 @@
-"""Does the latent meter work?  Masked-label test on held-out GTZAN.
+"""Does the latent meter work?  Masked-label test on annotated data.
+
+Two splits. --split test is held-out GTZAN, never trained or validated on, but 93.7%
+of it is in 4, so a constant meter is nearly unbeatable there and the test says little
+about metrically varied music. --split val is fold 0's validation set: also unseen by
+this checkpoint, and it carries asap, hainsworth and the rest, which is where the
+oracle test says the downbeat gap actually lives. Per-dataset numbers only mean
+something on that split, so it reports them.
 
 GTZAN is the test set -- never trained on, never validated on -- and it carries downbeat
 annotations, so the true meter L and the true DB/B label of every event are known. We
@@ -55,6 +62,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--split", choices=("test", "val"), default="test",
+                    help="test = held-out GTZAN; val = fold 0 validation, per dataset")
     ap.add_argument("--flat-class-prior", action="store_true", dest="flat",
                     help="set pi_C to (0.5, 0.5), removing the per-event -1.008 nat "
                          "cost of claiming a downbeat. pi_C(DB)=E[1/L] is derived from "
@@ -62,6 +71,10 @@ def main():
                          "log P(L), so charging it again per claimed event double-counts "
                          "the downbeat base rate -- and does so proportionally to how "
                          "many downbeats a hypothesis claims, i.e. biased toward large L")
+    ap.add_argument("--only-meter", type=int, default=None,
+                    help="restrict the hypothesis set to this single L, leaving only "
+                         "its phases. Scores phase inference with the meter handed to "
+                         "it, so r_i's dependence on getting L right is isolated")
     ap.add_argument("--uniform", action="store_true",
                     help="null pi_M, as meter_posterior.py does, to separate the "
                          "network's own evidence from the prior's contribution")
@@ -72,11 +85,15 @@ def main():
                         num_workers=2, test_dataset="gtzan",
                         length_based_oversampling_factor=0.65, augmentations={},
                         hung_data=False, no_val=False, fold=0)
-    dm.setup(stage="test")
+    dm.setup(stage="test" if args.split == "test" else "fit")
     device = f"cuda:{args.gpu}"
     path = sorted(glob.glob(args.checkpoint))[0]
     model = load(path, device)
     crit = model.subset_criterion
+    if args.only_meter:
+        L = args.only_meter
+        crit.meter_candidates = (L,)
+        crit.meter_prior = {L: -math.log(L)}      # the only hypothesis, so pi_M(L)=1
     if args.uniform:
         crit.meter_prior = None
     if args.flat:
@@ -87,7 +104,10 @@ def main():
     hd_tp = hd_fp = hd_fn = hd_tn = 0     # the head's own DB/B argmax, what decode uses
     both_right = r_only = head_only = 0
     r_on_db, r_on_b = [], []
-    for batch in dm.test_dataloader():
+    loader = dm.test_dataloader() if args.split == "test" else dm.val_dataloader()
+    # per dataset: L correct, L=4 correct, fragments, tp, fp, fn, tn, head correct
+    per_ds = collections.defaultdict(lambda: [0] * 8)
+    for batch in loader:
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         # GTZAN clips run ~1519 frames; the head is built for one 1500-frame window.
         # Crop spect and the frame-wise truths together so _subset_targets derives
@@ -138,7 +158,13 @@ def main():
             r_only += int((agree_r & ~agree_h).sum())
             head_only += int((agree_h & ~agree_r).sum())
 
-    print(f"\nGTZAN, labels masked, {'UNIFORM' if args.uniform else 'corpus'} pi_M, "
+            d = per_ds[batch["dataset"][i] if "dataset" in batch else "?"]
+            d[0] += int(L_hat == L_true); d[1] += int(L_true == 4); d[2] += 1
+            d[3] += int((called & is_db).sum());  d[4] += int((called & ~is_db).sum())
+            d[5] += int((~called & is_db).sum()); d[6] += int((~called & ~is_db).sum())
+            d[7] += int((head == is_db).sum())
+
+    print(f"\n{'GTZAN' if args.split == 'test' else 'fold 0 validation'}, labels masked, {'UNIFORM' if args.uniform else 'corpus'} pi_M, "
           f"{'FLAT' if args.flat else 'corpus'} pi_C")
     print(f"checkpoint: {Path(path).name}")
     print(f"fragments scored: {n_frag}\n")
@@ -179,6 +205,20 @@ def main():
     print(f"     events the 0.7 confidence gate would refuse: "
           f"{100*sum(1 for v in r_on_db+r_on_b if max(v,1-v)<0.7)/len(r_on_db+r_on_b):.1f}%")
 
+    if per_ds:
+        print("\n5  per dataset -- L argmax vs always-4, and r_i vs the head")
+        print(f"     {'dataset':<16}{'frag':>6}{'L acc':>8}{'always4':>9}"
+              f"{'r_i acc':>9}{'head':>8}{'delta':>7}{'r_i rec':>9}")
+        for ds in sorted(per_ds):
+            ok, a4, n, tp, fp, fn, tn, hok = per_ds[ds]
+            ev = tp + fp + fn + tn
+            racc = 100 * (tp + tn) / max(ev, 1)
+            hacc = 100 * hok / max(ev, 1)
+            print(f"     {ds:<16}{n:>6}{100*ok/max(n,1):>7.1f}%{100*a4/max(n,1):>8.1f}%"
+                  f"{racc:>8.1f}%{hacc:>7.1f}%{racc-hacc:>+7.1f}"
+                  f"{100*tp/max(tp+fn,1):>8.1f}%")
+
 
 if __name__ == "__main__":
     main()
+
