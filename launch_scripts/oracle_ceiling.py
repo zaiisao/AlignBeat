@@ -1,26 +1,40 @@
-"""What would F be if the classifier were perfect? An oracle decode on fold 0.
+"""What would F be if each stage in turn were perfect? An oracle ladder on fold 0.
 
 The A/B/C/D breakdown says which STAGE fails; this says what that failure COSTS in the
-metric the paper reports. Three decodes over the same predicted t_hat:
+metric the paper reports. A single oracle only gives the ceiling, so instead hand the
+model one true quantity at a time and watch F climb. Each rung differs from the one
+above it by exactly one oracle, so the step between them is that stage's price:
 
-  oracle   every candidate the time-only DP matches to a ground-truth event is emitted
-           with that event's true class, everything else is background. This is the
-           ceiling candidate placement allows: perfect classification, real timing.
-  real     the model's own argmax + threshold, i.e. what decode_events does.
-  gap      what the classifier costs.
+  real      decode_events: the model picks its own events by threshold, then each
+            candidate independently takes argmax over DB/B. What we ship.
+  +detect   the event SET is oracled -- the time-only DP says which candidates are real
+            events -- but classes still come from the head's argmax. The step from
+            "real" is what detection and thresholding cost.
+  +latent   same events, but downbeats come from r_i, the bar-constrained posterior,
+            with L inferred. The step is what the periodicity constraint buys.
+  +meter    same, with L pinned to the annotated meter. The step is what our meter
+            inference costs us by getting L wrong.
+  +class    every matched candidate gets its true label. The step is the head's
+            remaining error, and the level is the ceiling candidate placement allows.
 
-Timing is never oracled -- t_hat is the model's throughout -- so the ceiling already
-includes whatever localisation error remains.
+Beat F is identical from +detect down, since those rungs share an event set and differ
+only in labelling; read the beat column for the detection price and the downbeat column
+for everything after it. Timing is never oracled -- t_hat is the model's throughout --
+so even the top rung carries whatever localisation error remains.
 """
-import argparse, glob, os, re, sys
+import argparse, glob, math, os, re, sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from alignbeat.classes import BACKGROUND, DOWNBEAT
+from alignbeat.classes import BACKGROUND, CLASS_UNKNOWN, DOWNBEAT
+from alignbeat.classes import BEAT
 from alignbeat.dp import subset_select_dp
+
+# The rungs, in the order they are reported. Each adds one oracle to the one before.
+RUNGS = ("real", "+detect", "+latent", "+meter", "+class")
 
 
 def load(ckpt_path, device):
@@ -33,6 +47,43 @@ def load(ckpt_path, device):
     missing, _ = m.load_state_dict(ck["state_dict"], strict=False)
     assert not [k for k in missing if "criterion" not in k], "architecture mismatch"
     return m.eval().to(device)
+
+
+def true_meter(classes):
+    """The annotated L: the modal gap between consecutive downbeats."""
+    pos = (classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
+    if pos.numel() < 2:
+        return 0
+    return int(np.median(np.diff(pos.cpu().numpy())))
+
+
+def downbeat_call(model, log_p, t_hat, target, sigma, meter=None):
+    """r_i > 0.5 on the matched events, with every class label hidden.
+
+    This is the beat-only path run on labelled data: the E-step never sees a label, so
+    the downbeats it returns come from the bar-phase posterior alone. meter=None leaves
+    L to be inferred; an integer pins it, which prices our meter inference against the
+    annotation. Returns None when no hypothesis is viable."""
+    from launch_scripts.latent_meter import downbeat_mass
+    crit = model.subset_criterion
+    if meter is not None:
+        if meter <= 1:
+            return None
+        saved = (crit.meter_candidates, crit.meter_prior)
+        crit.meter_candidates = (meter,)
+        crit.meter_prior = {meter: -math.log(meter)}
+    try:
+        masked = torch.full_like(target["classes"], CLASS_UNKNOWN)
+        match = crit._e_step(log_p, t_hat, masked, target["times"])
+        if match.pi is None:
+            return None
+        r = downbeat_mass(crit, match.pi, int(target["classes"].numel()))
+        # _e_step resolves its own sigma; it is the same time-only match the ladder
+        # uses, but index by its own to stay consistent if that ever changes.
+        return (r > 0.5).cpu().numpy()
+    finally:
+        if meter is not None:
+            crit.meter_candidates, crit.meter_prior = saved
 
 
 @torch.no_grad()
@@ -58,12 +109,25 @@ def run(model, loader, device):
             if len(gt_t) < 2 or len(gt_t) > len(t_hat):
                 continue
 
-            # ORACLE: match on time alone, then hand each matched candidate its true class
+            # The oracled event set, shared by every rung below "real": match on time
+            # alone, so sigma is which candidates are genuinely events.
             sigma = subset_select_dp(np.abs(gt_t[:, None] - t_hat[None, :]))
-            oracle_sec = t_hat[sigma] * window
-            oracle_is_db = gt_c == DOWNBEAT
+            matched_sec = t_hat[sigma] * window
+            true_is_db = gt_c == DOWNBEAT
 
-            # REAL: the model's own decode
+            log_p = torch.log_softmax(pred["class_logits"][i].float(), dim=-1)
+            span = log_p[torch.from_numpy(sigma).to(device)]
+            head_is_db = (span[:, DOWNBEAT] > span[:, BEAT]).cpu().numpy()
+
+            # r_i on the same events, with the labels hidden exactly as training hides
+            # them on beat-only data. Free L, then L pinned to the annotation.
+            L_true = true_meter(target["classes"])
+            latent_is_db = downbeat_call(model, log_p, pred["t_hat"][i].float(),
+                                         target, sigma, meter=None)
+            meter_is_db = downbeat_call(model, log_p, pred["t_hat"][i].float(),
+                                        target, sigma, meter=L_true)
+
+            # REAL: the model's own decode, its own events and its own classes
             cls, times, _ = decode_events(pred["class_logits"][i].float(),
                                           pred["t_hat"][i].float(), model.tau)
             real_sec = (times * window).cpu().numpy()
@@ -72,9 +136,19 @@ def run(model, loader, device):
             truth_db = np.frombuffer(batch["truth_orig_downbeat"][i])
             has_db = bool(batch["downbeat_mask"][i]) and len(truth_db) >= 3
             row = dict(corpus=str(batch["spect_path"][i]).split("/", 1)[0],
-                       bpm=float(60.0 / np.median(np.diff(truth_b))))
-            for tag, sec, isdb in (("oracle", oracle_sec, oracle_is_db),
-                                   ("real", real_sec, real_is_db)):
+                       bpm=float(60.0 / np.median(np.diff(truth_b))), L_true=L_true)
+            # Upstream value, not a score: how often each rung's DB/B call is right.
+            for tag, isdb in (("+detect", head_is_db), ("+latent", latent_is_db),
+                              ("+meter", meter_is_db)):
+                if isdb is not None and has_db:
+                    row[f"{tag}_acc"] = float((isdb == true_is_db).mean())
+            for tag, sec, isdb in (("real", real_sec, real_is_db),
+                                   ("+detect", matched_sec, head_is_db),
+                                   ("+latent", matched_sec, latent_is_db),
+                                   ("+meter", matched_sec, meter_is_db),
+                                   ("+class", matched_sec, true_is_db)):
+                if isdb is None:
+                    continue
                 row[f"{tag}_F"] = model.metrics(truth_b, np.sort(sec), step="test")["F-measure"]
                 if has_db:
                     row[f"{tag}_dbF"] = model.metrics(
@@ -100,17 +174,27 @@ def main():
     device = f"cuda:{args.gpu}"
     rows = run(load(sorted(glob.glob(args.checkpoint))[0], device), dm.val_dataloader(), device)
 
-    def show(name, sel):
-        if not sel: return
-        o  = np.mean([r["oracle_F"] for r in sel]); rl = np.mean([r["real_F"] for r in sel])
-        db = [r for r in sel if "oracle_dbF" in r]
-        od = np.mean([r["oracle_dbF"] for r in db]) if db else float("nan")
-        rd = np.mean([r["real_dbF"] for r in db]) if db else float("nan")
-        print(f"  {name:<12}{len(sel):>5}   {o:6.3f}{rl:8.3f}{o-rl:+8.3f}   "
-              f"{od:8.3f}{rd:8.3f}{od-rd:+8.3f}")
+    def mean(sel, key):
+        v = [r[key] for r in sel if key in r]
+        return np.mean(v) if v else float("nan")
 
-    print(f"\n{'group':<12}{'n':>5}   {'oracle':>6}{'real':>8}{'cost':>8}   "
-          f"{'or.db':>8}{'real db':>8}{'cost':>8}")
+    def show(name, sel):
+        if not sel:
+            return
+        cells = ""
+        prev = None
+        for rung in RUNGS:
+            db = mean(sel, f"{rung}_dbF")
+            step = "" if prev is None or not np.isfinite(db) else f"{db - prev:+6.3f}"
+            cells += f"{db:>8.3f}{step:>7}"
+            if np.isfinite(db):
+                prev = db
+        print(f"  {name:<14}{len(sel):>4}{mean(sel, 'real_F'):>8.3f}"
+              f"{mean(sel, '+detect_F'):>8.3f}   {cells}")
+
+    head = "".join(f"{r:>8}{'step':>7}" for r in RUNGS)
+    print(f"\n{'':14}{'':4}{'beat F':>16}   {'downbeat F by rung':>16}")
+    print(f"  {'group':<14}{'n':>4}{'real':>8}{'+detect':>8}   {head}")
     show("ALL", rows)
     for lo, hi in ((0,70),(70,100),(100,130),(130,160),(160,1e9)):
         show(f"bpm {lo}-{hi:.0f}" if hi < 1e9 else f"bpm {lo}+",
