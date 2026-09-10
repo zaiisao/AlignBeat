@@ -85,6 +85,18 @@ def main():
         sel = (m >= lo) & (m < hi)
         if sel.any():
             print(f"  [{lo:.2f}, {hi:.2f}){sel.mean():>13.3f}{gap[sel].mean():>18.4f}")
+    M = np.array([r[2] for r in rows], dtype=float)
+    print(f"\n  does the gap just scale with fragment size?")
+    print(f"    corr(gap, M) = {np.corrcoef(gap, M)[0,1]:.3f}")
+    print(f"    gap per event: mean {np.mean(gap/M):.4f} nats   median {np.median(gap/M):.4f}")
+    print(f"    per-event certainty m^(1/M): mean {np.mean(np.exp(-gap/M)):.4f}"
+          f"   median {np.median(np.exp(-gap/M)):.4f}")
+    print(f"\n  {'M band':>12}{'n':>6}{'mean m':>9}{'mean gap':>10}{'gap/event':>11}")
+    for lo, hi in ((0,30),(30,50),(50,70),(70,200)):
+        sel = (M>=lo)&(M<hi)
+        if sel.any():
+            print(f"  [{lo:>4},{hi:>4}){sel.sum():>6}{m[sel].mean():>9.4f}"
+                  f"{gap[sel].mean():>10.3f}{np.mean(gap[sel]/M[sel]):>11.4f}")
     print(f"\n  {'dataset':<16}{'n':>5}{'mean m':>9}{'mean gap':>10}")
     for ds in sorted({r[3] for r in rows}):
         sel = [r for r in rows if r[3] == ds]
