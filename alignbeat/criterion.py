@@ -118,7 +118,28 @@ class SubsetCriterion(nn.Module):
 
         return cost.transpose(0, 1)                                             # (M, N)
 
-    def _e_step(self, log_probabilities, t_hat, gt_class, gt_time):
+    def build_l_match(self, class_logits, t_hat, gt_class, gt_time):
+        """Algorithm 1 lines 18 and 20. Two terms: the class cost of the event this
+        candidate would explain, and lambda_L1 times the timing error. No background
+        correction, no prior -- class_nll branches on ind for us."""
+        labelled = gt_class != CLASS_UNKNOWN
+        beat_only = not labelled.any()
+
+        # probabilities = F.softmax(class_logits, dim=-1) # (B, L, 3)
+        log_probabilities = F.log_softmax(class_logits, dim=-1)
+
+        time_loss_matrix = self.l1(t_hat[None, :], gt_time[:, None])
+        class_loss_matrix = None
+        if beat_only:
+            class_loss_matrix = torch.zeros_like(time_loss_matrix.T)
+        else:
+            class_loss_matrix = -log_probabilities[:, gt_class[labelled]]
+
+        l_match = time_loss_matrix + class_loss_matrix.T
+
+        return l_match
+
+    def _e_step(self, class_logits, t_hat, gt_class, gt_time):
         """Algorithm 1 lines 4-40, on one fragment, at theta_old."""
         with torch.no_grad():
             beat_only = bool((gt_class == CLASS_UNKNOWN).all())
@@ -127,28 +148,32 @@ class SubsetCriterion(nn.Module):
             # when ind = 1. Per-candidate independent, so this is the same as evaluating
             # it later at sigma_hat(i) -- the algorithm computes it here, and line 36
             # reads it back at the matched candidates.
+            log_probabilities = F.log_softmax(class_logits, dim=-1)
             class_posterior = (self._class_log_posterior(log_probabilities)
                                if beat_only else None)
 
             # Lines 15-23
-            corrected = self.build_cost(log_probabilities, t_hat, gt_class, gt_time)
+            # corrected = self.build_cost(log_probabilities, t_hat, gt_class, gt_time)
+            corrected = self.build_l_match(class_logits, t_hat, gt_class, gt_time)
 
             # Line 26: resolve sigma_hat
             sigma_np = subset_select_dp(corrected.cpu().numpy())
             sigma = torch.from_numpy(sigma_np).to(log_probabilities.device)
 
+            # JA: pi_p_i in line 27 is softmax(class_logits)[sigma]
             if beat_only:
                 # Line 36: q_i(c) <- P_hat(C=c | x, sigma_hat(i)), read back at the
                 # matched candidates rather than re-derived.
-                q = tuple(channel[sigma] for channel in class_posterior)
+                q = tuple(beat_class[sigma] for beat_class in class_posterior)
                 # Lines 39-41: the joint responsibility itself. This is the E-step's
                 # whole output -- pi over the (omega, L) hypotheses. Everything the
                 # M-step needs is a function of pi and of theta, so nothing else
                 # crosses the boundary.
-                scores = self._hypothesis_log_scores(q)
+                scores = self._log_scores(q)
                 if scores is not None:
-                    flat = torch.cat([scores[L] for L in scores])
-                    return Match(sigma_np, torch.softmax(flat, dim=0))
+                    scores_flat = torch.cat([scores[L] for L in scores])
+                    pi_omega_l = torch.softmax(scores_flat, dim=0)
+                    return Match(sigma_np, pi_omega_l)
 
             return Match(sigma_np)
 
@@ -178,9 +203,11 @@ class SubsetCriterion(nn.Module):
         """Line 56's timing term: lambda_L1 |t_i - t_hat_sigma(i)|, summed over events."""
         return self.lambda_l1 * residual.sum()
 
-    def _m_step(self, match, log_probabilities, t_hat, target):
+    def _m_step(self, match, class_logits, t_hat, target):
         """Algorithm 2 lines 48-56: sigma_hat held fixed, the loss built at theta."""
         gt_class, gt_time = target['classes'], target['times']
+
+        log_probabilities = F.log_softmax(class_logits, dim=-1)
 
         device = log_probabilities.device
         num_candidates = log_probabilities.shape[0]
@@ -188,7 +215,7 @@ class SubsetCriterion(nn.Module):
 
         sigma = torch.from_numpy(match.sigma).to(device)
 
-        # line 56, first term: cls(theta; ind)
+        # lines 49-56, first term: cls(theta; ind)
         class_term, unlabelled = self._class_term(
             log_probabilities[sigma], gt_class, target, match)
 
@@ -239,10 +266,10 @@ class SubsetCriterion(nn.Module):
                 continue
 
             # E-step: MAP estimate of sigma under the current theta (Alg. 3, 1-9)
-            match = self._e_step(log_probabilities[b], t_hat[b], gt_class, gt_time)
+            match = self._e_step(class_logits[b], t_hat[b], gt_class, gt_time)
 
             # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15).
-            terms = self._m_step(match, log_probabilities[b], t_hat[b], targets[b])
+            terms = self._m_step(match, class_logits[b], t_hat[b], targets[b])
 
             for key, bucket in (('class', class_terms), ('time', time_terms),
                                 ('background', background_terms)):
@@ -347,7 +374,7 @@ class SubsetCriterion(nn.Module):
             cls(theta; 1) = - sum_{L, omega} pi_{omega,L} [ log pi_M(L) + log pi_omega
                                               + sum_i log P_hat(C_i = c_i(omega, L)) ]
 
-        The bracket is exactly the hypothesis score _hypothesis_log_scores builds, so
+        The bracket is exactly the hypothesis score _log_scores builds, so
         the surrogate is one dot product: pi frozen at theta_old against the same
         scores recomputed at theta. The EM structure is the two arguments -- pi carries
         no gradient, the scores carry all of it.
@@ -378,7 +405,7 @@ class SubsetCriterion(nn.Module):
             # expectation under. What the label alone asserts is all that is left.
             return event
 
-        scores = self._hypothesis_log_scores(self._class_log_posterior(matched_log))
+        scores = self._log_scores(self._class_log_posterior(matched_log))
         flat = torch.cat([scores[L] for L in scores])
         return event - (pi * flat).sum()
 
@@ -392,11 +419,11 @@ class SubsetCriterion(nn.Module):
         there is no hypothesis to take an argmax over, not that the answer is beats.
 
         Lines 11-14 are _class_log_posterior and line 17's numerator is
-        _hypothesis_log_scores: the same two functions the E-step uses, so inference and
+        _log_scores: the same two functions the E-step uses, so inference and
         training score a hypothesis identically by construction. Line 17's denominator
         is constant in (omega, L), so line 20's argmax needs only the numerator.
         """
-        blocks = self._hypothesis_log_scores(self._class_log_posterior(log_p))
+        blocks = self._log_scores(self._class_log_posterior(log_p))
         if not blocks:
             return None
 
@@ -414,7 +441,7 @@ class SubsetCriterion(nn.Module):
                 break
             start += width
 
-        # Line 23: c_i(omega_hat, L_hat), the same pattern _hypothesis_log_scores
+        # Line 23: c_i(omega_hat, L_hat), the same pattern _log_scores
         # scored, so the emitted labels are exactly what won the argmax.
         i0 = torch.arange(log_p.shape[0], device=log_p.device)
         is_downbeat = ((omega_hat + i0) % meter_hat) == 0
@@ -424,7 +451,7 @@ class SubsetCriterion(nn.Module):
         return classes, int(omega_hat), int(meter_hat)
 
 
-    def _log_hypothesis_prior(self, meter):
+    def _log_prior(self, meter):
         """log pi_M(L) + log pi_omega(omega), Algorithm 2 line 52's first two brackets.
 
         pi_omega is uniform over the L phases, so log pi_omega = -log L and the pair is
@@ -434,7 +461,7 @@ class SubsetCriterion(nn.Module):
             return -math.log(meter)
         return self.meter_prior.get(meter, -float('inf'))
 
-    def _hypothesis_log_scores(self, q):
+    def _log_scores(self, q):
         """Algorithm 1 line 40's numerator: the log score of every (omega, L) hypothesis.
 
         q is (log P_hat(DB), log P_hat(B)) per event, as lines 5-12 produced it and
@@ -466,7 +493,7 @@ class SubsetCriterion(nn.Module):
             if meter <= 1 or M < meter:
                 continue
 
-            log_prior = self._log_hypothesis_prior(meter)
+            log_prior = self._log_prior(meter)
 
             phases = torch.arange(meter, device=device)
             # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.
@@ -486,7 +513,7 @@ class SubsetCriterion(nn.Module):
         Convenience for the diagnostics, which start from a checkpoint's logits rather
         than from an E-step that already built the posterior.
         """
-        blocks = self._hypothesis_log_scores(self._class_log_posterior(match_likelihood))
+        blocks = self._log_scores(self._class_log_posterior(match_likelihood))
         if blocks is None:
             return None
         meters = list(blocks)

@@ -144,7 +144,7 @@ def run(model, loader, device):
             keep = (arg != BACKGROUND) & (top >= model.tau)
             if int(keep.sum()) >= 4:
                 span_r = log_p[keep]
-                scores_h = crit._hypothesis_log_scores(crit._class_log_posterior(span_r))
+                scores_h = crit._log_scores(crit._class_log_posterior(span_r))
                 if scores_h:
                     flat = torch.cat([scores_h[L] for L in scores_h])
                     pi = torch.softmax(flat, dim=0)

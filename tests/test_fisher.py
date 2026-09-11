@@ -49,7 +49,7 @@ def marginal_nll(crit, log_p):
     The event term does not depend on (omega, L), so it is additive on both sides and
     the identity is unchanged by it. Including it here is what makes these tests confirm
     that the added term left the EM structure alone rather than perturbing it."""
-    scores = crit._hypothesis_log_scores(crit._class_log_posterior(log_p))
+    scores = crit._log_scores(crit._class_log_posterior(log_p))
     return (-torch.logsumexp(torch.cat([scores[L] for L in scores]), dim=0)
             - torch.logsumexp(log_p[:, [DOWNBEAT, BEAT]], dim=-1).sum())
 
@@ -61,7 +61,7 @@ def surrogate(crit, log_p, pi):
 def frozen_pi(crit, log_p):
     """pi_{omega,L} exactly as the E-step forms it (Algorithm 1 lines 39-41)."""
     with torch.no_grad():
-        scores = crit._hypothesis_log_scores(crit._class_log_posterior(log_p))
+        scores = crit._log_scores(crit._class_log_posterior(log_p))
         return torch.softmax(torch.cat([scores[L] for L in scores]), dim=0)
 
 

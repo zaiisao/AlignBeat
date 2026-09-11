@@ -122,7 +122,7 @@ def test_pattern_matches_the_hypothesis_that_won():
     assert resolved is not None
     classes, omega, meter = resolved
 
-    blocks = crit._hypothesis_log_scores(crit._class_log_posterior(log_p[keep]))
+    blocks = crit._log_scores(crit._class_log_posterior(log_p[keep]))
     best = max(float(blocks[L].max()) for L in blocks)
     assert abs(float(blocks[meter][omega]) - best) < 1e-6, "returned a non-argmax pair"
 

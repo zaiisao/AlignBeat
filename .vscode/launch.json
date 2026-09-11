@@ -7,9 +7,8 @@
     //   --num-workers 0  keeps the dataloader in-process so breakpoints there hit.
     //   --name debug_*   so debug checkpoints do not collide with real runs.
     //
-    // N is derived, not passed: --downsample_stages 3 halves 1500 -> 750 -> 375 -> 188.
-    // 188 clears the 170-candidate floor implied by --bpm_max 340 and drops only the
-    // ~0.03% of fragments whose asap MIDI annotations are note-level rather than beats.
+    // N is derived, not passed: train.py resolves the candidate count from
+    // --train_length and --bpm_max, so there is no stage or candidate flag to set here.
     "version": "0.2.0",
     "configurations": [
         {
@@ -23,14 +22,14 @@
             "args": [
                 "--name", "debug_L1_base", "--gpu", "0", "--fold", "0", "--seed", "0",
                 "--max-epochs", "100", "--val-frequency", "200", "--snapshot_every", "5",
-                "--head_type", "subset", "--omega_db", "2",
+                "--head_type", "subset",
                 "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
         },
         {
-            "name": "train: subset + candidate attention, index positions (L2_attn)",
+            "name": "train: subset + candidate attention (L2_attn)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/launch_scripts/train.py",
@@ -40,10 +39,10 @@
             "args": [
                 "--name", "debug_L2_attn", "--gpu", "2", "--fold", "0", "--seed", "0",
                 "--max-epochs", "100", "--val-frequency", "200", "--snapshot_every", "5",
-                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
-                // section 10.2. Without --class_attention_pos the attention is
-                // permutation-equivariant and cannot express bar phase at all.
-                "--class_attention_layers", "1", "--class_attention_pos", "index",
+                "--head_type", "subset",
+                // section 10.2: candidate self-attention in the class branch, so the
+                // candidates can coordinate instead of each deciding blind.
+                "--attention_layers", "1",
                 "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",
@@ -60,9 +59,9 @@
             "args": [
                 "--name", "debug_meter", "--gpu", "3", "--fold", "0", "--seed", "0",
                 "--max-epochs", "20", "--val-frequency", "200", "--snapshot_every", "5",
-                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                "--head_type", "subset",
                 // only affects beat-only fragments (smc, simac): infers L per fragment
-                "--meter_candidates", "2,3,4,6", "--meter_prior", "corpus",
+                "--meter_candidates", "2,3,4,6",
                 "--num-workers", "0", "--logger", "none", "--compile"
             ],
             "console": "integratedTerminal",
@@ -79,7 +78,7 @@
             "args": [
                 "--name", "debug_warm", "--gpu", "0", "--fold", "0", "--seed", "0",
                 "--max-epochs", "20", "--val-frequency", "200", "--snapshot_every", "5",
-                "--head_type", "subset", "--downsample_stages", "3", "--omega_db", "2",
+                "--head_type", "subset",
                 // frontend + transformer only; the head is always freshly initialised
                 "--init_encoder_from", "${workspaceFolder}/checkpoints/final100_subset S0 fold0 shift_tolerant_weighted_bce-h512-augTrueTrueTrue-epepoch=069.ckpt",
                 "--num-workers", "0", "--logger", "none", "--compile"
