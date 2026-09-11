@@ -93,11 +93,11 @@ def main():
     if args.only_meter:
         L = args.only_meter
         crit.meter_candidates = (L,)
-        crit.meter_prior = {L: -math.log(L)}      # the only hypothesis, so pi_M(L)=1
+        crit.meter_prior = {L: 1.0 / L}           # the only hypothesis, so pi_M(L)=1
     if args.uniform:
         crit.meter_prior = None
     if args.flat:
-        crit.log_class_prior = torch.log(torch.tensor([0.5, 0.5], device=device))
+        crit.class_prior = torch.tensor([0.5, 0.5], device=device)
 
     conf = collections.Counter(); n_frag = 0
     ev_tp = ev_fp = ev_fn = ev_tn = 0
@@ -135,7 +135,7 @@ def main():
             # THE MASK: every label hidden, so sigma is resolved by the beat-only
             # branch of build_l_match exactly as it is on real beat-only data.
             masked = torch.full_like(gt_c, CLASS_UNKNOWN)
-            m = crit._e_step(log_p, pred["t_hat"][i], masked, gt_t)
+            m = crit._e_step(pred["class_logits"][i], pred["t_hat"][i], masked, gt_t)
             if m.pi is None:
                 continue
             r = downbeat_mass(crit, m.pi, gt_c.numel())

@@ -40,8 +40,8 @@ def test_pi_omega_L_matches_brute_force_and_couples_events():
 
         # Brute force: section 1.3's P_hat, pi_data divided out before pi_C is applied,
         # then one factor per event under each (omega, L) pattern.
-        lc = crit.log_class_prior.to(matched.dtype)
-        ld = crit.log_data_prior.to(matched.dtype)
+        lc = crit.class_prior.to(matched.dtype).log()
+        ld = crit.data_prior.to(matched.dtype).log()
         log_db = matched[:, DOWNBEAT] - ld[DOWNBEAT] + lc[DOWNBEAT]
         log_b = matched[:, BEAT] - ld[BEAT] + lc[BEAT]
         norm = torch.logaddexp(log_db, log_b)

@@ -117,8 +117,9 @@ def test_pattern_matches_the_hypothesis_that_won():
     crit = criterion()
     logits, t_hat = head_output(seed=5)
     log_p = torch.log_softmax(logits, dim=-1)
+    p = torch.softmax(logits, dim=-1)
     keep = (1.0 - torch.softmax(logits, -1)[:, BACKGROUND]) >= 0.5
-    resolved = crit.infer_pattern(log_p[keep])
+    resolved = crit.infer_pattern(p[keep])
     assert resolved is not None
     classes, omega, meter = resolved
 
@@ -160,8 +161,7 @@ def test_recovers_the_planted_meter_and_phase(meter, omega):
         pytest.skip("phase must be below the meter")
     M = 8 * meter
     logits, t_hat = planted(M, omega, meter)
-    log_p = torch.log_softmax(logits, dim=-1)[:M]
-    resolved = criterion().infer_pattern(log_p)
+    resolved = criterion().infer_pattern(torch.softmax(logits, dim=-1)[:M])
     assert resolved is not None
     classes, got_omega, got_meter = resolved
     assert (got_meter, got_omega) == (meter, omega)
@@ -188,8 +188,8 @@ def test_recovery_survives_a_wrong_event():
     logits, t_hat = planted(M, omega, meter)
     logits[5] = logits[5].flip(0) if False else torch.log(
         torch.tensor([0.9, 0.1, 1e-6]) / torch.tensor([0.9, 0.1, 1e-6]).sum())
-    log_p = torch.log_softmax(logits, dim=-1)[:M]
-    _c, got_omega, got_meter = criterion().infer_pattern(log_p)
+    _c, got_omega, got_meter = criterion().infer_pattern(
+        torch.softmax(logits, dim=-1)[:M])
     assert (got_meter, got_omega) == (meter, omega)
 
 
@@ -199,6 +199,6 @@ def test_first_downbeat_index_matches_the_spec():
     only here."""
     M, meter, omega = 24, 4, 3
     logits, _t = planted(M, omega, meter)
-    classes, _o, _m = criterion().infer_pattern(torch.log_softmax(logits, -1)[:M])
+    classes, _o, _m = criterion().infer_pattern(torch.softmax(logits, -1)[:M])
     first = int((classes == DOWNBEAT).nonzero()[0])
     assert first == (meter - omega) % meter == 1

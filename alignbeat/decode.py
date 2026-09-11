@@ -148,8 +148,8 @@ def decode_events_metrical(class_logits, t_hat, criterion, tau=0.5):
         empty = index
         return empty, t_hat[empty], event_mass[empty]
 
-    log_p = torch.log_softmax(class_logits, dim=-1)[index]
-    resolved = criterion.infer_pattern(log_p)                     # lines 10-24
+    p = torch.softmax(class_logits, dim=-1)[index]
+    resolved = criterion.infer_pattern(p)                         # lines 10-24
     if resolved is None:
         # Fewer detected events than the smallest candidate meter, so no hypothesis
         # exists to resolve. Fall back to the per-candidate call over {DB, B}: still a

@@ -58,7 +58,7 @@ def collect(model, loader, device, candidates):
             if M < 2:
                 continue
             log_p = torch.log_softmax(pred["class_logits"][i], dim=-1)
-            match = crit._e_step(log_p, pred["t_hat"][i], gt_c, gt_t)
+            match = crit._e_step(pred["class_logits"][i], pred["t_hat"][i], gt_c, gt_t)
             span = log_p[torch.from_numpy(match.sigma).to(device)]
             post = crit._meter_log_posterior(span)
             if post is None:

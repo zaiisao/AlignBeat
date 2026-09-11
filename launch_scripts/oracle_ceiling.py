@@ -62,7 +62,7 @@ def true_meter(classes):
     return int(np.median(np.diff(pos.cpu().numpy())))
 
 
-def downbeat_call(model, log_p, t_hat, target, sigma, meter=None):
+def downbeat_call(model, class_logits, t_hat, target, sigma, meter=None):
     """r_i > 0.5 on the matched events, with every class label hidden.
 
     This is the beat-only path run on labelled data: the E-step never sees a label, so
@@ -76,10 +76,10 @@ def downbeat_call(model, log_p, t_hat, target, sigma, meter=None):
             return None
         saved = (crit.meter_candidates, crit.meter_prior)
         crit.meter_candidates = (meter,)
-        crit.meter_prior = {meter: -math.log(meter)}
+        crit.meter_prior = {meter: 1.0 / meter}    # the only hypothesis, so pi_M(L)=1
     try:
         masked = torch.full_like(target["classes"], CLASS_UNKNOWN)
-        match = crit._e_step(log_p, t_hat, masked, target["times"])
+        match = crit._e_step(class_logits, t_hat, masked, target["times"])
         if match.pi is None:
             return None
         r = downbeat_mass(crit, match.pi, int(target["classes"].numel()))
@@ -122,7 +122,8 @@ def run(model, loader, device):
             matched_sec = t_hat[sigma] * window
             true_is_db = gt_c == DOWNBEAT
 
-            log_p = torch.log_softmax(pred["class_logits"][i].float(), dim=-1)
+            logits = pred["class_logits"][i].float()
+            log_p = torch.log_softmax(logits, dim=-1)
             crit = model.subset_criterion
             span = log_p[torch.from_numpy(sigma).to(device)]
             head_is_db = (span[:, DOWNBEAT] > span[:, BEAT]).cpu().numpy()
@@ -130,9 +131,9 @@ def run(model, loader, device):
             # r_i on the same events, with the labels hidden exactly as training hides
             # them on beat-only data. Free L, then L pinned to the annotation.
             L_true = true_meter(target["classes"])
-            latent_is_db = downbeat_call(model, log_p, pred["t_hat"][i].float(),
+            latent_is_db = downbeat_call(model, logits, pred["t_hat"][i].float(),
                                          target, sigma, meter=None)
-            meter_is_db = downbeat_call(model, log_p, pred["t_hat"][i].float(),
+            meter_is_db = downbeat_call(model, logits, pred["t_hat"][i].float(),
                                         target, sigma, meter=L_true)
 
             # ALGORITHM 3, honestly: score the bar hypotheses over the candidates the
