@@ -17,11 +17,14 @@ class SubsetSelectionHead(nn.Module):
     """Encoder features -> N candidates -> (class logits, monotone times)."""
 
     def __init__(self, feature_size=256, hidden_size=256, attention_layers=0,
-                 attention_heads=4,
+                 attention_heads=4, time_param="bounded",
                  window_seconds=30.0):
         super(SubsetSelectionHead, self).__init__()
 
         self.window_seconds = float(window_seconds)
+        if time_param not in ("paper", "bounded", "floored"):
+            raise ValueError(f"time_param must be paper|bounded|floored, got {time_param!r}")
+        self.time_param = time_param
 
         self.input_norm = nn.LayerNorm(feature_size)
 
@@ -83,7 +86,12 @@ class SubsetSelectionHead(nn.Module):
 
         # JA: regression_head reduces 256-dim features to 1-d
         r = self.regression_head(z).squeeze(dim=2)      # (B, N)
-        t_hat = monotonic_times(r)
+        if self.time_param == "paper":
+            t_hat = paper_times(r)                       # eq. (1), coupled, no gap floor
+        elif self.time_param == "floored":
+            t_hat = floored_times(r, self.window_seconds)   # coupled, gap >= 2 * tolerance
+        else:
+            t_hat = monotonic_times(r)                   # bounded per-candidate offset
 
         # Only the classifier sees the contextualised features; regression already read
         # z above, so timing is unaffected by the attention pass.
@@ -187,3 +195,19 @@ def floored_times(r, window_seconds, min_gap_seconds=MIN_GAP_SECONDS):
             f"N={N} candidates at a {min_gap_seconds:g}s floor need "
             f"{N * min_gap_seconds:g}s > {window_seconds:g}s of window")
     return torch.cumsum(delta + slack * torch.softmax(r, dim=-1), dim=-1)
+
+
+def paper_times(r):
+    """Equation (1) of Beat_DP_matching_final: the cumulative-sum reparameterisation.
+
+        t_hat_j = sum_{k<=j} softplus(r_k) / sum_{k<N} softplus(r_k)
+
+    Strictly increasing for every r since softplus > 0, and normalised to (0, 1].
+    This is what monotonic_times replaced in 757d931. Kept so the three
+    parameterisations can be compared on one recipe rather than across sessions.
+
+    Note it has NO minimum gap: softplus(r) -> 0 is reachable, so two candidates can sit
+    arbitrarily close while remaining strictly ordered.
+    """
+    inc = F.softplus(r)
+    return torch.cumsum(inc, dim=-1) / inc.sum(dim=-1, keepdim=True)

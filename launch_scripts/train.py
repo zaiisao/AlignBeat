@@ -159,6 +159,7 @@ def main(args):
             "tau": args.tau,
             "decode": args.decode,
             "attention_layers": args.attention_layers,
+            "time_param": args.time_param,
             # criterion
             "gamma": args.gamma,
             "meter_prior": meter_prior,
@@ -348,6 +349,13 @@ if __name__ == "__main__":
     parser.add_argument("--tau", type=float, default=0.2,
                         help="detection threshold. algorithm5_hard-1 Algorithm 3 line 5 "
                              "keeps candidates whose 1 - p_j(empty) clears it")
+    parser.add_argument("--time_param", choices=("paper", "bounded", "floored"),
+                        default="bounded",
+                        help="how t_hat is produced. paper: eq.(1) cumsum of softplus. "
+                             "bounded: per-candidate offset from the cell centre "
+                             "(current). floored: eq.(1) with each increment floored at "
+                             "2x the metric tolerance, so no two detections can share a "
+                             "reference beat")
     parser.add_argument("--attention_layers", type=int, default=0,
                         help="candidate self-attention layers in the classification "
                              "branch. 0 = per-candidate MLP, each candidate blind to "
