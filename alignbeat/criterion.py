@@ -380,45 +380,32 @@ class SubsetCriterion(nn.Module):
         return log_db - log_norm, log_b - log_norm
 
     def _beat_only_term(self, matched_log, pi):
-        """Algorithm 2 line 52's cls(theta; 1).
+        """Algorithm 2 line 52's cls(theta; 1), as written.
 
             cls(theta; 1) = - sum_{L, omega} pi_{omega,L} [ log pi_M(L) + log pi_omega
                                               + sum_i log P_hat(C_i = c_i(omega, L)) ]
 
-        The bracket is exactly the hypothesis score _log_scores builds, so
-        the surrogate is one dot product: pi frozen at theta_old against the same
-        scores recomputed at theta. The EM structure is the two arguments -- pi carries
-        no gradient, the scores carry all of it.
-        """
-        # Line 50 decomposes exactly (verified to 1e-16):
-        #     -log p(c_i) = -log P_2(c_i)  +  -log(1 - p(empty))
-        #                   which class       is it an event at all
-        # Line 52 supplies only the first half: P_hat is normalised over {DB, B}, so
-        # cls(theta; 1) is INVARIANT to the background channel -- measured constant
-        # while P(event) swept 0.95 to 0.15. A beat-only annotation asserts two things,
-        # that an event is here and that its class is unknown, and the spec's surrogate
-        # uses only the second. Nothing then constrains p(empty) at a matched event on
-        # beat-only data, and it drifts: simac's detected/true events fall from 0.99 to
-        # 0.80 over 20 epochs, which is its entire gap to vanilla.
-        #
-        # This is line 20's own quantity, which the E-step already trusts to decide
-        # which candidates are events ("informative precisely because it is a proper
-        # subset of the head's own larger, three-way support"). Restoring it here makes
-        # ind=1 symmetric with ind=0. It does not depend on (omega, L), so it is purely
-        # additive and leaves Fisher's identity intact -- tests/test_fisher.py checks
-        # that rather than assuming it.
-        #
-        # DEVIATION from algorithm5_hard-1 line 52.
-        event = -torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
+        The bracket is exactly the hypothesis score _log_scores builds, so the surrogate
+        is one dot product: pi frozen at theta_old against the same scores recomputed at
+        theta. The EM structure is the two arguments -- pi carries no gradient, the
+        scores carry all of it.
 
+        P_hat is normalised over {DB, B}, so this is invariant to the background
+        channel: a beat-only fragment's class term says which kind of event each one is
+        and says nothing about whether it is an event at all. Line 56's gamma term
+        covers only the candidates sigma_hat did not match, so nothing in the loss
+        constrains p(empty) at a matched event on beat-only data. That is what line 52
+        specifies.
+        """
         if pi is None:
             # No viable meter hypothesis, so there is no pi_{omega,L} to take an
-            # expectation under. What the label alone asserts is all that is left.
-            return event
+            # expectation under and line 52 has no value. The fragment contributes no
+            # class term rather than being force-fitted to a label.
+            return torch.zeros((), dtype=matched_log.dtype, device=matched_log.device)
 
         scores = self._log_scores(self._class_log_posterior(matched_log))
         flat = torch.cat([scores[L] for L in scores])
-        return event - (pi * flat).sum()
+        return -(pi * flat).sum()
 
     def infer_pattern(self, p):
         """Algorithm 3 lines 10-24: resolve one (omega, L) for these events and label

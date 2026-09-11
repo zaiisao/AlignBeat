@@ -44,14 +44,10 @@ def logits(M, seed):
 
 
 def marginal_nll(crit, log_p):
-    """-log sum_h exp(s_h), plus the event-mass term the surrogate now carries.
-
-    The event term does not depend on (omega, L), so it is additive on both sides and
-    the identity is unchanged by it. Including it here is what makes these tests confirm
-    that the added term left the EM structure alone rather than perturbing it."""
+    """-log sum_h exp(s_h): the incomplete-data negative log-likelihood line 52's
+    surrogate stands in for, with (omega, L) marginalised out."""
     scores = crit._log_scores(crit._class_log_posterior(log_p))
-    return (-torch.logsumexp(torch.cat([scores[L] for L in scores]), dim=0)
-            - torch.logsumexp(log_p[:, [DOWNBEAT, BEAT]], dim=-1).sum())
+    return -torch.logsumexp(torch.cat([scores[L] for L in scores]), dim=0)
 
 
 def surrogate(crit, log_p, pi):

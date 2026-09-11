@@ -74,11 +74,7 @@ def test_surrogate_matches_the_direct_marginal_gradient():
         blocks = crit._log_scores(crit._class_log_posterior(log_p))
         return torch.cat([blocks[k] for k in blocks])
 
-    # The event-mass term line 52 omits is now carried by _beat_only_term. It does not
-    # depend on (omega, L), so it is additive on both sides and the identity is
-    # unchanged -- which is precisely what this test now confirms.
-    direct = (-flat(matched).logsumexp(dim=0)
-              - torch.logsumexp(matched[:, [DOWNBEAT, BEAT]], dim=-1).sum())
+    direct = -flat(matched).logsumexp(dim=0)
     g_direct, = torch.autograd.grad(direct, logits, retain_graph=True)
 
     with torch.no_grad():
@@ -89,7 +85,7 @@ def test_surrogate_matches_the_direct_marginal_gradient():
     print("ok: line 52's surrogate and the direct marginal share a gradient (Fisher)")
 
 
-def test_degenerate_meter_falls_back_to_the_marginal():
+def test_degenerate_meter_contributes_no_class_term():
     """A fragment with no viable meter hypothesis must NOT be force-fitted to "beat"."""
     torch.manual_seed(0)
     crit = SubsetCriterion(DATA_PRIOR, meter_prior={1: 1.0})
@@ -97,13 +93,13 @@ def test_degenerate_meter_falls_back_to_the_marginal():
     assert crit._log_scores(crit._class_log_posterior(matched)) is None, (
         "a degenerate meter must yield no hypothesis")
     term = crit._beat_only_term(matched, None)
-    marginal = -torch.logsumexp(matched[:, [DOWNBEAT, BEAT]], dim=-1).sum()
-    assert torch.allclose(term, marginal), "no meter must fall back to the marginal"
-    print("ok: degenerate meter falls back to the marginal, not a confident beat")
+    assert torch.allclose(term, torch.zeros_like(term)), (
+        "no hypothesis means line 52 has no value, so no class term")
+    print("ok: degenerate meter contributes no class term, not a confident beat")
 
 
 if __name__ == "__main__":
     test_pi_omega_L_matches_brute_force_and_couples_events()
     test_surrogate_matches_the_direct_marginal_gradient()
-    test_degenerate_meter_falls_back_to_the_marginal()
+    test_degenerate_meter_contributes_no_class_term()
     print("\nall phase tests passed")
