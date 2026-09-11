@@ -15,7 +15,7 @@ rather than assuming: we run N candidates against M events with N/M around 3.
 
 The gap this costs the surrogate is exactly -log m, so both are reported. Timing
 evidence ONLY -- P_1 is defined under the timing term alone, so the class NLL that
-build_cost adds for the E-step's own purposes is excluded here.
+build_l_match adds for the E-step's own purposes is excluded here.
 """
 import argparse
 import glob

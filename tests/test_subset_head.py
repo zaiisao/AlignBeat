@@ -336,35 +336,40 @@ def test_decode_no_duplicates_and_sorted():
 # Section 7.1: beat-only datasets (SMC), where the B/DB distinction is not annotated
 # --------------------------------------------------------------------------------
 
-def test_beat_only_events_use_the_marginal_not_a_fabricated_label():
-    """algorithm5_hard1 Algorithm 1 line 20: a CLASS_UNKNOWN event is scored by
-    -log(1 - p_j(empty)) == -log(p_DB + p_B), the raw head with no prior, never by
-    pretending one of the two labels was observed."""
+def test_beat_only_events_carry_no_class_cost():
+    """Algorithm 1 line 20: a CLASS_UNKNOWN event says an event occurred without saying
+    which kind, so no class term distinguishes one candidate from another and the pair
+    costs the timing error alone. A labelled event still pays line 18's own NLL."""
     from alignbeat.classes import CLASS_UNKNOWN
     N = 8
     log_p = torch.log(torch.tensor([[0.25, 0.6, 0.15]]).repeat(N, 1))
+    t_hat = torch.linspace(0.0, 1.0, N)
     crit = SubsetCriterion(DATA_PRIOR)
-    unknown = crit.class_nll(log_p, torch.tensor([CLASS_UNKNOWN]))
-    expected = -np.log(0.25 + 0.6)
-    assert np.isclose(float(unknown[0, 0]), expected, atol=1e-5), (float(unknown[0, 0]), expected)
-    # and a known label still uses its own class
-    known = crit.class_nll(log_p, torch.tensor([DOWNBEAT]))
-    assert np.isclose(float(known[0, 0]), -np.log(0.25), atol=1e-5)
-    print("ok: beat-only events scored by line 20's -log(1 - p(empty)), "
-          "labelled ones unchanged")
+
+    gt_t = t_hat[:1].clone()
+    unknown = crit.build_l_match(log_p, t_hat, torch.tensor([CLASS_UNKNOWN]), gt_t)
+    time_only = crit.l1(t_hat[None, :], gt_t[:, None])
+    assert torch.allclose(unknown, time_only, atol=1e-6)
+
+    known = crit.build_l_match(log_p, t_hat, torch.tensor([DOWNBEAT]), gt_t)
+    assert np.isclose(float((known - time_only)[0, 0]), -np.log(0.25), atol=1e-5)
+    print("ok: line 20 leaves the class channel out, line 18 pays its own NLL")
 
 
-def test_marginal_is_invariant_to_b_db_split():
-    """Under a uniform pi_C the mixture depends only on p(B)+p(DB): the matching cost
-    stays phase- and meter-blind, as line 14 requires."""
+def test_beat_only_cost_is_invariant_to_b_db_split():
+    """The matching cost for an unlabelled event stays phase- and meter-blind, as line
+    14 requires: nothing about how the head splits its mass between B and DB can move
+    it."""
     from alignbeat.classes import CLASS_UNKNOWN
     crit = SubsetCriterion(DATA_PRIOR)
+    t_hat, gt_t = torch.tensor([0.5]), torch.tensor([0.5])
+    unknown = torch.tensor([CLASS_UNKNOWN])
     a = torch.log(torch.tensor([[0.10, 0.75, 0.15]]))
     b = torch.log(torch.tensor([[0.75, 0.10, 0.15]]))
-    ca = crit.class_nll(a, torch.tensor([CLASS_UNKNOWN]))
-    cb = crit.class_nll(b, torch.tensor([CLASS_UNKNOWN]))
+    ca = crit.build_l_match(a, t_hat, unknown, gt_t)
+    cb = crit.build_l_match(b, t_hat, unknown, gt_t)
     assert np.isclose(float(ca), float(cb), atol=1e-6)
-    print("ok: marginal is invariant to how active mass splits between B and DB")
+    print("ok: the unlabelled cost is invariant to how active mass splits")
 
 
 def test_beat_only_end_to_end_trains_without_crashing():

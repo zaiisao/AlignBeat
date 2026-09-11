@@ -77,7 +77,7 @@ def collect(model, dense, loader, device, snapshots):
                 sp = snap.model(batch["spect"])
             sp = {kk: v.float() for kk, v in sp.items()}
             logp = F.log_softmax(sp["class_logits"][0], -1)
-            sigma = subset_select_dp(snap.subset_criterion.build_cost(
+            sigma = subset_select_dp(snap.subset_criterion.build_l_match(
                 logp, sp["t_hat"][0], gt_c, gt_t).cpu().numpy())
             labelled[name] = sigma == nearest
 

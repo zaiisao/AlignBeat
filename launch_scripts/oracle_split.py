@@ -67,9 +67,10 @@ def run(model, loader, device):
             # --- matchings -------------------------------------------------------
             sigma_time = subset_select_dp(np.abs(gt_t[:, None] - t_hat[None, :]))
             logp = F.log_softmax(logits, dim=-1)
-            full_cost = crit.build_cost(logp, t_hat_t, target["classes"], target["times"])
-            class_cost = crit.class_nll(logp, target["classes"])
+            full_cost = crit.build_l_match(logp, t_hat_t, target["classes"], target["times"])
             time_cost = crit.l1(t_hat_t[None, :], target["times"][:, None])
+            # build_l_match is the two terms added; the class channel is what is left.
+            class_cost = full_cost - time_cost
             sigma_full = subset_select_dp(full_cost.cpu().numpy())
 
             argmax = logits.argmax(-1).cpu().numpy()

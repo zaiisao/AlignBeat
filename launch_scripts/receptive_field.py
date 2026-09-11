@@ -80,7 +80,7 @@ def main():
         M = len(gt_t)
         if 2 <= M <= N:
             with torch.no_grad():
-                cost = crit.build_cost(logp, t_hat, gt_c, gt_t)
+                cost = crit.build_l_match(logp, t_hat, gt_c, gt_t)
             sigma = subset_select_dp(cost.cpu().numpy())
             f = gt_t.cpu().numpy() * T                                     # onset frames
             th = t_hat.detach().cpu().numpy() * T

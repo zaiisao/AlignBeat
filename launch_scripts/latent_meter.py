@@ -133,7 +133,7 @@ def main():
                 continue
             log_p = torch.log_softmax(pred["class_logits"][i], dim=-1)
             # THE MASK: every label hidden, so sigma is resolved by the beat-only
-            # branch of class_nll exactly as it is on real beat-only data.
+            # branch of build_l_match exactly as it is on real beat-only data.
             masked = torch.full_like(gt_c, CLASS_UNKNOWN)
             m = crit._e_step(log_p, pred["t_hat"][i], masked, gt_t)
             if m.pi is None:

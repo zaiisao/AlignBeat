@@ -88,94 +88,71 @@ class SubsetCriterion(nn.Module):
         """Eq. (3)'s time channel: plain L1 over the fixed E-step scale."""
         return self.lambda_l1 * (t_hat - t_target).abs()
 
-    def build_cost(self, log_probabilities, t_hat, gt_class, gt_time):
-        """Algorithm 1 lines 18 and 20. Two terms: the class cost of the event this
-        candidate would explain, and lambda_L1 times the timing error. No background
-        correction, no prior -- class_nll branches on ind for us."""
-        class_cost = self.class_nll(log_probabilities, gt_class)
-        time_cost = self.l1(t_hat[None, :], gt_time[:, None])
+    def build_l_match(self, log_probabilities, t_hat, gt_class, gt_time):
+        """Algorithm 1 lines 18 and 20: L_match(i, j) for every event i and candidate j.
 
-        return class_cost + time_cost
+        Line 18, ind = 0. The label is observed, so the pair costs that class's own
+        negative log-likelihood plus the timing error.
 
-    def class_nll(self, log_probabilities, gt_class):
-        """-log p_j(c_i) for every (event, candidate) pair, handling unlabelled classes.
+        Line 20, ind = 1. The label says an event occurred without saying which kind, so
+        nothing about the class distinguishes one candidate from another and the pair
+        costs the timing error alone. The matching for beat-only data is therefore
+        decided by time, subject to the ordering constraint.
 
-        A labelled event costs the NLL of its own class. An unlabelled one (beat-only
-        data's B* label) is known to be an event but not which kind, so it costs the
-        marginal -log(p_DB + p_B) instead, which steers the model toward neither.
+        Returns (M, N), the orientation subset_select_dp consumes.
         """
-        # JA: CLASS_UNKNOWN is assigned to all events in the beat-only dataset
         labelled = gt_class != CLASS_UNKNOWN
-        
-        # algorithm5_hard1 Algorithm 1 line 20: -log(1 - p_j(empty)), which is
-        # -log(p_DB + p_B) since the three classes sum to 1. The raw head, no prior:
-        # line 20 is the definition for ind=1, not a configurable alternative.
-        mixture = torch.logsumexp(
-            log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1, keepdim=True)
-        cost = -mixture.repeat(1, len(gt_class))                           # (N, M)
 
-        cost[:, labelled] = -log_probabilities[:, gt_class[labelled]]
+        # Line 19's L1, already scaled by lambda_L1.
+        time_cost = self.l1(t_hat[None, :], gt_time[:, None])                   # (M, N)
 
-        return cost.transpose(0, 1)                                             # (M, N)
+        # gt_class is CLASS_UNKNOWN at the unlabelled events, which would index the
+        # background column. Clamp so the gather stays on a real class; where() then
+        # discards those entries. Per event rather than per fragment, so a fragment
+        # carrying both kinds of annotation gets line 18 on the events that have a
+        # label and line 20 on the events that do not.
+        class_cost = -log_probabilities[:, gt_class.clamp(min=0)].transpose(0, 1)
 
-    def build_l_match(self, class_logits, t_hat, gt_class, gt_time):
-        """Algorithm 1 lines 18 and 20. Two terms: the class cost of the event this
-        candidate would explain, and lambda_L1 times the timing error. No background
-        correction, no prior -- class_nll branches on ind for us."""
-        labelled = gt_class != CLASS_UNKNOWN
-        beat_only = not labelled.any()
+        return torch.where(labelled[:, None], class_cost, 0.0) + time_cost
 
-        # probabilities = F.softmax(class_logits, dim=-1) # (B, L, 3)
-        log_probabilities = F.log_softmax(class_logits, dim=-1)
+    def _e_step(self, log_probabilities, t_hat, gt_class, gt_time):
+        """Algorithm 1 lines 4-40, on one fragment, at theta_old.
 
-        time_loss_matrix = self.l1(t_hat[None, :], gt_time[:, None])
-        class_loss_matrix = None
-        if beat_only:
-            class_loss_matrix = torch.zeros_like(time_loss_matrix.T)
-        else:
-            class_loss_matrix = -log_probabilities[:, gt_class[labelled]]
-
-        l_match = time_loss_matrix + class_loss_matrix.T
-
-        return l_match
-
-    def _e_step(self, class_logits, t_hat, gt_class, gt_time):
-        """Algorithm 1 lines 4-40, on one fragment, at theta_old."""
+        Reads top to bottom in the pseudocode's order, with each step under the line it
+        implements. Only two helpers are called out, and both are shared with inference
+        so that training and decoding score a hypothesis identically.
+        """
         with torch.no_grad():
-            beat_only = bool((gt_class == CLASS_UNKNOWN).all())
+            ind = bool((gt_class != CLASS_UNKNOWN).any())
 
-            # Lines 5-12: C's own posterior at EVERY candidate j, via Bayes' rule, only
-            # when ind = 1. Per-candidate independent, so this is the same as evaluating
-            # it later at sigma_hat(i) -- the algorithm computes it here, and line 36
-            # reads it back at the matched candidates.
-            log_probabilities = F.log_softmax(class_logits, dim=-1)
-            class_posterior = (self._class_log_posterior(log_probabilities)
-                               if beat_only else None)
+            # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate, when ind = 1. Per
+            # candidate independent, so evaluating it here and reading it back at
+            # sigma_hat(i) on line 36 gives what evaluating it there would.
+            posterior = None if ind else self._class_posterior(log_probabilities)
 
-            # Lines 15-23
-            # corrected = self.build_cost(log_probabilities, t_hat, gt_class, gt_time)
-            corrected = self.build_l_match(class_logits, t_hat, gt_class, gt_time)
+            # Lines 15-23: L_match(i, j).
+            l_match = self.build_l_match(log_probabilities, t_hat, gt_class, gt_time)
 
-            # Line 26: resolve sigma_hat
-            sigma_np = subset_select_dp(corrected.cpu().numpy())
-            sigma = torch.from_numpy(sigma_np).to(log_probabilities.device)
+            # Line 26: sigma_hat <- SubsetSelectDP(L_match).
+            sigma = subset_select_dp(l_match.cpu().numpy())
 
-            # JA: pi_p_i in line 27 is softmax(class_logits)[sigma]
-            if beat_only:
-                # Line 36: q_i(c) <- P_hat(C=c | x, sigma_hat(i)), read back at the
-                # matched candidates rather than re-derived.
-                q = tuple(beat_class[sigma] for beat_class in class_posterior)
-                # Lines 39-41: the joint responsibility itself. This is the E-step's
-                # whole output -- pi over the (omega, L) hypotheses. Everything the
-                # M-step needs is a function of pi and of theta, so nothing else
-                # crosses the boundary.
-                scores = self._log_scores(q)
-                if scores is not None:
-                    scores_flat = torch.cat([scores[L] for L in scores])
-                    pi_omega_l = torch.softmax(scores_flat, dim=0)
-                    return Match(sigma_np, pi_omega_l)
+            if ind:
+                return Match(sigma)
 
-            return Match(sigma_np)
+            # Line 36: q_i(c) <- P_hat(C = c | x, sigma_hat(i)).
+            matched = torch.from_numpy(sigma).to(log_probabilities.device)
+            q = tuple(channel[matched] for channel in posterior)
+
+            # Line 39: the numerator, pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
+            scores = self._hypothesis_scores(q)
+            if scores is None:
+                return Match(sigma)
+
+            # Line 40: pi_{omega,L} <- that numerator over its own sum across every
+            # hypothesis. This is the E-step's whole output. Everything the M-step needs
+            # is a function of pi and of theta, so nothing else crosses the boundary.
+            flat = torch.cat([scores[meter] for meter in scores])
+            return Match(sigma, flat / flat.sum())
 
 
     def _class_term(self, matched_class_probs, gt_class, target, match):
@@ -203,11 +180,9 @@ class SubsetCriterion(nn.Module):
         """Line 56's timing term: lambda_L1 |t_i - t_hat_sigma(i)|, summed over events."""
         return self.lambda_l1 * residual.sum()
 
-    def _m_step(self, match, class_logits, t_hat, target):
+    def _m_step(self, match, log_probabilities, t_hat, target):
         """Algorithm 2 lines 48-56: sigma_hat held fixed, the loss built at theta."""
         gt_class, gt_time = target['classes'], target['times']
-
-        log_probabilities = F.log_softmax(class_logits, dim=-1)
 
         device = log_probabilities.device
         num_candidates = log_probabilities.shape[0]
@@ -266,10 +241,10 @@ class SubsetCriterion(nn.Module):
                 continue
 
             # E-step: MAP estimate of sigma under the current theta (Alg. 3, 1-9)
-            match = self._e_step(class_logits[b], t_hat[b], gt_class, gt_time)
+            match = self._e_step(log_probabilities[b], t_hat[b], gt_class, gt_time)
 
             # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15).
-            terms = self._m_step(match, class_logits[b], t_hat[b], targets[b])
+            terms = self._m_step(match, log_probabilities[b], t_hat[b], targets[b])
 
             for key, bucket in (('class', class_terms), ('time', time_terms),
                                 ('background', background_terms)):
@@ -350,6 +325,35 @@ class SubsetCriterion(nn.Module):
         return (log_p[:, DOWNBEAT] - self.log_data_prior[DOWNBEAT],
                 log_p[:, BEAT] - self.log_data_prior[BEAT])
 
+    def _class_posterior(self, log_p):
+        """Algorithm 1 lines 7 and 10, as written: a ratio of probabilities.
+
+            l_hat_j(x | c)  =  p_hat_j(c | x) / pi_data(c)
+            P_hat(C = c | x, j)  =  pi_C(c) l_hat_j(x | c) / sum_c' pi_C(c') l_hat_j(x | c')
+
+        Bayes' rule over {DB, B}, whose support excludes empty because matching has
+        already established the event is a real beat. No logarithm appears in either
+        line, so none appears here; _class_log_posterior is the same quantity for the
+        consumers whose own line does carry one (Algorithm 2 line 52).
+
+        The head's probabilities are formed in float64 before the division. The class
+        can be rejected by 100 nats or more at a confident candidate, which float32
+        stores as exactly zero and would make the ratio 0/0; float64 reaches to 708.
+        That is a choice of precision, not a change of formula.
+        """
+        p = log_p.double().exp()
+        prior = self.log_class_prior.double().exp()
+        data_prior = self.log_data_prior.double().exp()
+
+        likelihood_db = p[:, DOWNBEAT] / data_prior[DOWNBEAT]
+        likelihood_b = p[:, BEAT] / data_prior[BEAT]
+
+        joint_db = prior[DOWNBEAT] * likelihood_db
+        joint_b = prior[BEAT] * likelihood_b
+        total = joint_db + joint_b
+
+        return joint_db / total, joint_b / total
+
     def _class_log_posterior(self, log_p):
         """Algorithm 1 line 10: P_hat(C = c | x, j) = pi_C(c) l_hat_j / sum_c' ...
 
@@ -418,12 +422,12 @@ class SubsetCriterion(nn.Module):
         None when no meter candidate is viable -- which on line 17's product means
         there is no hypothesis to take an argmax over, not that the answer is beats.
 
-        Lines 11-14 are _class_log_posterior and line 17's numerator is
-        _log_scores: the same two functions the E-step uses, so inference and
+        Lines 11-14 are _class_posterior and line 17's numerator is
+        _hypothesis_scores: the same two functions the E-step uses, so inference and
         training score a hypothesis identically by construction. Line 17's denominator
         is constant in (omega, L), so line 20's argmax needs only the numerator.
         """
-        blocks = self._log_scores(self._class_log_posterior(log_p))
+        blocks = self._hypothesis_scores(self._class_posterior(log_p))
         if not blocks:
             return None
 
@@ -441,7 +445,7 @@ class SubsetCriterion(nn.Module):
                 break
             start += width
 
-        # Line 23: c_i(omega_hat, L_hat), the same pattern _log_scores
+        # Line 23: c_i(omega_hat, L_hat), the same pattern _hypothesis_scores
         # scored, so the emitted labels are exactly what won the argmax.
         i0 = torch.arange(log_p.shape[0], device=log_p.device)
         is_downbeat = ((omega_hat + i0) % meter_hat) == 0
@@ -461,8 +465,57 @@ class SubsetCriterion(nn.Module):
             return -math.log(meter)
         return self.meter_prior.get(meter, -float('inf'))
 
+    def _hypothesis_scores(self, q):
+        """Algorithm 1 line 39's numerator, as written: a product of probabilities.
+
+            pi_M(L) pi_omega(omega) prod_{i=0}^{M-1} q_i(c_i(omega, L))
+
+        q is (P_hat(DB), P_hat(B)) per event, as lines 5-12 produced it and line 36 read
+        it back at the matched candidates. One entry per (omega, L), grouped by meter,
+        in the order line 40 sums over.
+
+        The product runs in float64, which q already is. Measured over fold 0 at two
+        checkpoints, the rejected hypotheses reach 1e-360 and would vanish in float32,
+        while the best hypothesis of a fragment sits near 1e-1 because it agrees with
+        the head. Line 40 divides by that winner, so float32 would in fact survive here;
+        float64 costs nothing and removes the question.
+        """
+        q_db, q_b = q
+        M = q_db.shape[0]
+        events = torch.arange(M, device=q_db.device)
+        blocks = {}
+
+        for meter in self.meter_candidates:
+            meter = int(meter)
+            # A meter of 1 makes every event a downbeat, so it carries no phase to
+            # infer. Requiring M >= L is a choice about short fragments rather than a
+            # well-definedness guard: c_i(omega, L) is defined for any L, but meters
+            # larger than the event count generate indistinguishable patterns, so they
+            # would only spread the prior's mass. It fires only on degenerate crops.
+            if meter <= 1 or M < meter:
+                continue
+
+            # pi_M(L) pi_omega(omega), the same under every phase of a given meter.
+            prior = math.exp(self._log_prior(meter))
+
+            phases = torch.arange(meter, device=q_db.device)
+            # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.
+            is_db = ((phases[:, None] + events[None, :]) % meter) == 0
+
+            # q_i(c_i(omega, L)) for every event, then the product over events.
+            factors = torch.where(is_db, q_db[None, :], q_b[None, :])
+            blocks[meter] = prior * factors.prod(dim=1)
+
+        return blocks or None
+
     def _log_scores(self, q):
-        """Algorithm 1 line 40's numerator: the log score of every (omega, L) hypothesis.
+        """Algorithm 2 line 52's bracket: the log score of every (omega, L) hypothesis.
+
+            log pi_M(L) + log pi_omega(omega) + sum_i log P_hat(C_i = c_i(omega, L))
+
+        The M-step's own line writes these logs, so this is not _hypothesis_scores with
+        a logarithm bolted on; it is the other formula. The two agree up to exp, which
+        is what makes Fisher's identity hold across the E/M boundary.
 
         q is (log P_hat(DB), log P_hat(B)) per event, as lines 5-12 produced it and
         line 36 read it back at the matched candidates. Taking it rather than raw
