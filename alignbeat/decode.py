@@ -1,5 +1,4 @@
 """Targets in, detections out: Algorithm 10 and the annotation conversions."""
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -32,10 +31,6 @@ def targets_to_events(target, num_frames=None):
         dtype=torch.long, device=target.device)
     times = torch.tensor(frames, dtype=torch.float32, device=target.device) / float(num_frames)
     return {'classes': classes, 'times': times}
-
-
-def batch_targets_to_events(targets, num_frames=None):
-    return [targets_to_events(targets[b], num_frames=num_frames) for b in range(targets.shape[0])]
 
 
 def intervals_to_events(annotations, num_frames):
@@ -97,16 +92,6 @@ def intervals_to_events(annotations, num_frames):
 # ---------------------------------------------------------------------------
 # Inference (section 9.2, Algorithm 10)
 # ---------------------------------------------------------------------------
-
-def estimate_beat_period(times, scores, threshold=0.2):
-    """Equation (36)'s Delta_bar, estimated from PREDICTIONS rather than matches."""
-    kept = times[scores >= threshold]
-    if kept.shape[0] < 4:
-        return None
-    gaps = np.diff(np.sort(kept))
-    gaps = gaps[gaps > 0]
-    return float(np.median(gaps)) if gaps.size else None
-
 
 def decode_events(class_logits, t_hat, tau=0.2):
     """Per-candidate argmax over {DB, B, empty}, kept when it clears tau."""

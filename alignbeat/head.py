@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from alignbeat.classes import F_MEASURE_TOLERANCE, NUM_CLASSES
+from alignbeat.classes import F_MEASURE_TOLERANCE
 
 
 # ---------------------------------------------------------------------------

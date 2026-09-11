@@ -2,7 +2,6 @@
 import math
 from typing import NamedTuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,18 +89,9 @@ class SubsetCriterion(nn.Module):
         return self.lambda_l1 * (t_hat - t_target).abs()
 
     def build_l_match(self, log_probabilities, t_hat, gt_class, gt_time):
-        """Algorithm 1 lines 18 and 20: L_match(i, j) for every event i and candidate j.
-
-        Line 18, ind = 0. The label is observed, so the pair costs that class's own
-        negative log-likelihood plus the timing error.
-
-        Line 20, ind = 1. The label says an event occurred without saying which kind, so
-        nothing about the class distinguishes one candidate from another and the pair
-        costs the timing error alone. The matching for beat-only data is therefore
-        decided by time, subject to the ordering constraint.
-
-        Returns (M, N), the orientation subset_select_dp consumes.
-        """
+        """Algorithm 1 lines 18 and 20: L_match(i, j), returned (M, N) for the DP.
+        Line 18 charges the observed class's NLL; line 20 has no class to charge, so an
+        unlabelled event pays the timing error alone."""
         labelled = gt_class != CLASS_UNKNOWN
 
         # Line 19's L1, already scaled by lambda_L1.
@@ -117,16 +107,9 @@ class SubsetCriterion(nn.Module):
         return torch.where(labelled[:, None], class_cost, 0.0) + time_cost
 
     def _e_step(self, class_logits, t_hat, gt_class, gt_time):
-        """Algorithm 1 lines 4-40, on one fragment, at theta_old.
-
-        Reads top to bottom in the pseudocode's order, with each step under the line it
-        implements. Only two helpers are called out, and both are shared with inference
-        so that training and decoding score a hypothesis identically.
-
-        Takes the logits because the algorithm wants the head both ways: lines 18 and 20
-        write log p_hat, lines 7 and 10 write p_hat. Both come straight off the logits,
-        so neither is the other exponentiated or logged back.
-        """
+        """Algorithm 1 lines 4-40, on one fragment, at theta_old. Takes the logits
+        because the algorithm wants the head both ways: lines 18 and 20 write log p_hat,
+        lines 7 and 10 write p_hat, and both come straight off them."""
         with torch.no_grad():
             ind = bool((gt_class != CLASS_UNKNOWN).any())
 
@@ -162,7 +145,7 @@ class SubsetCriterion(nn.Module):
             return Match(sigma, flat / flat.sum())
 
 
-    def _class_term(self, matched_class_probs, gt_class, target, match):
+    def _class_term(self, matched_class_probs, gt_class, match):
         """Algorithm 2 lines 49-53's cls(theta; ind), branched on the indicator.
 
         ind=0 (line 50) is an ordinary cross-entropy against the raw class head: the
@@ -199,7 +182,7 @@ class SubsetCriterion(nn.Module):
 
         # lines 49-56, first term: cls(theta; ind)
         class_term, unlabelled = self._class_term(
-            log_probabilities[sigma], gt_class, target, match)
+            log_probabilities[sigma], gt_class, match)
 
         residual = (gt_time - t_hat[sigma]).abs()            # (M,), raw
         time_term = self._time_term(residual)
@@ -226,7 +209,7 @@ class SubsetCriterion(nn.Module):
         class_terms, time_terms, background_terms = [], [], []
         matched_residuals = []
 
-        num_events, num_contributing, num_infeasible, num_unlabelled = 0, 0, 0, 0
+        num_events, num_infeasible, num_unlabelled = 0, 0, 0
 
         for b in range(batch_size):
             gt_class = targets[b]['classes']
@@ -237,7 +220,6 @@ class SubsetCriterion(nn.Module):
 
             if M == 0:
                 background_terms.append(background_nll.sum())
-                num_contributing += 1
                 continue
 
             if M > num_candidates:
@@ -263,26 +245,23 @@ class SubsetCriterion(nn.Module):
 
             num_unlabelled += terms['unlabelled']
             num_events += M
-            num_contributing += 1
 
         losses = self._aggregate(
-            class_logits, class_terms, time_terms, background_terms,
-            num_contributing)
+            class_logits, class_terms, time_terms, background_terms)
 
         with torch.no_grad():
             stats = self._make_stats(
-                losses, t_hat, num_candidates, matched_residuals,
+                losses, t_hat, matched_residuals,
                 counts=dict(num_events=num_events, infeasible=num_infeasible,
                             unlabelled_events=num_unlabelled))
 
         if self.training:
             self._call_count += 1
         if self._call_count % DIAGNOSTIC_EVERY == 1:
-            self._log_diagnostic(stats, num_candidates)
+            self._log_diagnostic(stats)
         return losses, stats
 
-    def _aggregate(self, class_logits, class_terms, time_terms, background_terms,
-                   num_contributing):
+    def _aggregate(self, class_logits, class_terms, time_terms, background_terms):
         """Per-fragment terms -> the loss dict train.py unpacks."""
         zero = torch.nan_to_num(class_logits).sum() * 0.0
         total = lambda terms: torch.stack(terms).sum() if terms else zero
@@ -295,8 +274,7 @@ class SubsetCriterion(nn.Module):
         losses['total'] = sum(losses[k] for k in ('class', 'time', 'background'))
         return losses
 
-    def _make_stats(self, losses, t_hat, num_candidates, matched_residuals, counts,
-                    ):
+    def _make_stats(self, losses, t_hat, matched_residuals, counts):
         """Logging floats, refreshed on a diagnostic step and cached otherwise."""
         stats = {
             'cls': float(losses['class']), 'time': float(losses['time']),
@@ -311,7 +289,7 @@ class SubsetCriterion(nn.Module):
 
         return stats
 
-    def _log_diagnostic(self, stats, num_candidates):
+    def _log_diagnostic(self, stats):
         print(f"[subset] residual={stats.get('residual_mean', float('nan')):.5f} "
               f"({stats.get('residual_mean', 0.0) * FRAGMENT_SECONDS * 1000:.0f}ms) "
               f"min_gap={stats['min_gap']:.2e} events={stats['num_events']} "
@@ -333,21 +311,9 @@ class SubsetCriterion(nn.Module):
                 log_p[:, BEAT] - self.data_prior[BEAT].log())
 
     def _class_posterior(self, p):
-        """Algorithm 1 lines 7 and 10, as written: a ratio of probabilities.
-
-            l_hat_j(x | c)  =  p_hat_j(c | x) / pi_data(c)
-            P_hat(C = c | x, j)  =  pi_C(c) l_hat_j(x | c) / sum_c' pi_C(c') l_hat_j(x | c')
-
-        Bayes' rule over {DB, B}, whose support excludes empty because matching has
-        already established the event is a real beat. No logarithm appears in either
-        line, so none appears here; _class_log_posterior is the same quantity for the
-        consumers whose own line does carry one (Algorithm 2 line 52).
-
-        p is the head's own p_hat_j(c | x), the softmax of the logits. The division
-        runs in float64: a class can be rejected by 100 nats or more at a confident
-        candidate, which float32 stores as exactly zero and would make the ratio 0/0,
-        while float64 reaches to 708. That is a choice of precision, not of formula.
-        """
+        """Algorithm 1 lines 7 and 10: Bayes over {DB, B}, pi_data divided out first.
+        Neither line carries a logarithm, so neither does this; _class_log_posterior is
+        the same quantity for line 52. float64 because a rejected class underflows f32."""
         p = p.double()
         prior = self.class_prior.double()
         data_prior = self.data_prior.double()
@@ -380,22 +346,9 @@ class SubsetCriterion(nn.Module):
         return log_db - log_norm, log_b - log_norm
 
     def _beat_only_term(self, matched_log, pi):
-        """Algorithm 2 line 52's cls(theta; 1), as written.
-
-            cls(theta; 1) = - sum_{L, omega} pi_{omega,L} [ log pi_M(L) + log pi_omega
-                                              + sum_i log P_hat(C_i = c_i(omega, L)) ]
-
-        The bracket is exactly the hypothesis score _log_scores builds, so the surrogate
-        is one dot product: pi frozen at theta_old against the same scores recomputed at
-        theta. The EM structure is the two arguments -- pi carries no gradient, the
-        scores carry all of it.
-
-        P_hat is normalised over {DB, B}, so this is invariant to the background
-        channel: a beat-only fragment's class term says which kind of event each one is
-        and says nothing about whether it is an event at all. Line 56's gamma term
-        covers only the candidates sigma_hat did not match, so nothing in the loss
-        constrains p(empty) at a matched event on beat-only data. That is what line 52
-        specifies.
+        """Algorithm 2 line 52's cls(theta; 1): pi frozen at theta_old, dotted into the
+        same bracket recomputed at theta. P_hat is normalised over {DB, B}, so this says
+        nothing about whether a matched candidate is an event at all.
         """
         if pi is None:
             # No viable meter hypothesis, so there is no pi_{omega,L} to take an
@@ -412,8 +365,7 @@ class SubsetCriterion(nn.Module):
         every one of them from it.
 
         p is the head's probabilities at the DETECTED candidates only, already ordered
-        by increasing t_hat (line 7). Lines 11-14 and 17 are written over probabilities,
-        so that is what they get. Returns (classes, omega_hat, L_hat), or
+        by increasing t_hat (line 7). Returns (classes, omega_hat, L_hat), or
         None when no meter candidate is viable -- which on line 17's product means
         there is no hypothesis to take an argmax over, not that the answer is beats.
 
@@ -451,40 +403,23 @@ class SubsetCriterion(nn.Module):
 
 
     def _prior(self, meter):
-        """pi_M(L) pi_omega(omega), Algorithm 1 line 39's first two factors.
-
-        pi_omega is uniform over the L phases, so the pair is the same under every omega
-        of a given meter and meter_prior stores them combined. With no corpus table the
-        meter prior is flat, leaving pi_omega alone.
-        """
+        """pi_M(L) pi_omega(omega), line 39's first two factors, stored combined.
+        pi_omega is uniform over the L phases, so the pair is the same under every omega."""
         if self.meter_prior is None:
             return 1.0 / meter
         return self.meter_prior.get(meter, 0.0)
 
     def _log_prior(self, meter):
-        """log pi_M(L) + log pi_omega(omega), Algorithm 2 line 52's first two brackets.
-
-        The logarithm is line 52's own. A meter the corpus never shows has prior zero,
-        whose log is -inf, which is the score that hypothesis deserves.
+        """The same pair in line 52's own logs. A meter the corpus never shows scores
+        -inf, which is what it deserves.
         """
         prior = self._prior(meter)
         return math.log(prior) if prior > 0.0 else -float('inf')
 
     def _hypothesis_scores(self, q):
-        """Algorithm 1 line 39's numerator, as written: a product of probabilities.
-
-            pi_M(L) pi_omega(omega) prod_{i=0}^{M-1} q_i(c_i(omega, L))
-
-        q is (P_hat(DB), P_hat(B)) per event, as lines 5-12 produced it and line 36 read
-        it back at the matched candidates. One entry per (omega, L), grouped by meter,
-        in the order line 40 sums over.
-
-        The product runs in float64, which q already is. Measured over fold 0 at two
-        checkpoints, the rejected hypotheses reach 1e-360 and would vanish in float32,
-        while the best hypothesis of a fragment sits near 1e-1 because it agrees with
-        the head. Line 40 divides by that winner, so float32 would in fact survive here;
-        float64 costs nothing and removes the question.
-        """
+        """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
+        One entry per (omega, L), grouped by meter, in the order line 40 sums over.
+        Rejected hypotheses reach 1e-360, so the product stays in q's own float64."""
         q_db, q_b = q
         M = q_db.shape[0]
         events = torch.arange(M, device=q_db.device)
@@ -514,26 +449,9 @@ class SubsetCriterion(nn.Module):
         return blocks or None
 
     def _log_scores(self, q):
-        """Algorithm 2 line 52's bracket: the log score of every (omega, L) hypothesis.
-
-            log pi_M(L) + log pi_omega(omega) + sum_i log P_hat(C_i = c_i(omega, L))
-
-        The M-step's own line writes these logs, so this is not _hypothesis_scores with
-        a logarithm bolted on; it is the other formula. The two agree up to exp, which
-        is what makes Fisher's identity hold across the E/M boundary.
-
-        q is (log P_hat(DB), log P_hat(B)) per event, as lines 5-12 produced it and
-        line 36 read it back at the matched candidates. Taking it rather than raw
-        logits is what keeps the algorithm's own order: the posterior is built once,
-        before sigma, and this only scores patterns against it.
-
-        The window crop is arbitrary, so the span may begin anywhere in the bar and
-        every phi_0 in range(L) is open.
-
-        Vectorised over hypotheses: one (H, M) downbeat mask and one matmul, rather than
-        a where+sum per hypothesis. With gradient on, the per-hypothesis loop launched
-        ~56 kernels per labelled fragment and cost 45 ms per batch; this costs two.
-        """
+        """Algorithm 2 line 52's bracket, in the logs that line writes itself:
+        log pi_M(L) + log pi_omega + sum_i log P_hat(C_i = c_i(omega, L)). Agreeing with
+        _hypothesis_scores up to exp is what makes Fisher's identity hold across E/M."""
         log_db, log_b = q
         M = log_db.shape[0]
         device = log_db.device
