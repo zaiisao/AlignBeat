@@ -44,11 +44,15 @@ class SubsetCriterion(nn.Module):
 
     def __init__(self,
                  data_prior, lambda_l1=LAMBDA_L1, gamma=0.5,
-                 meter_prior=None):
+                 meter_prior=None, match_event_cost=False, loss_event_term=False):
         super(SubsetCriterion, self).__init__()
 
         self.lambda_l1 = lambda_l1
         self.gamma = gamma
+        # The two deviations from algorithm5_hard-1, each independently switchable so
+        # an arm can price them apart. False on both is the algorithm as written.
+        self.match_event_cost = match_event_cost      # line 20's -log(1 - p(empty))
+        self.loss_event_term = loss_event_term        # the same quantity in line 52
         self.meter_candidates = tuple(sorted(int(L) for L in meter_prior)) if meter_prior else ()
         # pi_M(L) pi_omega(omega), combined: pi_omega is uniform over the L phases, so
         # the pair is the same under every phase of a given meter.
@@ -81,7 +85,9 @@ class SubsetCriterion(nn.Module):
         self.register_buffer("data_prior", data_priors / data_priors.sum())
 
         print(f"[subset-criterion] lambda_L1={self.lambda_l1:g} gamma={self.gamma} "
-              f"meter_candidates={self.meter_candidates or 'off'}", flush=True)
+              f"meter_candidates={self.meter_candidates or 'off'} "
+              f"match_event_cost={self.match_event_cost} "
+              f"loss_event_term={self.loss_event_term}", flush=True)
 
 
     def l1(self, t_hat, t_target):
@@ -104,7 +110,14 @@ class SubsetCriterion(nn.Module):
         # label and line 20 on the events that do not.
         class_cost = -log_probabilities[:, gt_class.clamp(min=0)].transpose(0, 1)
 
-        return torch.where(labelled[:, None], class_cost, 0.0) + time_cost
+        # DEVIATION, off by default: line 20's own -log(1 - p_j(empty)), the mass the
+        # head puts on the event classes, charged to unlabelled events instead of zero.
+        unlabelled_cost = 0.0
+        if self.match_event_cost:
+            unlabelled_cost = -torch.logsumexp(
+                log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1)[None, :]
+
+        return torch.where(labelled[:, None], class_cost, unlabelled_cost) + time_cost
 
     def _e_step(self, class_logits, t_hat, gt_class, gt_time):
         """Algorithm 1 lines 4-40, on one fragment, at theta_old. Takes the logits
@@ -350,15 +363,22 @@ class SubsetCriterion(nn.Module):
         same bracket recomputed at theta. P_hat is normalised over {DB, B}, so this says
         nothing about whether a matched candidate is an event at all.
         """
+        # DEVIATION, off by default: line 50 decomposes into which class the event is
+        # and whether it is an event at all. Line 52 supplies only the first, so nothing
+        # constrains p(empty) at a matched event on beat-only data. This restores it.
+        event = (-torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
+                 if self.loss_event_term
+                 else torch.zeros((), dtype=matched_log.dtype,
+                                  device=matched_log.device))
+
         if pi is None:
             # No viable meter hypothesis, so there is no pi_{omega,L} to take an
-            # expectation under and line 52 has no value. The fragment contributes no
-            # class term rather than being force-fitted to a label.
-            return torch.zeros((), dtype=matched_log.dtype, device=matched_log.device)
+            # expectation under and line 52 has no value.
+            return event
 
         scores = self._log_scores(self._class_log_posterior(matched_log))
         flat = torch.cat([scores[L] for L in scores])
-        return -(pi * flat).sum()
+        return event - (pi * flat).sum()
 
     def infer_pattern(self, p):
         """Algorithm 3 lines 10-24: resolve one (omega, L) for these events and label
