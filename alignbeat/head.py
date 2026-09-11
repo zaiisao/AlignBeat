@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from alignbeat.classes import NUM_CLASSES
+from alignbeat.classes import F_MEASURE_TOLERANCE, NUM_CLASSES
 
 
 # ---------------------------------------------------------------------------
@@ -141,3 +141,49 @@ def sinusoidal(position, dim):
                       * (-math.log(10000.0) / max(half - 1, 1)))
     angles = position.unsqueeze(-1) * freqs
     return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)[..., :dim]
+
+
+# Minimum gap between consecutive candidates, as a fraction of the window. Two
+# detections can only be matched to the same reference beat if they lie within 2 x the
+# metric tolerance of each other, so a floor of 2 x 70 ms makes that impossible by
+# construction. 0.218% of annotated inter-beat intervals in the corpus are below it.
+MIN_GAP_SECONDS = 2 * F_MEASURE_TOLERANCE
+
+
+def floored_times(r, window_seconds, min_gap_seconds=MIN_GAP_SECONDS):
+    """Equation (1) with a floor on each increment.
+
+    Section 9.2 argues no de-duplication is needed because eq. (1) guarantees
+    t_0 < t_1 < ... < t_{N-1}, so "no two reported detections can ever coincide or
+    cross in time". That is true, and it is not the property the metric needs:
+    mir_eval matches one estimate per reference inside a +-70 ms window, so two
+    detections 22 ms apart are distinct, correctly ordered, and still cost a false
+    positive. Measured on a trained model: duplicate pairs sit a median 22 ms apart,
+    every one strictly ordered, and they are 9.2% of all fires.
+
+    Strict ordering is a statement about points; the metric scores intervals. This
+    extends the guarantee from ordering to tolerance-disjointness, in the same style --
+    architectural, not penalised:
+
+        t_j = sum_{k<=j} [ delta + (1 - N delta) softmax(r)_k ],   delta = min_gap/window
+
+    Every increment is at least delta, so no two candidates can fall inside one
+    tolerance window, so no reference beat can absorb two detections. Still a cumulative
+    sum of strictly positive increments, still strictly increasing for every r, still
+    normalised to (0, 1].
+
+    The cost is a recall ceiling: true beats closer together than min_gap can never both
+    be emitted. At 140 ms that is 0.218% of the corpus.
+    """
+    # float32 cumsum over N terms loses ~1.2 us of the floor by the last candidate,
+    # which would leave the guarantee short of 2 x tolerance by a hair -- enough to be
+    # false in principle, which defeats the purpose. Carry a 0.1 ms margin so the
+    # realised gap clears the tolerance in float32 too.
+    N = r.shape[-1]
+    delta = (float(min_gap_seconds) + 1e-4) / float(window_seconds)
+    slack = 1.0 - N * delta
+    if slack <= 0:
+        raise ValueError(
+            f"N={N} candidates at a {min_gap_seconds:g}s floor need "
+            f"{N * min_gap_seconds:g}s > {window_seconds:g}s of window")
+    return torch.cumsum(delta + slack * torch.softmax(r, dim=-1), dim=-1)
