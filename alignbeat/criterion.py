@@ -124,13 +124,13 @@ class SubsetCriterion(nn.Module):
         because the algorithm wants the head both ways: lines 18 and 20 write log p_hat,
         lines 7 and 10 write p_hat, and both come straight off them."""
         with torch.no_grad():
-            ind = bool((gt_class != CLASS_UNKNOWN).any())
+            has_class_labels = bool((gt_class != CLASS_UNKNOWN).any())
 
             # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate, when ind = 1. Per
             # candidate independent, so evaluating it here and reading it back at
             # sigma_hat(i) on line 36 gives what evaluating it there would.
-            posterior = (None if ind else
-                         self._class_posterior(F.softmax(class_logits, dim=-1)))
+            class_posterior = (None if has_class_labels else
+                               self._class_posterior(F.softmax(class_logits, dim=-1)))
 
             # Lines 15-23: L_match(i, j).
             l_match = self.build_l_match(F.log_softmax(class_logits, dim=-1),
@@ -139,23 +139,25 @@ class SubsetCriterion(nn.Module):
             # Line 26: sigma_hat <- SubsetSelectDP(L_match).
             sigma = subset_select_dp(l_match.cpu().numpy())
 
-            if ind:
+            if has_class_labels:
                 return Match(sigma)
 
             # Line 36: q_i(c) <- P_hat(C = c | x, sigma_hat(i)).
-            matched = torch.from_numpy(sigma).to(class_logits.device)
-            q = tuple(channel[matched] for channel in posterior)
+            matched_candidates = torch.from_numpy(sigma).to(class_logits.device)
+            matched_class_posterior = tuple(channel[matched_candidates]
+                                            for channel in class_posterior)
 
             # Line 39: the numerator, pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
-            scores = self._hypothesis_scores(q)
-            if scores is None:
+            scores_by_meter = self._meter_phase_scores(matched_class_posterior)
+            if scores_by_meter is None:
                 return Match(sigma)
 
             # Line 40: pi_{omega,L} <- that numerator over its own sum across every
-            # hypothesis. This is the E-step's whole output. Everything the M-step needs
+            # (omega, L) pair. This is the E-step's whole output. Everything the M-step needs
             # is a function of pi and of theta, so nothing else crosses the boundary.
-            flat = torch.cat([scores[meter] for meter in scores])
-            return Match(sigma, flat / flat.sum())
+            meter_phase_scores = torch.cat(
+                [scores_by_meter[meter] for meter in scores_by_meter])
+            return Match(sigma, meter_phase_scores / meter_phase_scores.sum())
 
 
     def _class_term(self, matched_class_probs, gt_class, match):
@@ -242,10 +244,10 @@ class SubsetCriterion(nn.Module):
                       flush=True)
                 continue
 
-            # E-step: MAP estimate of sigma under the current theta (Alg. 3, 1-9)
+            # E-step: sigma_hat under the current theta (Algorithm 1, lines 4-40)
             match = self._e_step(class_logits[b], t_hat[b], gt_class, gt_time)
 
-            # M-step: sigma fixed and the loss evaluated at it (Alg. 3, 10-15).
+            # M-step: sigma_hat fixed, the loss built at theta (Algorithm 2, lines 48-56)
             terms = self._m_step(match, log_probabilities[b], t_hat[b], targets[b])
 
             for key, bucket in (('class', class_terms), ('time', time_terms),
@@ -376,9 +378,11 @@ class SubsetCriterion(nn.Module):
             # expectation under and line 52 has no value.
             return event
 
-        scores = self._log_scores(self._class_log_posterior(matched_log))
-        flat = torch.cat([scores[L] for L in scores])
-        return event - (pi * flat).sum()
+        scores_by_meter = self._log_meter_phase_scores(
+            self._class_log_posterior(matched_log))
+        meter_phase_scores = torch.cat(
+            [scores_by_meter[meter] for meter in scores_by_meter])
+        return event - (pi * meter_phase_scores).sum()
 
     def infer_pattern(self, p):
         """Algorithm 3 lines 10-24: resolve one (omega, L) for these events and label
@@ -390,29 +394,29 @@ class SubsetCriterion(nn.Module):
         there is no hypothesis to take an argmax over, not that the answer is beats.
 
         Lines 11-14 are _class_posterior and line 17's numerator is
-        _hypothesis_scores: the same two functions the E-step uses, so inference and
+        _meter_phase_scores: the same two functions the E-step uses, so inference and
         training score a hypothesis identically by construction. Line 17's denominator
         is constant in (omega, L), so line 20's argmax needs only the numerator.
         """
-        blocks = self._hypothesis_scores(self._class_posterior(p))
-        if not blocks:
+        scores_by_meter = self._meter_phase_scores(self._class_posterior(p))
+        if not scores_by_meter:
             return None
 
-        meters = list(blocks)
-        flat = torch.cat([blocks[L] for L in meters])
-        best = int(torch.argmax(flat))                       # line 20
+        meters = list(scores_by_meter)
+        meter_phase_scores = torch.cat([scores_by_meter[meter] for meter in meters])
+        best = int(torch.argmax(meter_phase_scores))         # line 20
 
-        # Invert the concatenation: blocks[L] holds one entry per phase, in phase
+        # Invert the concatenation: each meter holds one entry per phase, in phase
         # order, so the flat index decomposes into (L_hat, omega_hat) by walking it.
         start = 0
         for meter in meters:
-            width = blocks[meter].shape[0]
+            width = scores_by_meter[meter].shape[0]
             if best < start + width:
                 omega_hat, meter_hat = best - start, meter
                 break
             start += width
 
-        # Line 23: c_i(omega_hat, L_hat), the same pattern _hypothesis_scores
+        # Line 23: c_i(omega_hat, L_hat), the same pattern _meter_phase_scores
         # scored, so the emitted labels are exactly what won the argmax.
         i0 = torch.arange(p.shape[0], device=p.device)
         is_downbeat = ((omega_hat + i0) % meter_hat) == 0
@@ -422,28 +426,28 @@ class SubsetCriterion(nn.Module):
         return classes, int(omega_hat), int(meter_hat)
 
 
-    def _prior(self, meter):
+    def _meter_phase_prior(self, meter):
         """pi_M(L) pi_omega(omega), line 39's first two factors, stored combined.
         pi_omega is uniform over the L phases, so the pair is the same under every omega."""
         if self.meter_prior is None:
             return 1.0 / meter
         return self.meter_prior.get(meter, 0.0)
 
-    def _log_prior(self, meter):
+    def _log_meter_phase_prior(self, meter):
         """The same pair in line 52's own logs. A meter the corpus never shows scores
         -inf, which is what it deserves.
         """
-        prior = self._prior(meter)
+        prior = self._meter_phase_prior(meter)
         return math.log(prior) if prior > 0.0 else -float('inf')
 
-    def _hypothesis_scores(self, q):
+    def _meter_phase_scores(self, matched_class_posterior):
         """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
         One entry per (omega, L), grouped by meter, in the order line 40 sums over.
-        Rejected hypotheses reach 1e-360, so the product stays in q's own float64."""
-        q_db, q_b = q
+        Rejected pairs reach 1e-360, so the product stays in the posterior's float64."""
+        q_db, q_b = matched_class_posterior
         M = q_db.shape[0]
         events = torch.arange(M, device=q_db.device)
-        blocks = {}
+        scores_by_meter = {}
 
         for meter in self.meter_candidates:
             meter = int(meter)
@@ -456,7 +460,7 @@ class SubsetCriterion(nn.Module):
                 continue
 
             # pi_M(L) pi_omega(omega), the same under every phase of a given meter.
-            prior = self._prior(meter)
+            prior = self._meter_phase_prior(meter)
 
             phases = torch.arange(meter, device=q_db.device)
             # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.
@@ -464,20 +468,20 @@ class SubsetCriterion(nn.Module):
 
             # q_i(c_i(omega, L)) for every event, then the product over events.
             factors = torch.where(is_db, q_db[None, :], q_b[None, :])
-            blocks[meter] = prior * factors.prod(dim=1)
+            scores_by_meter[meter] = prior * factors.prod(dim=1)
 
-        return blocks or None
+        return scores_by_meter or None
 
-    def _log_scores(self, q):
+    def _log_meter_phase_scores(self, matched_class_posterior):
         """Algorithm 2 line 52's bracket, in the logs that line writes itself:
         log pi_M(L) + log pi_omega + sum_i log P_hat(C_i = c_i(omega, L)). Agreeing with
-        _hypothesis_scores up to exp is what makes Fisher's identity hold across E/M."""
-        log_db, log_b = q
+        _meter_phase_scores up to exp is what makes Fisher's identity hold across E/M."""
+        log_db, log_b = matched_class_posterior
         M = log_db.shape[0]
         device = log_db.device
 
         i0 = torch.arange(M, device=device)
-        blocks = {}
+        scores_by_meter = {}
 
         for meter in self.meter_candidates:
             meter = int(meter)
@@ -489,18 +493,19 @@ class SubsetCriterion(nn.Module):
             if meter <= 1 or M < meter:
                 continue
 
-            log_prior = self._log_prior(meter)
+            log_prior = self._log_meter_phase_prior(meter)
 
             phases = torch.arange(meter, device=device)
             # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.
             is_db = (((phases[:, None] + i0[None, :]) % meter) == 0).to(log_db.dtype)
 
-            blocks[meter] = is_db @ log_db + (1.0 - is_db) @ log_b + log_prior
+            scores_by_meter[meter] = (is_db @ log_db + (1.0 - is_db) @ log_b
+                                      + log_prior)
 
-        if not blocks:
+        if not scores_by_meter:
             return None
 
-        return blocks
+        return scores_by_meter
 
 
     def _meter_log_posterior(self, match_likelihood):
@@ -509,11 +514,13 @@ class SubsetCriterion(nn.Module):
         Convenience for the diagnostics, which start from a checkpoint's logits rather
         than from an E-step that already built the posterior.
         """
-        blocks = self._log_scores(self._class_log_posterior(match_likelihood))
-        if blocks is None:
+        scores_by_meter = self._log_meter_phase_scores(
+            self._class_log_posterior(match_likelihood))
+        if scores_by_meter is None:
             return None
-        meters = list(blocks)
-        log_joint = torch.log_softmax(torch.cat([blocks[L] for L in meters]), dim=0)
+        meters = list(scores_by_meter)
+        log_joint = torch.log_softmax(
+            torch.cat([scores_by_meter[meter] for meter in meters]), dim=0)
         out, start = {}, 0
         for meter in meters:
             out[meter] = log_joint[start:start + meter].logsumexp(dim=0)

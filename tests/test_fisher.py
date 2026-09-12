@@ -46,7 +46,7 @@ def logits(M, seed):
 def marginal_nll(crit, log_p):
     """-log sum_h exp(s_h): the incomplete-data negative log-likelihood line 52's
     surrogate stands in for, with (omega, L) marginalised out."""
-    scores = crit._log_scores(crit._class_log_posterior(log_p))
+    scores = crit._log_meter_phase_scores(crit._class_log_posterior(log_p))
     return -torch.logsumexp(torch.cat([scores[L] for L in scores]), dim=0)
 
 
@@ -57,7 +57,7 @@ def surrogate(crit, log_p, pi):
 def frozen_pi(crit, log_p):
     """pi_{omega,L} exactly as the E-step forms it (Algorithm 1 lines 39-41)."""
     with torch.no_grad():
-        scores = crit._log_scores(crit._class_log_posterior(log_p))
+        scores = crit._log_meter_phase_scores(crit._class_log_posterior(log_p))
         return torch.softmax(torch.cat([scores[L] for L in scores]), dim=0)
 
 

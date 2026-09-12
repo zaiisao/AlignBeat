@@ -35,7 +35,7 @@ def test_pi_omega_L_matches_brute_force_and_couples_events():
         crit = SubsetCriterion(DATA_PRIOR, meter_prior={L: 1.0})
         torch.manual_seed(L)
         matched = torch.log_softmax(torch.randn(M, 3, dtype=torch.float64) * 2, dim=-1)
-        scores = crit._log_scores(crit._class_log_posterior(matched))
+        scores = crit._log_meter_phase_scores(crit._class_log_posterior(matched))
         got = torch.softmax(torch.cat([scores[k] for k in scores]), dim=0)
 
         # Brute force: section 1.3's P_hat, pi_data divided out before pi_C is applied,
@@ -55,7 +55,7 @@ def test_pi_omega_L_matches_brute_force_and_couples_events():
         perturbed = matched.clone()
         perturbed[0] = torch.log_softmax(
             torch.tensor([5.0, -5.0, -5.0], dtype=torch.float64), dim=-1)
-        moved = crit._log_scores(crit._class_log_posterior(perturbed))
+        moved = crit._log_meter_phase_scores(crit._class_log_posterior(perturbed))
         moved = torch.softmax(torch.cat([moved[k] for k in moved]), dim=0)
         assert not np.allclose(got.numpy(), moved.numpy(), atol=1e-6), (
             "pi must couple across events")
@@ -71,7 +71,7 @@ def test_surrogate_matches_the_direct_marginal_gradient():
     matched = torch.log_softmax(logits, dim=-1)
 
     def flat(log_p):
-        blocks = crit._log_scores(crit._class_log_posterior(log_p))
+        blocks = crit._log_meter_phase_scores(crit._class_log_posterior(log_p))
         return torch.cat([blocks[k] for k in blocks])
 
     direct = -flat(matched).logsumexp(dim=0)
@@ -90,7 +90,7 @@ def test_degenerate_meter_contributes_no_class_term():
     torch.manual_seed(0)
     crit = SubsetCriterion(DATA_PRIOR, meter_prior={1: 1.0})
     matched = torch.log_softmax(torch.randn(6, 3), dim=-1)
-    assert crit._log_scores(crit._class_log_posterior(matched)) is None, (
+    assert crit._log_meter_phase_scores(crit._class_log_posterior(matched)) is None, (
         "a degenerate meter must yield no hypothesis")
     term = crit._beat_only_term(matched, None)
     assert torch.allclose(term, torch.zeros_like(term)), (
