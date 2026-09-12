@@ -126,12 +126,6 @@ class SubsetCriterion(nn.Module):
         with torch.no_grad():
             has_class_labels = bool((gt_class != CLASS_UNKNOWN).any())
 
-            # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate, when ind = 1. Per
-            # candidate independent, so evaluating it here and reading it back at
-            # sigma_hat(i) on line 36 gives what evaluating it there would.
-            class_posterior = (None if has_class_labels else
-                               self._class_posterior(F.softmax(class_logits, dim=-1)))
-
             # Lines 15-23: L_match(i, j).
             l_match = self.build_l_match(F.log_softmax(class_logits, dim=-1),
                                          t_hat, gt_class, gt_time)
@@ -140,7 +134,14 @@ class SubsetCriterion(nn.Module):
             sigma = subset_select_dp(l_match.cpu().numpy())
 
             if has_class_labels:
+                # ind = 0: sigma_hat is the whole E-step. Lines 5-12 and 36-40 below
+                # are the ind = 1 branch and have nothing to contribute here.
                 return Match(sigma)
+
+            # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate. The algorithm builds
+            # it before sigma_hat; it is per-candidate independent, so building it here
+            # and reading it back at sigma_hat(i) gives the same numbers.
+            class_posterior = self._class_posterior(F.softmax(class_logits, dim=-1))
 
             # Line 36: q_i(c) <- P_hat(C = c | x, sigma_hat(i)).
             matched_candidates = torch.from_numpy(sigma).to(class_logits.device)
@@ -153,8 +154,8 @@ class SubsetCriterion(nn.Module):
                 return Match(sigma)
 
             # Line 40: pi_{omega,L} <- that numerator over its own sum across every
-            # (omega, L) pair. This is the E-step's whole output. Everything the M-step needs
-            # is a function of pi and of theta, so nothing else crosses the boundary.
+            # (omega, L) pair. This is the E-step's whole output: everything the M-step
+            # needs is a function of pi and theta, so nothing else crosses the boundary.
             meter_phase_scores = torch.cat(
                 [scores_by_meter[meter] for meter in scores_by_meter])
             return Match(sigma, meter_phase_scores / meter_phase_scores.sum())
