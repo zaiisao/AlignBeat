@@ -126,6 +126,12 @@ class SubsetCriterion(nn.Module):
         with torch.no_grad():
             has_class_labels = bool((gt_class != CLASS_UNKNOWN).any())
 
+            # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate. The algorithm reaches
+            # here only when ind = 1; it is built unconditionally so the code runs in the
+            # pseudocode's order, and the labelled path below simply discards it. Nothing
+            # downstream of it feeds L_match, so no ordering changes any result.
+            class_posterior = self._class_posterior(F.softmax(class_logits, dim=-1))
+
             # Lines 15-23: L_match(i, j).
             l_match = self.build_l_match(F.log_softmax(class_logits, dim=-1),
                                          t_hat, gt_class, gt_time)
@@ -134,14 +140,9 @@ class SubsetCriterion(nn.Module):
             sigma = subset_select_dp(l_match.cpu().numpy())
 
             if has_class_labels:
-                # ind = 0: sigma_hat is the whole E-step. Lines 5-12 and 36-40 below
-                # are the ind = 1 branch and have nothing to contribute here.
+                # ind = 0: sigma_hat is the whole E-step. Lines 36-40 are the ind = 1
+                # branch and have nothing to contribute here.
                 return Match(sigma)
-
-            # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate. The algorithm builds
-            # it before sigma_hat; it is per-candidate independent, so building it here
-            # and reading it back at sigma_hat(i) gives the same numbers.
-            class_posterior = self._class_posterior(F.softmax(class_logits, dim=-1))
 
             # Line 36: q_i(c) <- P_hat(C = c | x, sigma_hat(i)).
             matched_candidates = torch.from_numpy(sigma).to(class_logits.device)
