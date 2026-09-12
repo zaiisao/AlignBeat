@@ -348,7 +348,7 @@ def test_beat_only_events_carry_no_class_cost():
 
     gt_t = t_hat[:1].clone()
     unknown = crit.build_l_match(log_p, t_hat, torch.tensor([CLASS_UNKNOWN]), gt_t)
-    time_only = crit.l1(t_hat[None, :], gt_t[:, None])
+    time_only = crit.lambda_l1 * (t_hat[None, :] - gt_t[:, None]).abs()
     assert torch.allclose(unknown, time_only, atol=1e-6)
 
     known = crit.build_l_match(log_p, t_hat, torch.tensor([DOWNBEAT]), gt_t)

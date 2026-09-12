@@ -177,9 +177,10 @@ def test_forward_beat_only_gradient_matches_the_marginal():
     # Recompute the marginal directly at the E-step's own sigma.
     with torch.no_grad():
         log_p = torch.log_softmax(class_logits, dim=-1)[0]
-        match = crit._e_step(log_p, t_hat[0], targets[0]["classes"], targets[0]["times"])
+        match = crit._e_step(class_logits[0], t_hat[0],
+                             targets[0]["classes"], targets[0]["times"])
     z2 = class_logits.detach().clone().requires_grad_(True)
-    matched = torch.log_softmax(z2, dim=-1)[0][torch.from_numpy(match.sigma)]
+    matched = torch.log_softmax(z2, dim=-1)[0][match.sigma]
     g_marg, = torch.autograd.grad(marginal_nll(crit, matched), z2)
 
     # forward() may scale the class term when aggregating; compare direction exactly
@@ -187,7 +188,9 @@ def test_forward_beat_only_gradient_matches_the_marginal():
     s = float((g_forward * g_marg).sum() / (g_marg * g_marg).sum())
     assert torch.allclose(g_forward, s * g_marg, atol=1e-10), \
         f"direction differs; max |diff| = {(g_forward - s * g_marg).abs().max():.3e}"
-    assert abs(s - 1.0) < 1e-9, f"class term is scaled by {s:.6f}, not 1"
+    # 1e-7, not 1e-9: the E-step builds the posterior in float64 and the M-step
+    # surrogate is float32, so the two agree only to float32 precision.
+    assert abs(s - 1.0) < 1e-7, f"class term is scaled by {s:.9f}, not 1"
 
 
 def test_forward_gradient_is_nonzero_and_finite():
@@ -208,6 +211,7 @@ def test_pi_carries_no_gradient():
     crit = criterion()
     class_logits, t_hat, targets = beat_only_batch(seed=4)
     log_p = torch.log_softmax(class_logits, dim=-1)[0]
-    match = crit._e_step(log_p, t_hat[0], targets[0]["classes"], targets[0]["times"])
+    match = crit._e_step(class_logits[0], t_hat[0],
+                         targets[0]["classes"], targets[0]["times"])
     assert match.pi is not None
     assert not match.pi.requires_grad

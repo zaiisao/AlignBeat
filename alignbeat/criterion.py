@@ -56,24 +56,21 @@ class SubsetCriterion(nn.Module):
         self.meter_candidates = tuple(sorted(int(L) for L in meter_prior)) if meter_prior else ()
         # pi_M(L) pi_omega(omega), combined: pi_omega is uniform over the L phases, so
         # the pair is the same under every phase of a given meter.
-        self.meter_prior = ({int(L): p / int(L)
-                             for L, p in meter_prior.items() if p > 0.0}
-                            if meter_prior else None)
+        # self.meter_prior = ({int(L): p / int(L)
+        #                      for L, p in meter_prior.items() if p > 0.0}
+        #                     if meter_prior else None)
 
-        downbeat_share = (sum(self.meter_prior.values())
-                          if self.meter_prior else 0.0)
+        # downbeat_share = (sum(self.meter_prior.values())
+        #                   if self.meter_prior else 0.0)
 
-        if not 0.0 < downbeat_share < 1.0:
-            # No meter candidates, so no hypothesis is ever scored and pi_C is unused.
-            downbeat_share = 0.5
-        prior = torch.tensor([downbeat_share, 1.0 - downbeat_share], dtype=torch.float32)
+        # if not 0.0 < downbeat_share < 1.0:
+        #     # No meter candidates, so no hypothesis is ever scored and pi_C is unused.
+        #     downbeat_share = 0.5
+        # prior = torch.tensor([downbeat_share, 1.0 - downbeat_share], dtype=torch.float32)
+
+        self.meter_prior = meter_prior
 
         self._call_count = 0
-
-        # Persistent: Algorithm 3's Require lists pi_C and pi_data as inference inputs,
-        # and a deployed model has no training split to recount them from. They ride
-        # in the checkpoint.
-        self.register_buffer("class_prior", prior / prior.sum())
 
         # pi_data(c): the DB:B balance the head was trained on, measured per fold by
         # BeatDataModule.get_train_class_prior. Section 1.3 divides it out of the raw
@@ -81,6 +78,9 @@ class SubsetCriterion(nn.Module):
         # own rather than layering on top of it.
         data_priors = torch.tensor([data_prior["downbeat"], data_prior["beat"]],
                                     dtype=torch.float32)
+
+        # JA: We are assuming for now that the document's pi_data is the same as pi_C
+        self.class_prior = data_priors
 
         self.register_buffer("data_prior", data_priors / data_priors.sum())
 
@@ -90,34 +90,30 @@ class SubsetCriterion(nn.Module):
               f"loss_event_term={self.loss_event_term}", flush=True)
 
 
-    def l1(self, t_hat, t_target):
-        """Eq. (3)'s time channel: plain L1 over the fixed E-step scale."""
-        return self.lambda_l1 * (t_hat - t_target).abs()
-
     def build_l_match(self, log_probabilities, t_hat, gt_class, gt_time):
         """Algorithm 1 lines 18 and 20: L_match(i, j), returned (M, N) for the DP.
         Line 18 charges the observed class's NLL; line 20 has no class to charge, so an
         unlabelled event pays the timing error alone."""
         labelled = gt_class != CLASS_UNKNOWN
 
-        # Line 19's L1, already scaled by lambda_L1.
-        time_cost = self.l1(t_hat[None, :], gt_time[:, None])                   # (M, N)
+        # The timing term both 18 and 20 carry
+        time_loss_matrix = self.lambda_l1 * (t_hat[None, :] - gt_time[:, None]).abs()
 
-        # gt_class is CLASS_UNKNOWN at the unlabelled events, which would index the
-        # background column. Clamp so the gather stays on a real class; where() then
-        # discards those entries. Per event rather than per fragment, so a fragment
-        # carrying both kinds of annotation gets line 18 on the events that have a
-        # label and line 20 on the events that do not.
-        class_cost = -log_probabilities[:, gt_class.clamp(min=0)].transpose(0, 1)
+        # Line 18, ind = 0: the observed class's own NLL
+        labelled_class_loss_matrix = -log_probabilities[:, gt_class].T
 
-        # DEVIATION, off by default: line 20's own -log(1 - p_j(empty)), the mass the
-        # head puts on the event classes, charged to unlabelled events instead of zero.
-        unlabelled_cost = 0.0
         if self.match_event_cost:
-            unlabelled_cost = -torch.logsumexp(
+            # Line 20, ind = 1: -log(1 - p_j(empty)), the mass the head puts on the event classes.
+            unlabelled_class_loss_matrix = -torch.logsumexp(
                 log_probabilities[:, [DOWNBEAT, BEAT]], dim=-1)[None, :]
+        else:
+            unlabelled_class_loss_matrix = torch.zeros_like(labelled_class_loss_matrix)
 
-        return torch.where(labelled[:, None], class_cost, unlabelled_cost) + time_cost
+        class_loss_matrix = torch.where(labelled[:, None], 
+                                        labelled_class_loss_matrix,
+                                        unlabelled_class_loss_matrix)
+
+        return class_loss_matrix + time_loss_matrix
 
     def _e_step(self, class_logits, t_hat, gt_class, gt_time):
         """Algorithm 1 lines 4-40, on one fragment, at theta_old. Takes the logits
@@ -125,40 +121,40 @@ class SubsetCriterion(nn.Module):
         lines 7 and 10 write p_hat, and both come straight off them."""
         with torch.no_grad():
             has_class_labels = bool((gt_class != CLASS_UNKNOWN).any())
+            class_posterior = F.softmax(class_logits, dim=-1)
 
             # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate, when ind = 1. Per
             # candidate independent, so evaluating it here and reading it back at
             # sigma_hat(i) on line 36 gives what evaluating it there would.
-            class_posterior = (None if has_class_labels else
-                               self._class_posterior(F.softmax(class_logits, dim=-1)))
+            if not has_class_labels:
+                class_posterior = self._class_posterior(class_posterior)
 
             # Lines 15-23: L_match(i, j).
-            l_match = self.build_l_match(F.log_softmax(class_logits, dim=-1),
+            l_match = self.build_l_match(torch.log(class_posterior),
                                          t_hat, gt_class, gt_time)
 
             # Line 26: sigma_hat <- SubsetSelectDP(L_match).
-            sigma = subset_select_dp(l_match.cpu().numpy())
+            sigma_np = subset_select_dp(l_match.cpu().numpy())
+            sigma = torch.from_numpy(sigma_np).to(class_logits.device)
+            pi = None
 
-            if has_class_labels:
-                return Match(sigma)
+            if not has_class_labels:
+                # Line 36: q_i(c) <- P_hat(C = c | x, sigma_hat(i)).
+                matched_class_posterior = class_posterior[sigma]
 
-            # Line 36: q_i(c) <- P_hat(C = c | x, sigma_hat(i)).
-            matched_candidates = torch.from_numpy(sigma).to(class_logits.device)
-            matched_class_posterior = tuple(channel[matched_candidates]
-                                            for channel in class_posterior)
+                # Line 39: the numerator, pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
+                scores_by_meter = self._meter_phase_scores(matched_class_posterior)
+                if scores_by_meter:
+                    # Line 40: pi_{omega,L} <- that numerator over its own sum across every
+                    # (omega, L) pair. This is the E-step's whole output. Everything the M-step needs
+                    # is a function of pi and of theta, so nothing else crosses the boundary.
+                    meter_phase_scores = torch.cat(
+                        [scores_by_meter[meter] for meter in scores_by_meter])
 
-            # Line 39: the numerator, pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
-            scores_by_meter = self._meter_phase_scores(matched_class_posterior)
-            if scores_by_meter is None:
-                return Match(sigma)
+                    pi = meter_phase_scores / meter_phase_scores.sum()
 
-            # Line 40: pi_{omega,L} <- that numerator over its own sum across every
-            # (omega, L) pair. This is the E-step's whole output. Everything the M-step needs
-            # is a function of pi and of theta, so nothing else crosses the boundary.
-            meter_phase_scores = torch.cat(
-                [scores_by_meter[meter] for meter in scores_by_meter])
-            return Match(sigma, meter_phase_scores / meter_phase_scores.sum())
-
+            return Match(sigma, pi)
+            
 
     def _class_term(self, matched_class_probs, gt_class, match):
         """Algorithm 2 lines 49-53's cls(theta; ind), branched on the indicator.
@@ -185,15 +181,17 @@ class SubsetCriterion(nn.Module):
         """Line 56's timing term: lambda_L1 |t_i - t_hat_sigma(i)|, summed over events."""
         return self.lambda_l1 * residual.sum()
 
-    def _m_step(self, match, log_probabilities, t_hat, target):
+    def _m_step(self, match, class_logits, t_hat, target):
         """Algorithm 2 lines 48-56: sigma_hat held fixed, the loss built at theta."""
         gt_class, gt_time = target['classes'], target['times']
+
+        log_probabilities = F.log_softmax(class_logits, dim=-1)
 
         device = log_probabilities.device
         num_candidates = log_probabilities.shape[0]
         background_nll = -log_probabilities[:, BACKGROUND]
 
-        sigma = torch.from_numpy(match.sigma).to(device)
+        sigma = match.sigma
 
         # lines 49-56, first term: cls(theta; ind)
         class_term, unlabelled = self._class_term(
@@ -248,7 +246,7 @@ class SubsetCriterion(nn.Module):
             match = self._e_step(class_logits[b], t_hat[b], gt_class, gt_time)
 
             # M-step: sigma_hat fixed, the loss built at theta (Algorithm 2, lines 48-56)
-            terms = self._m_step(match, log_probabilities[b], t_hat[b], targets[b])
+            terms = self._m_step(match, class_logits[b], t_hat[b], targets[b])
 
             for key, bucket in (('class', class_terms), ('time', time_terms),
                                 ('background', background_terms)):
@@ -330,17 +328,20 @@ class SubsetCriterion(nn.Module):
         Neither line carries a logarithm, so neither does this; _class_log_posterior is
         the same quantity for line 52. float64 because a rejected class underflows f32."""
         p = p.double()
-        prior = self.class_prior.double()
-        data_prior = self.data_prior.double()
+        class_prior = self.class_prior.double()
+        data_class_prior = self.data_prior.double()
 
-        likelihood_db = p[:, DOWNBEAT] / data_prior[DOWNBEAT]
-        likelihood_b = p[:, BEAT] / data_prior[BEAT]
+        likelihood_db = p[:, DOWNBEAT] / data_class_prior[DOWNBEAT]
+        likelihood_b = p[:, BEAT] / data_class_prior[BEAT]
 
-        joint_db = prior[DOWNBEAT] * likelihood_db
-        joint_b = prior[BEAT] * likelihood_b
+        joint_db = class_prior[DOWNBEAT] * likelihood_db
+        joint_b = class_prior[BEAT] * likelihood_b
         total = joint_db + joint_b
 
-        return joint_db / total, joint_b / total
+        posterior = torch.zeros_like(p)
+        posterior[:, DOWNBEAT] = joint_db / total
+        posterior[:, BEAT] = joint_b / total
+        return posterior
 
     def _class_log_posterior(self, log_p):
         """Algorithm 1 line 10: P_hat(C = c | x, j) = pi_C(c) l_hat_j / sum_c' ...
@@ -365,24 +366,25 @@ class SubsetCriterion(nn.Module):
         same bracket recomputed at theta. P_hat is normalised over {DB, B}, so this says
         nothing about whether a matched candidate is an event at all.
         """
+        # Line 52, the bracket: log pi_M(L) + log pi_omega + sum_i log P_hat(C_i = c_i).
+        # pi is None when no meter hypothesis was viable, which the algorithm does not
+        # contemplate; there is then no expectation to take and the term is zero.
+        surrogate = torch.zeros((), dtype=matched_log.dtype, device=matched_log.device)
+        if pi is not None:
+            scores_by_meter = self._log_meter_phase_scores(
+                self._class_log_posterior(matched_log))
+            meter_phase_scores = torch.cat(
+                [scores_by_meter[meter] for meter in scores_by_meter])
+            surrogate = -(pi * meter_phase_scores).sum()
+
         # DEVIATION, off by default: line 50 decomposes into which class the event is
         # and whether it is an event at all. Line 52 supplies only the first, so nothing
         # constrains p(empty) at a matched event on beat-only data. This restores it.
-        event = (-torch.logsumexp(matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
-                 if self.loss_event_term
-                 else torch.zeros((), dtype=matched_log.dtype,
-                                  device=matched_log.device))
+        if self.loss_event_term:
+            surrogate = surrogate - torch.logsumexp(
+                matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
 
-        if pi is None:
-            # No viable meter hypothesis, so there is no pi_{omega,L} to take an
-            # expectation under and line 52 has no value.
-            return event
-
-        scores_by_meter = self._log_meter_phase_scores(
-            self._class_log_posterior(matched_log))
-        meter_phase_scores = torch.cat(
-            [scores_by_meter[meter] for meter in scores_by_meter])
-        return event - (pi * meter_phase_scores).sum()
+        return surrogate
 
     def infer_pattern(self, p):
         """Algorithm 3 lines 10-24: resolve one (omega, L) for these events and label
@@ -429,8 +431,6 @@ class SubsetCriterion(nn.Module):
     def _meter_phase_prior(self, meter):
         """pi_M(L) pi_omega(omega), line 39's first two factors, stored combined.
         pi_omega is uniform over the L phases, so the pair is the same under every omega."""
-        if self.meter_prior is None:
-            return 1.0 / meter
         return self.meter_prior.get(meter, 0.0)
 
     def _log_meter_phase_prior(self, meter):
@@ -444,7 +444,8 @@ class SubsetCriterion(nn.Module):
         """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
         One entry per (omega, L), grouped by meter, in the order line 40 sums over.
         Rejected pairs reach 1e-360, so the product stays in the posterior's float64."""
-        q_db, q_b = matched_class_posterior
+        q_db = matched_class_posterior[:, DOWNBEAT]
+        q_b = matched_class_posterior[:, BEAT]
         M = q_db.shape[0]
         events = torch.arange(M, device=q_db.device)
         scores_by_meter = {}
