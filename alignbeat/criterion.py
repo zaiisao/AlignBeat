@@ -437,7 +437,9 @@ class SubsetCriterion(nn.Module):
         """The same pair in line 52's own logs. A meter the corpus never shows scores
         -inf, which is what it deserves.
         """
-        prior = self._meter_phase_prior(meter)
+        meter_prior = self._meter_phase_prior(meter)
+        omega_prior = 1.0 / meter
+        prior = meter_prior * omega_prior
         return math.log(prior) if prior > 0.0 else -float('inf')
 
     def _meter_phase_scores(self, matched_class_posterior):
@@ -461,7 +463,9 @@ class SubsetCriterion(nn.Module):
                 continue
 
             # pi_M(L) pi_omega(omega), the same under every phase of a given meter.
-            prior = self._meter_phase_prior(meter)
+            meter_prior = self._meter_phase_prior(meter)
+            omega_prior = 1.0 / meter
+            prior = meter_prior * omega_prior
 
             phases = torch.arange(meter, device=q_db.device)
             # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.

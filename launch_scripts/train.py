@@ -358,7 +358,7 @@ if __name__ == "__main__":
                              "(current). floored: eq.(1) with each increment floored at "
                              "2x the metric tolerance, so no two detections can share a "
                              "reference beat")
-    parser.add_argument("--attention_layers", type=int, default=0,
+    parser.add_argument("--attention_layers", type=int, default=2,
                         help="candidate self-attention layers in the classification "
                              "branch. 0 = per-candidate MLP, each candidate blind to "
                              "its neighbours. >0 lets them coordinate, which is how "
@@ -389,13 +389,15 @@ if __name__ == "__main__":
                              "fresh optimizer and schedule; for thawing a converged pair")
     parser.add_argument("--freeze_encoder", action="store_true",
                         help="train only task_heads, with the encoder held fixed")
-    parser.add_argument("--gamma", type=float, default=0.5)
-    parser.add_argument("--match_event_cost", action="store_true",
-                        help="DEVIATION: charge line 20's -log(1 - p(empty)) to an "
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--match_event_cost", default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help="DEVIATION, on by default: charge line 20's -log(1 - p(empty)) to an "
                              "unlabelled event, so the beat-only matching is not "
                              "decided by time alone")
-    parser.add_argument("--loss_event_term", action="store_true",
-                        help="DEVIATION: add the same quantity to line 52, so something "
+    parser.add_argument("--loss_event_term", default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help="DEVIATION, on by default: add the same quantity to line 52, so something "
                              "constrains p(empty) at a matched beat-only event")
     # NOTE: --train_length (underscore) is defined above and owns dest=train_length.
     # A second "--train-length" action used to be declared here with its own default;
