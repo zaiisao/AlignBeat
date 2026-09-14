@@ -81,6 +81,7 @@ def main(args):
         hung_data=args.hung_data,
         no_val=not args.val,
         fold=args.fold,
+        downbeat_dropout=args.downbeat_dropout,
     )
 
     # Parsed before setup so the meter prior below is measured over exactly the
@@ -158,6 +159,7 @@ def main(args):
             "stitch_border": args.stitch_border,
             "tau": args.tau,
             "decode": args.decode,
+            "detect_tau": args.detect_tau,
             "attention_layers": args.attention_layers,
             "time_param": args.time_param,
             # criterion
@@ -363,7 +365,18 @@ if __name__ == "__main__":
                              "branch. 0 = per-candidate MLP, each candidate blind to "
                              "its neighbours. >0 lets them coordinate, which is how "
                              "DETR avoids NMS; a final LayerNorm is always applied")
-    parser.add_argument("--decode", choices=("argmax", "metrical"), default="argmax",
+    parser.add_argument("--downbeat_dropout", type=float, default=0.0,
+                        help="Annotation-coverage ablation: pretend this fraction of "
+                             "downbeat-annotated TRAINING pieces were never downbeat-"
+                             "annotated. Deterministic in the piece name. Affects both "
+                             "head types identically (default: %(default)s)")
+    parser.add_argument("--detect_tau", type=float, default=0.5,
+                        help="Algorithm 3 line 5's own threshold on the event mass "
+                             "1 - p(empty), used by --decode metrical and detect. "
+                             "Separate from --tau, which gates decode_events' winning "
+                             "class probability instead (default: %(default)s)")
+    parser.add_argument("--decode", choices=("argmax", "metrical", "detect"),
+                        default="detect",
                         help="argmax: per-candidate argmax over {DB, B, empty}. "
                              "metrical: Algorithm 3, one (omega, L) resolved jointly "
                              "across the detected events, so the emitted pattern is "
