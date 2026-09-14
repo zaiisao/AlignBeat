@@ -44,7 +44,7 @@ class SubsetCriterion(nn.Module):
 
     def __init__(self,
                  data_prior, lambda_l1=LAMBDA_L1, gamma=0.5,
-                 meter_prior=None, match_event_cost=False, loss_event_term=False):
+                 meter_prior=None, match_event_cost=False, loss_event_term=None):
         super(SubsetCriterion, self).__init__()
 
         self.lambda_l1 = lambda_l1
@@ -52,7 +52,12 @@ class SubsetCriterion(nn.Module):
         # The two deviations from algorithm5_hard-1, each independently switchable so
         # an arm can price them apart. False on both is the algorithm as written.
         self.match_event_cost = match_event_cost      # line 20's -log(1 - p(empty))
-        self.loss_event_term = loss_event_term        # the same quantity in line 52
+        # loss_event_term is accepted and ignored. It switched on -log(1 - p(empty)) at
+        # matched events, which the revised Algorithm 2 line 10 no longer needs: reading
+        # q_i off the raw three-way head already carries that mass, and adding it again
+        # would double-count it. Kept in the signature only so checkpoints written before
+        # the revision still load, since subset_kwargs is splatted into this constructor.
+        del loss_event_term
         self.meter_candidates = tuple(sorted(int(L) for L in meter_prior)) if meter_prior else ()
         # pi_M(L) pi_omega(omega), combined: pi_omega is uniform over the L phases, so
         # the pair is the same under every phase of a given meter.
@@ -86,8 +91,7 @@ class SubsetCriterion(nn.Module):
 
         print(f"[subset-criterion] lambda_L1={self.lambda_l1:g} gamma={self.gamma} "
               f"meter_candidates={self.meter_candidates or 'off'} "
-              f"match_event_cost={self.match_event_cost} "
-              f"loss_event_term={self.loss_event_term}", flush=True)
+              f"match_event_cost={self.match_event_cost}", flush=True)
 
 
     def build_l_match(self, log_probabilities, t_hat, gt_class, gt_time):

@@ -167,7 +167,6 @@ def main(args):
             "meter_prior": meter_prior,
             "data_prior": data_prior,
             "match_event_cost": args.match_event_cost,
-            "loss_event_term": args.loss_event_term,
         },
     )
     # --- frozen-encoder head swap -------------------------------------------------
@@ -408,10 +407,6 @@ if __name__ == "__main__":
                         help="DEVIATION, on by default: charge line 20's -log(1 - p(empty)) to an "
                              "unlabelled event, so the beat-only matching is not "
                              "decided by time alone")
-    parser.add_argument("--loss_event_term", default=True,
-                        action=argparse.BooleanOptionalAction,
-                        help="DEVIATION, on by default: add the same quantity to line 52, so something "
-                             "constrains p(empty) at a matched beat-only event")
     # NOTE: --train_length (underscore) is defined above and owns dest=train_length.
     # A second "--train-length" action used to be declared here with its own default;
     # both wrote the same dest, so whichever was declared later silently won. Kept as a
