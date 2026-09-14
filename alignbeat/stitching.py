@@ -49,8 +49,14 @@ def fragment_offsets(total_frames, fragment_frames, border_frames):
 
 
 def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
-                 tau=0.2):
-    """Section 9.3 over one piece."""
+                 tau=0.2, decode_fn=None):
+    """Section 9.3 over one piece.
+
+    decode_fn selects the rule, exactly as _subset_decode does per excerpt: None keeps
+    decode_events' per-candidate argmax, and a callable (class_logits, t_hat, tau) ->
+    (classes, times, scores) lets the caller pass Algorithm 3 instead. Without this the
+    whole-piece path was pinned to argmax and --decode metrical silently did nothing
+    here, so the two paths could disagree on the same checkpoint."""
     total_frames, num_mels = mel.shape
     fragments = fragment_offsets(total_frames, fragment_frames, border_frames)
 
@@ -74,7 +80,8 @@ def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
 
     all_classes, all_frames, all_scores = [], [], []
     for index, (offset, keep_start, keep_end) in enumerate(fragments):
-        classes, times, scores = decode_events(
+        decode = decode_fn if decode_fn is not None else decode_events
+        classes, times, scores = decode(
             batched_class_logits[index], batched_t_hat[index], tau)
 
         if classes.numel() == 0:

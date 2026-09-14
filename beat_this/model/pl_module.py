@@ -20,7 +20,8 @@ import numpy as np
 from beat_this.model.beat_tracker import BeatThis
 from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
 from alignbeat.criterion import SubsetCriterion
-from alignbeat.decode import decode_events, decode_events_metrical
+from alignbeat.decode import (decode_events, decode_events_detect,
+                              decode_events_metrical)
 from alignbeat.stitching import stitch_piece
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
@@ -29,7 +30,8 @@ from beat_this.utils import replace_state_dict_key
 # Architecture and decode settings that ride in subset_kwargs rather than in
 # PLBeatThis's own signature.
 SUBSET_ARCH_KEYS = ("num_candidates", "train_length", "downsample_stages",
-                    "stitch_border", "tau", "decode", "attention_layers", "time_param")
+                    "stitch_border", "tau", "decode", "detect_tau",
+                    "attention_layers", "time_param")
 
 
 def split_subset_kwargs(subset_kwargs):
@@ -92,9 +94,18 @@ class PLBeatThis(LightningModule):
         # existing checkpoints decode exactly as they were scored.
         self.attention_layers = arch.pop("attention_layers", 0)
         self.time_param = arch.pop("time_param", "bounded")
-        self.decode = arch.pop("decode", "argmax")
-        if self.decode not in ("argmax", "metrical"):
-            raise ValueError(f"decode must be argmax or metrical, got {self.decode!r}")
+        # Default is Algorithm 3's own line 5 detection with per-candidate labelling.
+        # Checkpoints written before this flag existed record no "decode" key, so they
+        # would silently change rule on reload -- they carry decode explicitly instead.
+        self.decode = arch.pop("decode", "detect")
+        if self.decode not in ("argmax", "metrical", "detect"):
+            raise ValueError(
+                f"decode must be argmax, metrical or detect, got {self.decode!r}")
+        # Algorithm 3's own tau, kept separate from decode_events' 0.2: the two threshold
+        # different quantities (event mass 1 - p(empty) vs the winning class's own
+        # probability), so one value cannot serve both, and every existing checkpoint
+        # records tau=0.2 for the argmax path.
+        self.detect_tau = arch.pop("detect_tau", 0.5)
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -185,7 +196,10 @@ class PLBeatThis(LightningModule):
                 # Algorithm 3. One fragment per call is exactly the condition section 3
                 # states its stage 2 for: a single (omega, L) spans this window.
                 classes, times, _scores = decode_events_metrical(
-                    logits, candidate_times, self.subset_criterion, self.tau)
+                    logits, candidate_times, self.subset_criterion, self.detect_tau)
+            elif self.decode == "detect":
+                classes, times, _scores = decode_events_detect(
+                    logits, candidate_times, self.detect_tau)
             else:
                 classes, times, _scores = decode_events(
                     logits, candidate_times, self.tau)
@@ -387,7 +401,8 @@ class PLBeatThis(LightningModule):
         batch: Any,
         batch_idx: int,
         dataloader_idx: int = 0,
-        chunk_size: int = 1500
+        chunk_size: int = 1500,
+        overlap_mode: str = "keep_first",
     ) -> Any:
         """
         Compute predictions and metrics for a batch (a dictionary with an "spect" key).
@@ -446,8 +461,19 @@ class PLBeatThis(LightningModule):
             # before getattr's default can apply, so guard self as well.
             border = 2 * getattr(getattr(self, "beat_loss", None), "tolerance", 3)
 
+        # Same rule as _subset_decode uses per excerpt, so whole-piece inference and
+        # validation cannot disagree about how candidates are emitted.
+        decode_fn, tau = None, self.tau
+        if self.decode == "metrical":
+            tau = self.detect_tau
+            def decode_fn(logits, t_hat, tau):
+                return decode_events_metrical(logits, t_hat, self.subset_criterion, tau)
+        elif self.decode == "detect":
+            tau = self.detect_tau
+            decode_fn = decode_events_detect
         classes, frames, _scores = stitch_piece(
-            batch["spect"][0], forward_fn, chunk_size, border, self.tau)
+            batch["spect"][0], forward_fn, chunk_size, border, tau,
+            decode_fn=decode_fn)
 
         seconds = (frames / self.fps).detach().cpu().numpy()
         classes = classes.detach().cpu().numpy()
