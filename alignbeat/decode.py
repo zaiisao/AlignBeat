@@ -101,45 +101,105 @@ def decode_events(class_logits, t_hat, tau=0.2):
     return predicted[keep], t_hat[keep], scores[keep]
 
 
-def decode_events_metrical(class_logits, t_hat, criterion, tau=0.5):
-    """Algorithm 3: detect events, then resolve ONE (omega, L) across all of them.
+def _stage1(class_logits, t_hat, tau):
+    """Algorithm 3 lines 1-8: event detection, shared by both stage-1 consumers.
 
-    Section 3.1's objection to decode_events is that per-candidate argmax can emit a
+    Line 3's forward pass is the caller's; this receives its two outputs. Line 5 keeps
+    J = { j : 1 - p_hat_j(empty) >= tau }, thresholding the EVENT mass rather than the
+    winning class's own probability, so a candidate split evenly between DB and B still
+    counts as an event. Line 7 relabels J by increasing t_hat: monotonic_times is
+    strictly increasing in the candidate index in fp32 but NOT under autocast (at N=188
+    fp16 collapses adjacent centres on ~6% of real fragments, and training runs
+    precision="16-mixed"), and c_i(omega, L) is indexed by position, so an inversion
+    would silently mislabel everything after it. The sort is performed, not assumed.
+
+    Returns (probabilities, index, event_mass); index is j_0 < ... < j_{Mhat-1}.
+    """
+    probabilities = F.softmax(class_logits, dim=-1)
+    event_mass = 1.0 - probabilities[..., BACKGROUND]             # line 5
+    index = torch.nonzero(event_mass >= tau, as_tuple=False).flatten()
+    index = index[torch.argsort(t_hat[index], stable=True)]       # line 7
+    return probabilities, index, event_mass
+
+
+def decode_events_detect(class_logits, t_hat, tau=0.5):
+    """Algorithm 3's STAGE 1 ONLY: line 5's detection, then per-candidate labelling.
+
+    DEVIATION from Algorithm 3, deliberate and measured. Lines 9-25 assign c_i(omega, L)
+    by RANK, so one missed detection shifts every later index and inverts the phase for
+    the rest of the fragment: 25.9 downbeat F1 per deleted event, measured on fragments
+    whose detection was otherwise >= 99% correct, with the meter still resolved correctly
+    92.3% of the time. Below ~99% detection the true labelling is not in that hypothesis
+    class at all -- the oracle over every (omega, L) scores BELOW per-candidate labelling
+    there -- so no resolver, prior or re-anchoring recovers it.
+
+    Line 5 is kept because it is right: it is the Bayes rule for event-vs-empty, where
+    decode_events' three-way argmax discards a candidate whose event mass is split across
+    DB and B. Worth +0.29 beat F1 over argmax on the 8-fold protocol.
+
+    Returns (classes, times, scores) exactly as decode_events does.
+    """
+    probabilities, index, event_mass = _stage1(class_logits, t_hat, tau)
+    p = probabilities[index]
+    # DOWNBEAT = 0, BEAT = 1, so the argmax over those two columns is the class id.
+    classes = p[:, [DOWNBEAT, BEAT]].argmax(dim=-1)
+    return classes, t_hat[index], event_mass[index]
+
+
+def decode_events_metrical(class_logits, t_hat, criterion, tau=0.5):
+    """Algorithm 3 Infer: detect events, then resolve one (omega, L) across all of them.
+
+    Require: audio fragment x, trained theta, detection threshold tau, candidate meters
+    M with prior pi_M, phase-offset prior pi_omega, class prior pi_C, training prior
+    pi_data. The last five all ride on `criterion`, which carries them from the
+    checkpoint. Ensure: predicted events (c_0, t_0), ..., (c_{Mhat-1}, t_{Mhat-1}).
+
+    Section 3.1's objection to decode_events is that a per-candidate argmax can emit a
     pattern no (omega, L) could produce -- two adjacent downbeats, say -- because
     nothing in the head's own loss ties events to each other at inference. Here every
     emitted label is c_i(omega_hat, L_hat) for one jointly-chosen hypothesis, so a
-    metrically valid output is guaranteed by construction rather than hoped for.
+    metrically valid output holds by construction rather than by hope.
 
-    Two differences from decode_events, both from the spec and both deliberate:
-    line 5 thresholds the EVENT mass 1 - p(empty) rather than the winning class's own
+    Line 5 thresholds the EVENT mass 1 - p(empty), not the winning class's own
     probability, so a candidate split evenly between DB and B still counts as an event;
-    and tau defaults to 0.5, the value section 3's own note names, not 0.2.
-
-    criterion supplies pi_data, pi_C, pi_M and pi_omega, all of which ride in the
-    checkpoint. Returns (classes, times, scores) exactly as decode_events does.
+    and tau defaults to 0.5, the value section 3's own note names, not decode_events'
+    0.2. Returns (classes, times, scores) exactly as decode_events does.
     """
-    probabilities = F.softmax(class_logits, dim=-1)
-    event_mass = 1.0 - probabilities[..., BACKGROUND]
-    keep = event_mass >= tau                                      # line 5
-    # Line 7: relabel the kept candidates by increasing t_hat. monotonic_times is
-    # strictly increasing in the candidate index in fp32, but NOT under autocast: at
-    # N=188 fp16 collapses adjacent centres onto each other on ~6% of real fragments,
-    # and training runs precision="16-mixed". Since c_i(omega, L) is indexed by
-    # position, an inversion silently mislabels everything after it, so line 7 is
-    # performed rather than assumed.
-    index = torch.nonzero(keep, as_tuple=False).flatten()
-    index = index[torch.argsort(t_hat[index], stable=True)]
-    if index.numel() == 0:
-        empty = index
-        return empty, t_hat[empty], event_mass[empty]
+    # ---- Lines 1-8: Stage 1, in _stage1 --------------------------------------------
+    probabilities, index, event_mass = _stage1(class_logits, t_hat, tau)
+    num_events = index.numel()                                    # Mhat
 
-    p = torch.softmax(class_logits, dim=-1)[index]
-    resolved = criterion.infer_pattern(p)                         # lines 10-24
+    # ---- Line 9: Stage 2: metrical refinement { ----------------------------------
+    # Lines 10-24 live in criterion.infer_pattern, on the kept candidates in line 7's
+    # order:
+    #   lines 11-14  P_hat(C = c | x, j_i) by Bayes, dividing pi_data and applying pi_C
+    #   lines 16-18  Pi_{omega,L}, the joint posterior over (omega, L)
+    #   line 20      (omega_hat, L_hat) <- argmax Pi_{omega,L}
+    #   lines 22-24  c_i <- c_i(omega_hat, L_hat)
+    # It is the E-step's own two functions underneath, so training and inference score a
+    # hypothesis identically by construction.
+    # infer_pattern reads Mhat back off p's own leading dimension, which is num_events
+    # by construction, so lines 11 and 22's loop bounds are line 7's cardinality.
+    p = probabilities[index]
+    assert p.shape[0] == num_events
+    resolved = criterion.infer_pattern(p)
+
     if resolved is None:
-        # Fewer detected events than the smallest candidate meter, so no hypothesis
-        # exists to resolve. Fall back to the per-candidate call over {DB, B}: still a
-        # detection, just with no metrical structure available to constrain it.
-        classes = log_p[:, [DOWNBEAT, BEAT]].argmax(dim=-1)
+        # DEVIATION. Line 17's product runs over i = 0..Mhat-1 for every (L, omega), so
+        # the spec always has a hypothesis for line 20's argmax. Our meter candidates are
+        # only scored when Mhat admits them, so too few detections leaves the set empty.
+        # Falling back to the per-candidate call over {DB, B} keeps line 5's detections
+        # rather than dropping the fragment; it forfeits only line 9's metrical
+        # guarantee, which had no hypothesis to enforce anyway.
+        # p is already restricted to the kept candidates, and DOWNBEAT = 0, BEAT = 1, so
+        # the argmax over those two columns is the class id itself.
+        classes = p[:, [DOWNBEAT, BEAT]].argmax(dim=-1)
     else:
-        classes, _omega, _meter = resolved
+        classes, _omega_hat, _meter_hat = resolved
+    # ---- Line 25: } --------------------------------------------------------------
+
+    # Line 26: return (c_0, t_0), ..., (c_{Mhat-1}, t_{Mhat-1}). Line 23 pairs each class
+    # with t_hat_{j_i}, so times carry line 7's ordering. The third element is this
+    # rule's own confidence, the line 5 mass, standing where decode_events returns the
+    # winning class probability.
     return classes, t_hat[index], event_mass[index]
