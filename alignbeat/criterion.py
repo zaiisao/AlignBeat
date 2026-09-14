@@ -447,7 +447,12 @@ class SubsetCriterion(nn.Module):
     def _meter_phase_scores(self, matched_class_probs):
         """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
         One entry per (omega, L), grouped by meter, in the order line 40 sums over.
-        Rejected pairs reach 1e-360, so the product stays in the posterior's float64."""
+        The product over M events underflows float32 at M ~ 50 -- q_i is the raw head
+        output, so a hypothesis that assigns an unlikely class somewhere contributes a
+        very small factor, and 1e-38 arrives quickly. float64 carries the same fragment
+        to 1e-173 at M = 200. Cast here rather than at the call sites: infer_pattern has
+        the same exposure, and pi = scores / scores.sum() silently becomes 0/0 = NaN."""
+        matched_class_probs = matched_class_probs.double()
         q_db = matched_class_probs[:, DOWNBEAT]
         q_b = matched_class_probs[:, BEAT]
         M = q_db.shape[0]
