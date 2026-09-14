@@ -123,12 +123,6 @@ class SubsetCriterion(nn.Module):
             has_class_labels = bool((gt_class != CLASS_UNKNOWN).any())
             class_posterior = F.softmax(class_logits, dim=-1)
 
-            # Lines 5-12: P_hat(C = c | x, j) at EVERY candidate, when ind = 1. Per
-            # candidate independent, so evaluating it here and reading it back at
-            # sigma_hat(i) on line 36 gives what evaluating it there would.
-            if not has_class_labels:
-                class_posterior = self._class_posterior(class_posterior)
-
             # Lines 15-23: L_match(i, j).
             l_match = self.build_l_match(torch.log(class_posterior),
                                          t_hat, gt_class, gt_time)
@@ -371,18 +365,11 @@ class SubsetCriterion(nn.Module):
         # contemplate; there is then no expectation to take and the term is zero.
         surrogate = torch.zeros((), dtype=matched_log.dtype, device=matched_log.device)
         if pi is not None:
-            scores_by_meter = self._log_meter_phase_scores(
-                self._class_log_posterior(matched_log))
+            matched_class_probs = (matched_log[:, DOWNBEAT], matched_log[:, BEAT])
+            scores_by_meter = self._log_meter_phase_scores(matched_class_probs)
             meter_phase_scores = torch.cat(
                 [scores_by_meter[meter] for meter in scores_by_meter])
             surrogate = -(pi * meter_phase_scores).sum()
-
-        # DEVIATION, off by default: line 50 decomposes into which class the event is
-        # and whether it is an event at all. Line 52 supplies only the first, so nothing
-        # constrains p(empty) at a matched event on beat-only data. This restores it.
-        if self.loss_event_term:
-            surrogate = surrogate - torch.logsumexp(
-                matched_log[:, [DOWNBEAT, BEAT]], dim=-1).sum()
 
         return surrogate
 
@@ -397,16 +384,27 @@ class SubsetCriterion(nn.Module):
 
         Lines 11-14 are _class_posterior and line 17's numerator is
         _meter_phase_scores: the same two functions the E-step uses, so inference and
-        training score a hypothesis identically by construction. Line 17's denominator
-        is constant in (omega, L), so line 20's argmax needs only the numerator.
+        training score a hypothesis identically by construction.
         """
-        scores_by_meter = self._meter_phase_scores(self._class_posterior(p))
+        # Lines 11-14: P_hat(C = c | x, j_i), Bayes over {DB, B} at every kept candidate.
+        class_posterior = self._class_posterior(p)
+        # Line 17's numerator, pi_M(L) pi_omega(omega) prod_i P_hat(C = c_i(omega, L) | x, j_i),
+        # one entry per (L, omega).
+        scores_by_meter = self._meter_phase_scores(class_posterior)
         if not scores_by_meter:
             return None
 
         meters = list(scores_by_meter)
         meter_phase_scores = torch.cat([scores_by_meter[meter] for meter in meters])
-        best = int(torch.argmax(meter_phase_scores))         # line 20
+
+        # Lines 16-18: Pi_{omega,L}, the numerator over its own sum across every
+        # (L, omega). The sum is constant in (omega, L) and so cannot move line 20's
+        # argmax, but line 17 defines Pi as the normalised quantity and this is what
+        # line 20 is written to maximise, so it is formed rather than skipped.
+        joint_posterior = meter_phase_scores / meter_phase_scores.sum()
+
+        # Line 20: (omega_hat, L_hat) <- arg max_{omega,L} Pi_{omega,L}.
+        best = int(torch.argmax(joint_posterior))
 
         # Invert the concatenation: each meter holds one entry per phase, in phase
         # order, so the flat index decomposes into (L_hat, omega_hat) by walking it.
@@ -442,24 +440,25 @@ class SubsetCriterion(nn.Module):
         prior = meter_prior * omega_prior
         return math.log(prior) if prior > 0.0 else -float('inf')
 
-    def _meter_phase_scores(self, matched_class_posterior):
+    def _meter_phase_scores(self, matched_class_probs):
         """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
         One entry per (omega, L), grouped by meter, in the order line 40 sums over.
         Rejected pairs reach 1e-360, so the product stays in the posterior's float64."""
-        q_db = matched_class_posterior[:, DOWNBEAT]
-        q_b = matched_class_posterior[:, BEAT]
+        q_db = matched_class_probs[:, DOWNBEAT]
+        q_b = matched_class_probs[:, BEAT]
         M = q_db.shape[0]
         events = torch.arange(M, device=q_db.device)
         scores_by_meter = {}
 
         for meter in self.meter_candidates:
             meter = int(meter)
-            # A meter of 1 makes every event a downbeat, so it carries no phase to
-            # infer. Requiring M >= L is a choice about short fragments rather than a
-            # well-definedness guard: c_i(omega, L) is defined for any L, but meters
-            # larger than the event count generate indistinguishable patterns, so they
-            # would only spread the prior's mass. It fires only on degenerate crops.
-            if meter <= 1 or M < meter:
+            # Line 16 loops over every L in M unconditionally, so no meter is dropped
+            # for being larger than the event count: c_i(omega, L) is defined for any L,
+            # and at M < L the phases merely generate patterns the events cannot tell
+            # apart, which the product scores honestly rather than discards. A meter of 1
+            # would carry no phase to infer, but the candidate set never contains it;
+            # this guard is defensive, not a filter on the fragment.
+            if meter <= 1:
                 continue
 
             # pi_M(L) pi_omega(omega), the same under every phase of a given meter.
@@ -477,11 +476,11 @@ class SubsetCriterion(nn.Module):
 
         return scores_by_meter or None
 
-    def _log_meter_phase_scores(self, matched_class_posterior):
+    def _log_meter_phase_scores(self, matched_class_probs):
         """Algorithm 2 line 52's bracket, in the logs that line writes itself:
         log pi_M(L) + log pi_omega + sum_i log P_hat(C_i = c_i(omega, L)). Agreeing with
         _meter_phase_scores up to exp is what makes Fisher's identity hold across E/M."""
-        log_db, log_b = matched_class_posterior
+        log_db, log_b = matched_class_probs
         M = log_db.shape[0]
         device = log_db.device
 
@@ -490,12 +489,13 @@ class SubsetCriterion(nn.Module):
 
         for meter in self.meter_candidates:
             meter = int(meter)
-            # A meter of 1 makes every event a downbeat, so it carries no phase to
-            # infer. Requiring M >= L is a choice about short fragments rather than a
-            # well-definedness guard: c_i(omega, L) is defined for any L, but meters
-            # larger than the event count generate indistinguishable patterns, so they
-            # would only spread the prior's mass. It fires only on degenerate crops.
-            if meter <= 1 or M < meter:
+            # Line 16 loops over every L in M unconditionally, so no meter is dropped
+            # for being larger than the event count: c_i(omega, L) is defined for any L,
+            # and at M < L the phases merely generate patterns the events cannot tell
+            # apart, which the product scores honestly rather than discards. A meter of 1
+            # would carry no phase to infer, but the candidate set never contains it;
+            # this guard is defensive, not a filter on the fragment.
+            if meter <= 1:
                 continue
 
             log_prior = self._log_meter_phase_prior(meter)
