@@ -134,7 +134,8 @@ def main(args):
                 )
                 all_piece_metrics.append(metrics)
                 all_piece_dataset.append(dataset)
-                all_piece_preds.extend(preds)
+                if preds is not None:
+                    all_piece_preds.extend(preds)
                 all_piece.append(piece)
             # aggregate across folds
             all_piece_metrics = {
@@ -147,6 +148,16 @@ def main(args):
             assert len(all_piece) == len(
                 np.unique(all_piece)
             ), "There are repeated pieces in the folds"
+            if args.dump_piece_metrics:
+                import csv
+                keys = sorted(all_piece_metrics)
+                with open(args.dump_piece_metrics, "w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["piece", "dataset"] + keys)
+                    for i in range(len(all_piece)):
+                        w.writerow([all_piece[i], all_piece_dataset[i]]
+                                   + [all_piece_metrics[k][i] for k in keys])
+                print(f"wrote per-piece metrics to {args.dump_piece_metrics}")
             dataset_metrics = {
                 k: {
                     d: np.mean(v[all_piece_dataset == d])
@@ -290,6 +301,14 @@ if __name__ == "__main__":
         choices=("mean-std", "k-fold"),
         default="mean-std",
         help="Type of aggregation to use for multiple models; ignored if only one model is given",
+    )
+    parser.add_argument(
+        "--dump-piece-metrics",
+        metavar="FILENAME",
+        type=str,
+        default=None,
+        help="Write the per-piece metrics already computed for the k-fold "
+        "aggregation to a CSV (reporting only; changes no metric)",
     )
     parser.add_argument(
         "--dump-predictions",
