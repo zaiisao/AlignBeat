@@ -8,7 +8,7 @@ in the pipeline, and tau is the one knob controlling it.
 A first sweep showed tau is INERT: identical scores from 0.05 to 0.30, because the emit
 decision is argmax over three classes and tau only fires when the winning probability
 falls below it, which almost never happens. So the knob that actually controls how many
-candidates are emitted is a bias on the BACKGROUND logit -- subtract b and every
+candidates are emitted is a bias on the CLASS_BACKGROUND logit -- subtract b and every
 candidate whose event evidence is within b nats of background is emitted too. b = 0 is
 current behaviour; this sweeps it to trace the detection precision/recall trade the
 ladder says is worth 0.09 beat F.
@@ -28,13 +28,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import alignbeat.decode
-import alignbeat.stitching
+import alignbeat.inference.decode
+import alignbeat.inference.stitching
 import beat_this.model.pl_module
-from alignbeat.classes import BACKGROUND
+from alignbeat.constants import CLASS_BACKGROUND
 from launch_scripts.score_fold0_subset import build_loader, load_model, score
 
-_decode = alignbeat.decode.decode_events
+_decode = alignbeat.inference.decode.decode_events
 
 
 def set_background_bias(bias):
@@ -43,10 +43,10 @@ def set_background_bias(bias):
     def patched(class_logits, t_hat, tau=0.2):
         if bias:
             class_logits = class_logits.clone()
-            class_logits[..., BACKGROUND] = class_logits[..., BACKGROUND] - bias
+            class_logits[..., CLASS_BACKGROUND] = class_logits[..., CLASS_BACKGROUND] - bias
         return _decode(class_logits, t_hat, tau)
     beat_this.model.pl_module.decode_events = patched
-    alignbeat.stitching.decode_events = patched
+    alignbeat.inference.stitching.decode_events = patched
 
 BEAT_ONLY = ("simac", "smc")
 

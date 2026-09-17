@@ -5,8 +5,8 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from alignbeat.classes import F_MEASURE_TOLERANCE
-from alignbeat.head import MIN_GAP_SECONDS, floored_times, monotonic_times
+from alignbeat.constants import F_MEASURE_TOLERANCE
+from alignbeat.model.head import MIN_GAP_SECONDS, floored_times, monotonic_times
 
 W = 30.0
 

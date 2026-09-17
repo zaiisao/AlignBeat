@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from alignbeat.classes import F_MEASURE_TOLERANCE
+from alignbeat.constants import F_MEASURE_TOLERANCE
+from alignbeat.model.downsample import Downsample
 
 
 # ---------------------------------------------------------------------------
@@ -16,9 +17,8 @@ from alignbeat.classes import F_MEASURE_TOLERANCE
 class SubsetSelectionHead(nn.Module):
     """Encoder features -> N candidates -> (class logits, monotone times)."""
 
-    def __init__(self, feature_size=256, hidden_size=256, attention_layers=0,
-                 attention_heads=4, time_param="bounded",
-                 window_seconds=30.0):
+    def __init__(self, window_seconds, feature_size=256, hidden_size=256,
+                 attention_layers=0, attention_heads=4, time_param="bounded"):
         super(SubsetSelectionHead, self).__init__()
 
         self.window_seconds = float(window_seconds)
@@ -38,17 +38,10 @@ class SubsetSelectionHead(nn.Module):
             nn.GELU(),
         )
 
-        # Candidate self-attention. The head is otherwise a per-candidate MLP, so
-        # candidate j cannot see what j+1 is doing -- and 82% of false fires are within
-        # two cells of a real one, i.e. the same beat claimed twice. DETR avoids NMS
-        # precisely because its queries attend to each other and can back off; this is
-        # that mechanism, on an anchored grid.
-        #
-        # The final LayerNorm is NOT optional here. norm_first normalises each
-        # sublayer's INPUT, leaving the residual stream itself unnormalised, so what
-        # class_head reads leaves the block several times longer than it entered
-        # (measured previously: token norm 11.7 -> 46.5 at one layer, compounding with
-        # depth). 42 of the 44 arms that ever ran this had it OFF. It is on here.
+        # Lets candidate j see what its neighbours claim: 82% of false fires are the
+        # same beat claimed twice, two cells apart. The final LayerNorm is required --
+        # norm_first leaves the residual stream unnormalised, so class_head would read
+        # tokens several times longer than they entered (11.7 -> 46.5 at one layer).
         self.candidate_attention = None
         if attention_layers > 0:
             layer = nn.TransformerEncoderLayer(
@@ -97,11 +90,9 @@ class SubsetSelectionHead(nn.Module):
         # z above, so timing is unaffected by the attention pass.
         z_class = z
         if self.candidate_attention is not None:
-            # Self-attention is permutation-equivariant, so without a position signal
-            # the classifier could see WHAT the other candidates look like but not
-            # WHERE they are -- and "is my neighbour claiming this beat" is a question
-            # about position. t_hat is already monotone in the index, so the index IS
-            # the time order; sinusoidal features of it are the cheaper of the two.
+            # Self-attention is permutation-equivariant, so the classifier needs a
+            # position signal to ask "is my neighbour claiming this beat". t_hat is
+            # monotone in the index, so the index is already the time order.
             z_class = z + sinusoidal(
                 torch.arange(z.shape[1], device=z.device, dtype=z.dtype)
                 .unsqueeze(0).expand(z.shape[0], -1), z.shape[2])
@@ -111,31 +102,19 @@ class SubsetSelectionHead(nn.Module):
         return class_logits, t_hat
 
 
-# Largest displacement of a clock from its cell centre, as a fraction of one cell.
-# Below 1/2 no two clocks can cross, so ordering is architectural. At 0.45 a clock
-# reaches +-72 ms at N=188, past the cell's own half-width, and the seam between two
-# neighbours' reaches is 0.1 cell = 16 ms -- 8 ms from a clock, well inside the
-# 70 ms tolerance.
+# Largest displacement from a cell centre, as a fraction of one cell. Below 1/2 no two
+# candidates can cross, so ordering is architectural. At 0.45 the reach is +-72 ms at
+# N=188, and the seam between neighbours is 16 ms -- inside the 70 ms tolerance.
 MAX_OFFSET = 0.45
 
 
 def monotonic_times(r, max_offset=MAX_OFFSET):
-    """Each clock is its cell centre plus a bounded offset read from its own feature.
+    """t_hat_j = (j + 1/2)/N + max_offset * tanh(r_j)/N.
 
-        t_hat_j = (j + 1/2) / N  +  max_offset * tanh(r_j) / N
-
-    Consecutive centres are 1/N apart and every offset lies in (-max_offset/N,
-    +max_offset/N), so t_hat_{j+1} - t_hat_j > (1 - 2 max_offset)/N > 0 for any r:
-    strictly increasing by construction, not learned, and with no state that can
-    fail it (tanh is bounded; there is no normaliser to underflow).
-
-    This replaces the cumsum of normalised increments. That form coupled every clock
-    to every increment before it: moving one clock 80 ms toward a beat meant its
-    neighbour giving up ~17 ms (measured corr -0.61), and the reach saturated at ~68 ms
-    however far the beat was (0.62 of the need beyond 100 ms). Here beat i's time
-    gradient reaches r_j and nothing else, and the reach is max_offset of a cell.
-    The price is that clocks can no longer bunch up inside one cell, which nothing
-    measured used.
+    Strictly increasing for any r, since centres are 1/N apart and offsets are bounded
+    by max_offset/N < 1/2N. Replaces eq. (1)'s cumsum of normalised increments, which
+    coupled every candidate to every increment before it (moving one 80 ms cost its
+    neighbour 17 ms, corr -0.61) and saturated its reach at ~68 ms.
     """
     N = r.shape[-1]
     centre = (torch.arange(N, device=r.device, dtype=r.dtype) + 0.5) / N
@@ -211,3 +190,39 @@ def paper_times(r):
     """
     inc = F.softplus(r)
     return torch.cumsum(inc, dim=-1) / inc.sum(dim=-1, keepdim=True)
+
+
+class SubsetHead(nn.Module):
+    """Progressive downsample T -> N, then the order-preserving alignment head."""
+
+    def __init__(self, input_dim, num_candidates, attention_layers=0, time_param="bounded",
+                 train_length=1500, fps=50,
+                 downsample_stages=None):
+        super().__init__()
+
+        self.downsample = Downsample(input_dim, num_candidates,
+                                     fragment_frames=train_length,
+                                     stages=downsample_stages)
+
+        # One token out of the downsample is one candidate into the heads, so there is a
+        # single N. The halvings decide it (1500 -> 188) and the tempo floor is only a
+        # lower bound they must clear, not a target to pool down to -- tempo augmentation
+        # can push a 30 s window past the floor's 170 events, so the slack above it is
+        # useful rather than waste. The criterion reads N from the logits' shape.
+        self.num_candidates = self.downsample.num_candidates
+
+        self.head = SubsetSelectionHead(
+            feature_size=input_dim, attention_layers=attention_layers, time_param=time_param,
+            window_seconds=train_length / float(fps))
+
+    def forward(self, x):
+        z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
+        out = self.head(z.transpose(1, 2))     # the head wants channel-first
+
+        # The candidate grid spans padded_length frames, so on a short input t_hat is
+        # relative to the padding rather than to x. Rescale so callers can keep reading
+        # it as a fraction of what they passed in; candidates past 1.0 sit in the pad.
+        downsample_factor = self.downsample.time_scale(x.shape[1])
+        t_hat = out[1] if downsample_factor == 1.0 else out[1] * downsample_factor
+
+        return {"class_logits": out[0], "t_hat": t_hat}

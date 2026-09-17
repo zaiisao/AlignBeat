@@ -6,8 +6,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.stitching import fragment_offsets, stitch_piece  # noqa: E402
-from alignbeat.classes import BACKGROUND, BEAT, DOWNBEAT
+from alignbeat.inference.stitching import fragment_offsets, stitch_piece  # noqa: E402
+from alignbeat.constants import CLASS_BACKGROUND, CLASS_BEAT, CLASS_DOWNBEAT
 
 
 def test_keep_regions_partition_exactly():
@@ -46,7 +46,7 @@ def test_every_event_reported_exactly_once():
         # every candidate is a confident beat, uniformly spaced over the window
         B = fragment.shape[0]
         logits = torch.full((B, num_candidates, 3), -10.0)
-        logits[:, :, BEAT] = 10.0
+        logits[:, :, CLASS_BEAT] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
         return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
@@ -56,7 +56,7 @@ def test_every_event_reported_exactly_once():
     assert torch.all(frames[1:] > frames[:-1]), "output must be sorted and duplicate-free"
     assert torch.all(frames >= 0) and torch.all(frames <= total), (
         "the piece end is a legal detection time (this fake grid puts t_hat_N at 1)")
-    assert torch.all(classes == BEAT)
+    assert torch.all(classes == CLASS_BEAT)
 
     # Each fragment contributes exactly the candidates landing in its keep region, and
     # the keep regions tile [0, total) - so the count must equal the number of distinct
@@ -80,7 +80,7 @@ def test_short_piece_is_padded_not_dropped():
         assert fragment.shape[1] == window, "model must always see a full window"
         B = fragment.shape[0]
         logits = torch.full((B, num_candidates, 3), -10.0)
-        logits[:, :, BEAT] = 10.0
+        logits[:, :, CLASS_BEAT] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
         return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
@@ -96,7 +96,7 @@ def test_background_only_model_returns_nothing():
     def fake_forward(fragment):
         B = fragment.shape[0]
         logits = torch.full((B, num_candidates, 3), -10.0)
-        logits[:, :, BACKGROUND] = 10.0
+        logits[:, :, CLASS_BACKGROUND] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
         return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
@@ -111,15 +111,15 @@ def test_downbeat_class_survives_stitching():
     def fake_forward(fragment):
         B = fragment.shape[0]
         logits = torch.full((B, num_candidates, 3), -10.0)
-        logits[:, 0::4, DOWNBEAT] = 10.0
-        logits[:, 1::4, BEAT] = 10.0
-        logits[:, 2::4, BEAT] = 10.0
-        logits[:, 3::4, BEAT] = 10.0
+        logits[:, 0::4, CLASS_DOWNBEAT] = 10.0
+        logits[:, 1::4, CLASS_BEAT] = 10.0
+        logits[:, 2::4, CLASS_BEAT] = 10.0
+        logits[:, 3::4, CLASS_BEAT] = 10.0
         t_hat = (torch.arange(1, num_candidates + 1, dtype=torch.float32) / num_candidates)
         return logits, t_hat.unsqueeze(0).expand(B, -1).contiguous()
 
     classes, frames, _ = stitch_piece(torch.zeros(1500, 128), fake_forward, window, border)
-    assert int((classes == DOWNBEAT).sum()) > 0 and int((classes == BEAT).sum()) > 0
+    assert int((classes == CLASS_DOWNBEAT).sum()) > 0 and int((classes == CLASS_BEAT).sum()) > 0
     print("ok: both classes survive stitching")
 
 

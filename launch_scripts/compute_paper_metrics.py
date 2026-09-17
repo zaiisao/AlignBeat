@@ -183,7 +183,10 @@ def datamodule_setup(checkpoint, num_workers, datasplit):
     # Load the datamodule
     print("Creating datamodule")
     data_dir = Path(__file__).parent.parent.relative_to(Path.cwd()) / "data"
-    datamodule_hparams = checkpoint["datamodule_hyper_parameters"]
+    datamodule_hparams = dict(checkpoint["datamodule_hyper_parameters"])
+    # Checkpoints written before the knob moved to alignbeat.training.priors record it here;
+    # scoring never masks anything. Drop when those are retrained.
+    datamodule_hparams.pop("downbeat_dropout", None)
     # update the hparams with the ones from the arguments
     if num_workers is not None:
         datamodule_hparams["num_workers"] = num_workers
@@ -213,7 +216,11 @@ def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu):
     if dbn is not None:
         checkpoint["hyper_parameters"]["use_dbn"] = dbn
 
-    model = PLBeatThis(**checkpoint["hyper_parameters"])
+    hparams = dict(checkpoint["hyper_parameters"])
+    # Checkpoints predating the subset_kwargs discriminator record head_type; it is
+    # vestigial now. Drop when those are retrained.
+    hparams.pop("head_type", None)
+    model = PLBeatThis(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
     # set correct device and accelerator
     if gpu >= 0:

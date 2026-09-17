@@ -34,9 +34,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from alignbeat.classes import BACKGROUND, CLASS_UNKNOWN, DOWNBEAT
-from alignbeat.classes import BEAT
-from alignbeat.dp import subset_select_dp
+from alignbeat.constants import CLASS_BACKGROUND, CLASS_UNKNOWN, CLASS_DOWNBEAT
+from alignbeat.constants import CLASS_BEAT
+from alignbeat.training.dp import subset_select_dp
 
 # The rungs, in the order they are reported. Each adds one oracle to the one before.
 RUNGS = ("real", "real+latent", "+detect", "+latent", "+meter", "+class")
@@ -56,7 +56,7 @@ def load(ckpt_path, device):
 
 def true_meter(classes):
     """The annotated L: the modal gap between consecutive downbeats."""
-    pos = (classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
+    pos = (classes == CLASS_DOWNBEAT).nonzero(as_tuple=False).flatten()
     if pos.numel() < 2:
         return 0
     return int(np.median(np.diff(pos.cpu().numpy())))
@@ -93,7 +93,7 @@ def downbeat_call(model, class_logits, t_hat, target, sigma, meter=None):
 
 @torch.no_grad()
 def run(model, loader, device):
-    from alignbeat.decode import decode_events
+    from alignbeat.inference.decode import decode_events
     # Deferred: latent_meter imports load() from here, so a module-level import cycles.
     from launch_scripts.latent_meter import downbeat_mass
     rows = []
@@ -120,13 +120,13 @@ def run(model, loader, device):
             # alone, so sigma is which candidates are genuinely events.
             sigma = subset_select_dp(np.abs(gt_t[:, None] - t_hat[None, :]))
             matched_sec = t_hat[sigma] * window
-            true_is_db = gt_c == DOWNBEAT
+            true_is_db = gt_c == CLASS_DOWNBEAT
 
             logits = pred["class_logits"][i].float()
             log_p = torch.log_softmax(logits, dim=-1)
             crit = model.subset_criterion
             span = log_p[torch.from_numpy(sigma).to(device)]
-            head_is_db = (span[:, DOWNBEAT] > span[:, BEAT]).cpu().numpy()
+            head_is_db = (span[:, CLASS_DOWNBEAT] > span[:, CLASS_BEAT]).cpu().numpy()
 
             # r_i on the same events, with the labels hidden exactly as training hides
             # them on beat-only data. Free L, then L pinned to the annotation.
@@ -142,7 +142,7 @@ def run(model, loader, device):
             real_latent_is_db = None
             probs = torch.softmax(pred["class_logits"][i].float(), dim=-1)
             top, arg = probs.max(dim=-1)
-            keep = (arg != BACKGROUND) & (top >= model.tau)
+            keep = (arg != CLASS_BACKGROUND) & (top >= model.tau)
             if int(keep.sum()) >= 4:
                 span_r = log_p[keep]
                 scores_h = crit._log_meter_phase_scores(crit._class_log_posterior(span_r))
@@ -158,7 +158,7 @@ def run(model, loader, device):
             cls, times, _ = decode_events(pred["class_logits"][i].float(),
                                           pred["t_hat"][i].float(), model.tau)
             real_sec = (times * window).cpu().numpy()
-            real_is_db = (cls == DOWNBEAT).cpu().numpy()
+            real_is_db = (cls == CLASS_DOWNBEAT).cpu().numpy()
 
             truth_db = np.frombuffer(batch["truth_orig_downbeat"][i])
             has_db = bool(batch["downbeat_mask"][i]) and len(truth_db) >= 3

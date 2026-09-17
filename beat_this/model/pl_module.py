@@ -8,50 +8,17 @@ from typing import Any
 
 import mir_eval
 import numpy as np
-import inspect
-
 import torch
 from pytorch_lightning import LightningModule
 
 import beat_this.model.loss
 from beat_this.inference import split_predict_aggregate
-import numpy as np
-
+from alignbeat.integration.config import split_subset_kwargs
+from alignbeat.training.criterion import SubsetCriterion
+from alignbeat.integration.subset import subset_decode, subset_loss, subset_predict_piece
 from beat_this.model.beat_tracker import BeatThis
-from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
-from alignbeat.criterion import SubsetCriterion
-from alignbeat.decode import (decode_events, decode_events_detect,
-                              decode_events_metrical)
-from alignbeat.stitching import stitch_piece
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
-
-
-# Architecture and decode settings that ride in subset_kwargs rather than in
-# PLBeatThis's own signature.
-SUBSET_ARCH_KEYS = ("num_candidates", "train_length", "downsample_stages",
-                    "stitch_border", "tau", "decode", "detect_tau",
-                    "attention_layers", "time_param")
-
-
-def split_subset_kwargs(subset_kwargs):
-    """Split subset_kwargs into its (architecture/decode, criterion) halves.
-
-    Everything the subset head needs travels in one dict, so upstream PLBeatThis's own
-    18 arguments stay 18 plus head_type and subset_kwargs, rather than spreading our
-    additions across the signature. Keys SubsetCriterion accepts go to it; the caller
-    pops what it needs from the rest, which is checked here against SUBSET_ARCH_KEYS
-    so a typo or a retired knob fails loudly instead of being silently ignored.
-    """
-    sk = dict(subset_kwargs or {})
-    criterion_keys = set(inspect.signature(SubsetCriterion.__init__).parameters)
-    arch = {k: v for k, v in sk.items() if k not in criterion_keys}
-
-    unknown = set(arch) - set(SUBSET_ARCH_KEYS)
-    if unknown:
-        raise TypeError(f"unknown subset_kwargs: {', '.join(sorted(unknown))}")
-
-    return arch, {k: v for k, v in sk.items() if k in criterion_keys}
 
 
 class PLBeatThis(LightningModule):
@@ -75,47 +42,22 @@ class PLBeatThis(LightningModule):
         eval_trim_beats=5,
         sum_head=True,
         partial_transformers=True,
-        head_type: str = "dense",
-        subset_kwargs: dict = None,
+        subset_kwargs=None,
     ):
         super().__init__()
         self.save_hyperparameters()
-
-        arch, subset_kwargs = split_subset_kwargs(subset_kwargs)
-
-        num_candidates = arch.pop("num_candidates", None)
-        train_length = arch.pop("train_length", 1500)
-        downsample_stages = arch.pop("downsample_stages", None)
-
-        self.stitch_border = arch.pop("stitch_border", None)
-        self.tau = arch.pop("tau", 0.2)
-        # "argmax": per-candidate argmax, decode_events. "metrical": Algorithm 3, one
-        # (omega, L) resolved jointly across the detected events. Defaults to argmax so
-        # existing checkpoints decode exactly as they were scored.
-        self.attention_layers = arch.pop("attention_layers", 0)
-        self.time_param = arch.pop("time_param", "bounded")
-        # Default is Algorithm 3's own line 5 detection with per-candidate labelling.
-        # Checkpoints written before this flag existed record no "decode" key, so they
-        # would silently change rule on reload -- they carry decode explicitly instead.
-        self.decode = arch.pop("decode", "detect")
-        if self.decode not in ("argmax", "metrical", "detect"):
-            raise ValueError(
-                f"decode must be argmax, metrical or detect, got {self.decode!r}")
-        # Algorithm 3's own tau, kept separate from decode_events' 0.2: the two threshold
-        # different quantities (event mass 1 - p(empty) vs the winning class's own
-        # probability), so one value cannot serve both, and every existing checkpoint
-        # records tau=0.2 for the argmax path.
-        self.detect_tau = arch.pop("detect_tau", 0.5)
-
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
-        # Decode-time Bayes correction for omega_DB-weighted training; see
-        # decode_events. Enters through __init__ with a default so old checkpoints
-        # still load, and can be overridden at load_from_checkpoint time.
         # create model
+        # AlignBeat's settings ride in one dict, routed to the head, to this module,
+        # and to the criterion.
+        head_arch, decode_arch, criterion_kwargs = split_subset_kwargs(subset_kwargs)
+        self.decode, self.tau = decode_arch["decode"], decode_arch["tau"]
+        self.detect_tau = decode_arch["detect_tau"]
+        self.stitch_border = decode_arch["stitch_border"]
+
         self.model = BeatThis(
-            head_type=head_type,
             spect_dim=spect_dim,
             transformer_dim=transformer_dim,
             ff_mult=ff_mult,
@@ -125,24 +67,21 @@ class PLBeatThis(LightningModule):
             dropout=dropout,
             sum_head=sum_head,
             partial_transformers=partial_transformers,
-            num_candidates=num_candidates,
-            train_length=train_length,
-            fps=fps,
-            downsample_stages=downsample_stages,
-            attention_layers=self.attention_layers,
-            time_param=self.time_param,
+            subset_arch=({**head_arch, "fps": fps}
+                         if subset_kwargs is not None else None),
         )
+        # The head owns the window a normalised time of 1.0 spans -- it built the
+        # candidate grid over it. Read it back rather than deriving it twice, so
+        # lambda_L1 is calibrated to the same excerpt the head actually laid out.
+        self.subset_criterion = (
+            SubsetCriterion(**criterion_kwargs,
+                            window_seconds=self.model.task_heads.head.window_seconds)
+            if subset_kwargs is not None else None)
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         # set up the losses
         self.pos_weights = pos_weights
-        # The order-preserving alignment head brings its own loss: the DP selects which
-        # candidates are responsible for which events, and the loss is evaluated at that
-        # selection. Nothing frame-wise applies, so the BCE variants below are skipped.
-        self.subset_criterion = None
-        if head_type == "subset":
-            self.subset_criterion = SubsetCriterion(**subset_kwargs)
-        elif loss_type == "shift_tolerant_weighted_bce":
+        if loss_type == "shift_tolerant_weighted_bce":
             self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
                 pos_weight=pos_weights["beat"]
             )
@@ -177,86 +116,9 @@ class PLBeatThis(LightningModule):
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
-    def _subset_decode(self, batch, model_prediction):
-        """Inference per excerpt, returned as predicted TIMES in seconds.
-
-        Either decoding rule, selected by self.decode: the per-candidate argmax of
-        decode_events, or Algorithm 3's two stages. Everything after the call -- the
-        seconds conversion, the padding-mask restriction, the sort -- is shared, so the
-        two rules differ in exactly one thing: which candidates are emitted with which
-        classes."""
-        num_frames = batch["truth_beat"].shape[-1]
-        window_seconds = num_frames / self.fps
-        padding_mask = batch.get("padding_mask")
-        beats, downbeats = [], []
-        for index in range(len(batch["spect"])):
-            logits = model_prediction["class_logits"][index].float()
-            candidate_times = model_prediction["t_hat"][index].float()
-            if self.decode == "metrical":
-                # Algorithm 3. One fragment per call is exactly the condition section 3
-                # states its stage 2 for: a single (omega, L) spans this window.
-                classes, times, _scores = decode_events_metrical(
-                    logits, candidate_times, self.subset_criterion, self.detect_tau)
-            elif self.decode == "detect":
-                classes, times, _scores = decode_events_detect(
-                    logits, candidate_times, self.detect_tau)
-            else:
-                classes, times, _scores = decode_events(
-                    logits, candidate_times, self.tau)
-            seconds = (times * window_seconds).detach().cpu().numpy()
-            classes = classes.detach().cpu().numpy()
-            if padding_mask is not None:
-                # The dense arm passes padding_mask to its postprocessor; without the
-                # same restriction here, candidates landing in an excerpt's zero-padded
-                # tail are emitted as detections that no ground-truth event can match
-                # (truth_orig_* stops at the real end), so they are pure false positives
-                # charged to one arm of the A/B only.
-                valid_seconds = float(padding_mask[index].sum()) / self.fps
-                keep = seconds < valid_seconds
-                seconds, classes = seconds[keep], classes[keep]
-            beats.append(np.sort(seconds))
-            downbeats.append(np.sort(seconds[classes == DOWNBEAT]))
-        return tuple(beats), tuple(downbeats)
-
-    def _subset_targets(self, batch):
-        """Ground-truth events for the alignment head, from this batch's own annotations."""
-        num_frames = batch["truth_beat"].shape[-1]
-        window_seconds = num_frames / self.fps
-        device = batch["spect"].device
-        targets = []
-        for index in range(len(batch["spect"])):
-            beats = np.frombuffer(batch["truth_orig_beat"][index])
-            downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
-            has_downbeats = bool(batch["downbeat_mask"][index])
-
-            # eq. (1) maps onto the half-open axis (0, 1], so a target at exactly 0 is
-            # unreachable by construction and would be an unmatchable event.
-            keep = (beats > 0) & (beats <= window_seconds)
-            beats = np.unique(beats[keep])   # unique, not just sorted: Definition 1
-            if has_downbeats:
-                classes = np.where(np.isin(beats, downbeats), DOWNBEAT, BEAT)
-            else:
-                classes = np.full(len(beats), CLASS_UNKNOWN)
-
-            targets.append({
-                "times": torch.as_tensor(beats / window_seconds,
-                                         dtype=torch.float32, device=device),
-                "classes": torch.as_tensor(classes, dtype=torch.long, device=device),
-            })
-        return targets
-
     def _compute_loss(self, batch, model_prediction):
         if self.subset_criterion is not None:
-            losses, _stats = self.subset_criterion(
-                model_prediction["class_logits"].float(),
-                model_prediction["t_hat"].float(),
-                self._subset_targets(batch))
-
-            # Keys kept as "beat"/"downbeat" so log_losses and every downstream reader
-            # are unchanged; they carry the class and timing terms of loss (8).
-            return {"beat": losses["class"], "downbeat": losses["time"],
-                    "total": losses["total"]}
-
+            return subset_loss(self, batch, model_prediction)
         beat_mask = batch["padding_mask"]
         beat_loss = self.beat_loss(
             model_prediction["beat"], batch["truth_beat"].float(), beat_mask
@@ -323,7 +185,7 @@ class PLBeatThis(LightningModule):
 
     def log_losses(self, losses, batch_size, step="train"):
         # log for separate targets
-        for target in "beat", "downbeat":
+        for target in (k for k in losses if k != "total"):
             self.log(
                 f"{step}_loss_{target}",
                 losses[target].item(),
@@ -359,7 +221,6 @@ class PLBeatThis(LightningModule):
     def training_step(self, batch, batch_idx):
         # run the model
         model_prediction = self.model(batch["spect"])
-
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
         self.log_losses(losses, len(batch["spect"]), "train")
@@ -372,7 +233,7 @@ class PLBeatThis(LightningModule):
         losses = self._compute_loss(batch, model_prediction)
         # postprocess the predictions
         if self.subset_criterion is not None:
-            postp_beat, postp_downbeat = self._subset_decode(batch, model_prediction)
+            postp_beat, postp_downbeat = subset_decode(self, batch, model_prediction)
         else:
             postp_beat, postp_downbeat = self.postprocessor(
                 model_prediction["beat"],
@@ -387,12 +248,11 @@ class PLBeatThis(LightningModule):
 
     def test_step(self, batch, batch_idx):
         metrics, model_prediction, _, _ = self.predict_step(batch, batch_idx)
-        # The alignment head returns no piece-level framewise prediction (its loss is
-        # defined over a fixed-length excerpt against a matched set of events, which a
-        # whole piece is not), so there is no test loss to log -- only metrics, which
-        # are the comparable quantity anyway.
+        # The alignment head returns no framewise prediction for a whole piece, so
+        # there is no test loss to log -- only metrics, the comparable quantity.
         if model_prediction is not None:
             losses = self._compute_loss(batch, model_prediction)
+            # log
             self.log_losses(losses, len(batch["spect"]), "test")
         self.log_metrics(metrics, batch["spect"].shape[0], "test")
 
@@ -423,8 +283,7 @@ class PLBeatThis(LightningModule):
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
         if self.subset_criterion is not None:
-            return self._subset_predict_piece(batch, chunk_size)
-
+            return subset_predict_piece(self, batch, chunk_size)
         # compute border size according to the loss type
         if hasattr(
             self.beat_loss, "tolerance"
@@ -447,76 +306,24 @@ class PLBeatThis(LightningModule):
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="test")
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
 
-    def _subset_predict_piece(self, batch, chunk_size):
-        """Whole-piece decoding for the alignment head (Section 9.3)."""
-        def forward_fn(batch_mel):
-            with torch.no_grad():
-                out = self.model(batch_mel)
-            return out["class_logits"].float(), out["t_hat"].float()
-
-        border = self.stitch_border
-        if border is None:
-            # A subset run has no beat_loss at all -- the subset branch of __init__
-            # builds subset_criterion instead -- and nn.Module.__getattr__ raises
-            # before getattr's default can apply, so guard self as well.
-            border = 2 * getattr(getattr(self, "beat_loss", None), "tolerance", 3)
-
-        # Same rule as _subset_decode uses per excerpt, so whole-piece inference and
-        # validation cannot disagree about how candidates are emitted.
-        decode_fn, tau = None, self.tau
-        if self.decode == "metrical":
-            tau = self.detect_tau
-            def decode_fn(logits, t_hat, tau):
-                return decode_events_metrical(logits, t_hat, self.subset_criterion, tau)
-        elif self.decode == "detect":
-            tau = self.detect_tau
-            decode_fn = decode_events_detect
-        classes, frames, _scores = stitch_piece(
-            batch["spect"][0], forward_fn, chunk_size, border, tau,
-            decode_fn=decode_fn)
-
-        seconds = (frames / self.fps).detach().cpu().numpy()
-        classes = classes.detach().cpu().numpy()
-        beats = (seconds,)
-        downbeats = (seconds[classes == DOWNBEAT],)
-        metrics = self._compute_metrics(batch, beats, downbeats, step="test")
-        return metrics, None, batch["dataset"], batch["spect_path"]
-
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW
         # only decay 2+-dimensional tensors, to exclude biases and norms
         # (filtering on dimensionality idea taken from Kaparthy's nano-GPT)
-        # Discriminative learning rates. The encoder and the head have different
-        # stability requirements and there is no reason they must share an lr: the dense
-        # baseline reaches its best at 8e-4, but the subset head collapses there (0.617
-        # at ep4 -> 0.545 at ep9, measured), which forced every subset arm to 3e-4. That
-        # costs the ENCODER real quality -- the dense control loses 0.025 joint at 3e-4
-        # versus 8e-4 (0.894 vs 0.919). head_lr lets the encoder train at the rate that
-        # suits it while the head keeps the rate that keeps it stable.
-        def _is_head(name):
-            return name.startswith("model.task_heads") or name.startswith("subset_criterion")
-        head_lr = self.lr
-        groups, seen = [], set()
-        for tag, pred, lr in (("encoder", lambda n: not _is_head(n), self.lr),
-                              ("head",    _is_head,                  head_lr)):
-            for decay, keep in (("decay", lambda p: p.ndim >= 2), ("nodecay", lambda p: p.ndim <= 1)):
-                # No requires_grad filter: configure_optimizers runs once, at fit
-                # start, so filtering here would permanently exclude anything frozen at
-                # construction. requires_grad already controls whether a parameter
-                # RECEIVES a gradient; a frozen one keeps p.grad = None and AdamW skips
-                # it, so freezing still works and thawing takes effect.
-                ps = [p for n, p in self.named_parameters()
-                      if pred(n) and keep(p) and id(p) not in seen]
-                for p in ps: seen.add(id(p))
-                if ps:
-                    groups.append({"params": ps, "lr": lr,
-                                   "weight_decay": self.weight_decay if decay == "decay" else 0.0,
-                                   "name": f"{tag}.{decay}"})
-        if head_lr != self.lr:
-            print(f"[optim] discriminative lr: encoder {self.lr:g}, head {head_lr:g} "
-                  f"({sum(len(g['params']) for g in groups if g['name'].startswith('head'))} head tensors)",
-                  flush=True)
-        params = groups
+        params = [
+            {
+                "params": (
+                    p for p in self.parameters() if p.requires_grad and p.ndim >= 2
+                ),
+                "weight_decay": self.weight_decay,
+            },
+            {
+                "params": (
+                    p for p in self.parameters() if p.requires_grad and p.ndim <= 1
+                ),
+                "weight_decay": 0,
+            },
+        ]
 
         optimizer = optimizer(params, lr=self.lr)
 

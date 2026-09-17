@@ -12,13 +12,14 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
-from alignbeat.criterion import SubsetCriterion
+from alignbeat.constants import CLASS_BEAT, CLASS_UNKNOWN, CLASS_DOWNBEAT
+from alignbeat.training.criterion import SubsetCriterion
 
 DATA_PRIOR = {"downbeat": 0.2853, "beat": 0.7147}   # fold-0 pi_data, measured
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
 
 LABELS = {
-    "labelled": [DOWNBEAT, BEAT, BEAT, BEAT, DOWNBEAT, BEAT, BEAT, BEAT],
+    "labelled": [CLASS_DOWNBEAT, CLASS_BEAT, CLASS_BEAT, CLASS_BEAT, CLASS_DOWNBEAT, CLASS_BEAT, CLASS_BEAT, CLASS_BEAT],
     "beat_only": [CLASS_UNKNOWN] * 8,
 }
 
@@ -46,7 +47,7 @@ def test_matches_the_double_loop(kind, seed):
     gt_time = torch.sort(torch.rand(8, generator=g, dtype=torch.float64)).values
     gt_class = torch.tensor(LABELS[kind])
 
-    criterion = SubsetCriterion(DATA_PRIOR, meter_prior={4: 1.0})
+    criterion = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS, meter_prior={4: 1.0})
     got = criterion.build_l_match(log_probabilities, t_hat, gt_class, gt_time)
     want = l_match_loop(criterion, log_probabilities, t_hat, gt_class, gt_time)
 

@@ -8,7 +8,7 @@ a probability. If logZ were wrong, section 4.2's condition would be measured wro
 import itertools, sys
 import numpy as np
 sys.path.insert(0, '/home/sogang/jaehoon/beatFCOS_new')
-from alignbeat.dp import subset_select_dp, subset_select_logz
+from alignbeat.training.dp import subset_select_dp, subset_select_logz
 
 def main():
   rng = np.random.default_rng(0)

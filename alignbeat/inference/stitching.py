@@ -1,7 +1,7 @@
 """Piece-level inference by stitching overlapping fragments (Section 9.3)."""
 import torch
 
-from alignbeat.decode import decode_events
+from alignbeat.inference.decode import decode_events
 
 
 def fragment_offsets(total_frames, fragment_frames, border_frames):

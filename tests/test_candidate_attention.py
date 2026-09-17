@@ -17,12 +17,14 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from alignbeat.head import SubsetSelectionHead, monotonic_times
+from alignbeat.model.head import SubsetSelectionHead, monotonic_times
+
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
 
 
 def head(layers, seed=1):
     torch.manual_seed(seed)
-    h = SubsetSelectionHead(feature_size=256, attention_layers=layers).eval()
+    h = SubsetSelectionHead(WINDOW_SECONDS, feature_size=256, attention_layers=layers).eval()
     # class_head is deliberately zero-initialised, which makes every logit constant and
     # any sensitivity probe vacuously zero. Undo it so the test measures something.
     torch.nn.init.normal_(h.class_head.weight, std=0.05)

@@ -4,11 +4,16 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
-from alignbeat.classes import METER_PRIOR
-from alignbeat.criterion import LAMBDA_L1, SubsetCriterion
+from alignbeat.constants import CLASS_BEAT, CLASS_UNKNOWN, CLASS_DOWNBEAT
+from alignbeat.training.criterion import SubsetCriterion
+
+# Corpus meter distribution, from docs/METER_DISTRIBUTION.md. A fixture only: the
+# model is trained on a per-fold prior measured by get_train_meter_prior, which
+# excludes the held-out pieces and so differs from this.
+METER_PRIOR = {2: 0.0447, 3: 0.0838, 4: 0.8612, 5: 0.0011, 6: 0.0068, 8: 0.0017}
 
 DATA_PRIOR = {"downbeat": 0.2853, "beat": 0.7147}   # fold-0 pi_data, measured
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
 
 # pi_M restricted to a candidate set and renormalised, as the datamodule returns it.
 CORPUS = {L: METER_PRIOR[L] / sum(METER_PRIOR[c] for c in (2, 3, 4, 6))
@@ -22,7 +27,8 @@ GOLDEN = os.path.join(os.path.dirname(__file__), '_criterion_golden.pt')
 CONFIGS = [
     ("default",        dict(gamma=0.5)),
     ("gamma1",         dict(gamma=1.0)),
-    ("lambda_l1_2x",   dict(gamma=0.5, lambda_l1=2 * LAMBDA_L1)),
+    # lambda_L1 is 2 * window_seconds / tolerance, so a double-length window doubles it
+    ("lambda_l1_2x",   dict(gamma=0.5, window_seconds=2 * WINDOW_SECONDS)),
     ("beat_only_em",   dict(gamma=0.5, meter_prior={4: 1.0})),
     ("latent_meter",   dict(gamma=0.5, meter_prior=CORPUS)),
 ]
@@ -53,8 +59,8 @@ def build(seed, batch, N, Ms, mode, device="cpu"):
         else:
             idx = torch.arange(M, device=device)
             cls = torch.where(idx % 4 == 0,
-                              torch.full((M,), DOWNBEAT, dtype=torch.long, device=device),
-                              torch.full((M,), BEAT, dtype=torch.long, device=device))
+                              torch.full((M,), CLASS_DOWNBEAT, dtype=torch.long, device=device),
+                              torch.full((M,), CLASS_BEAT, dtype=torch.long, device=device))
         targets.append({"times": times, "classes": cls})
     return logits, t_hat, targets
 
@@ -62,7 +68,7 @@ def build(seed, batch, N, Ms, mode, device="cpu"):
 def run_case(cfg_kwargs, seed, shape):
     _, batch, N, Ms, mode = shape
     logits, t_hat, targets = build(seed, batch, N, Ms, mode)
-    crit = SubsetCriterion(DATA_PRIOR, **cfg_kwargs)
+    crit = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS, **cfg_kwargs)
     losses, stats = crit(logits, t_hat, targets)
     out = {k: v.detach().clone() for k, v in losses.items() if torch.is_tensor(v)}
     total = losses["total"]

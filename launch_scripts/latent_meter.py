@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from alignbeat.classes import BEAT, CLASS_UNKNOWN, DOWNBEAT
+from alignbeat.constants import CLASS_BEAT, CLASS_UNKNOWN, CLASS_DOWNBEAT
 from launch_scripts.oracle_ceiling import load
 
 
@@ -51,7 +51,7 @@ def downbeat_mass(crit, pi, M):
 
 def true_meter(classes):
     """The annotated L: the modal gap between consecutive downbeats."""
-    pos = (classes == DOWNBEAT).nonzero(as_tuple=False).flatten()
+    pos = (classes == CLASS_DOWNBEAT).nonzero(as_tuple=False).flatten()
     if pos.numel() < 2:
         return 0
     return int(np.median(np.diff(pos.cpu().numpy())))
@@ -67,7 +67,7 @@ def main():
     ap.add_argument("--flat-class-prior", action="store_true", dest="flat",
                     help="set pi_C to (0.5, 0.5), removing the per-event -1.008 nat "
                          "cost of claiming a downbeat. pi_C(DB)=E[1/L] is derived from "
-                         "METER_PRIOR, the same prior already applied per hypothesis as "
+                         "the meter prior, the same one already applied per hypothesis as "
                          "log P(L), so charging it again per claimed event double-counts "
                          "the downbeat base rate -- and does so proportionally to how "
                          "many downbeats a hypothesis claims, i.e. biased toward large L")
@@ -144,7 +144,7 @@ def main():
             L_hat = max(post, key=lambda L: float(post[L]))
             conf[(L_true, L_hat)] += 1
 
-            is_db = (gt_c == DOWNBEAT)
+            is_db = (gt_c == CLASS_DOWNBEAT)
             called = r > 0.5
             ev_tp += int((called & is_db).sum());  ev_fp += int((called & ~is_db).sum())
             ev_fn += int((~called & is_db).sum()); ev_tn += int((~called & ~is_db).sum())
@@ -153,7 +153,7 @@ def main():
             # What decode_events does today: each matched candidate independently takes
             # argmax over DB/B, with no bar-phase constraint tying the events together.
             span = log_p[torch.from_numpy(m.sigma).to(device)]
-            head = span[:, DOWNBEAT] > span[:, BEAT]
+            head = span[:, CLASS_DOWNBEAT] > span[:, CLASS_BEAT]
             hd_tp += int((head & is_db).sum());  hd_fp += int((head & ~is_db).sum())
             hd_fn += int((~head & is_db).sum()); hd_tn += int((~head & ~is_db).sum())
             agree_r = (called == is_db); agree_h = (head == is_db)

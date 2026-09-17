@@ -1,0 +1,50 @@
+\section{Experimental setup}
+
+We evaluate on the $18$ datasets distributed with Beat This~\cite{foscarin2024beat} under its $8$-fold split, holding GTZAN out entirely as a test set. Metrics are F-measure and the continuity measures CMLt and AMLt~\cite{davies2009evaluation}, computed with \texttt{mir\_eval}~\cite{raffel2014mir} over whole pieces with the first five seconds discarded, and no DBN anywhere. Our baseline is Beat This's released per-fold checkpoints, scored by us through the same pipeline; we reproduce their published figures. Two of the $18$ datasets, \texttt{simac} and \texttt{smc}, carry no downbeat annotations, so beat metrics are pooled over $4556$ pieces and downbeat metrics over $3744$.
+
+We initialize the encoder from Beat This's released per-fold checkpoints and train the full model for a further $20$ epochs. Training the same architecture from scratch for $100$ epochs trails slightly on F-measure while preserving the gain in downbeat CMLt, but we adopt the two-stage scheme because it is also the convention in the literature this head derives from: set-prediction detectors are trained over pretrained backbones rather than from scratch~\cite{carion2020end}. Fragments are $30$ seconds at $50$~fps. We use AdamW at $3\times10^{-4}$ with weight decay $0.01$, $1000$ warmup steps and a cosine schedule, batch size $8$ with gradient accumulation over $8$ steps, $\lambda = 857$ with times expressed as a fraction of the fragment, $\gamma = 1$, $\alpha = 0.45$ and $\tau = 0.5$.
+
+\section{Results}
+
+Table~\ref{tab:cv} gives the cross-validation result. The method improves every metric, but not evenly: downbeat CMLt rises $3.90$ points and downbeat AMLt $2.46$, while both F-measures move by less than half a point. The same asymmetry holds on beat, where CMLt gains $3.24$ against $0.82$ on F-measure. The model does not find more events than the baseline; it places them at the right metrical level more often.
+
+That gain is consistent rather than concentrated. Downbeat CMLt improves on $15$ of the $16$ datasets carrying downbeat annotations (Fig.~\ref{fig:perdataset}), the exception being \texttt{candombe} at a $99.9$ ceiling, and the improvement is largest on the hardest sets: $+12.73$ on \texttt{guitarset} and $+5.43$ on \texttt{asap}, whose baseline is $23.50$. Downbeat F-measure stays within two points on every dataset and is positive on $9$ of $16$. On the three hardest sets the two metrics move in opposite directions --- \texttt{asap}, \texttt{hainsworth} and \texttt{rwc\_classical} each lose about a point of F-measure while gaining between $3.6$ and $6.1$ of CMLt --- which is what a model that commits to a metrical interpretation rather than hedging would be expected to do.
+
+The difference between AMLt and CMLt isolates the error the latent bar is meant to remove, since AMLt accepts half, double and offbeat interpretations and CMLt does not. Pooled over all pieces that gap falls from $7.63$ to $5.10$ on beat. It does not fall uniformly: the reduction tracks how much level confusion the baseline had to begin with. On \texttt{simac}, where Beat This's gap is $29.4$ points, ours is $12.6$; on \texttt{guitarset}, $7.7$ falls to $0.6$; on datasets whose baseline gap is already near zero, such as \texttt{ballroom} and \texttt{hjdb}, neither system makes such errors and nothing changes. The beat-metric gains in Table~\ref{tab:cv} come almost entirely from \texttt{simac} for this reason. \texttt{smc}, which also lacks downbeat annotations but begins with a gap of only $9.6$, shows no gain --- so it is the presence of level confusion, not the absence of downbeat labels, that predicts where the method helps.
+
+Table~\ref{tab:gtzan} compares against the concurrent masked-diffusion system on GTZAN. We improve on Beat This in downbeat CMLt and AMLt and trail it slightly elsewhere, and we trail~\cite{foscarin2026masked} on every metric. Their result is obtained with an ensemble of three models at eight inference steps, costs they report themselves, where ours is a single forward pass of a single model; and our cross-validation comparison spans $18$ datasets where theirs is GTZAN alone.
+
+\begin{table}[t]
+  \centering
+  \caption{Eight-fold cross-validation over $18$ datasets. Beat rows pool $4556$ pieces; downbeat rows pool the $3744$ carrying downbeat annotations. Intervals are $95\%$ over per-piece differences.}
+  \label{tab:cv}
+  \begin{tabular}{llrrr}
+    \hline
+     & & Beat This & Ours & $\Delta$ \\
+    \hline
+    \multirow{3}{*}{Beat}     & F-measure & 89.30 & 90.11 & $+0.82$ \, {\footnotesize$[+0.58, +1.05]$} \\
+                              & CMLt      & 79.20 & 82.45 & $+3.24$ \, {\footnotesize$[+2.65, +3.84]$} \\
+                              & AMLt      & 86.83 & 87.55 & $+0.71$ \, {\footnotesize$[+0.40, +1.02]$} \\
+    \hline
+    \multirow{3}{*}{Downbeat} & F-measure & 86.01 & 86.34 & $+0.33$ \, {\footnotesize$[+0.09, +0.57]$} \\
+                              & CMLt      & 73.67 & 77.58 & $+3.90$ \, {\footnotesize$[+3.46, +4.35]$} \\
+                              & AMLt      & 80.57 & 83.03 & $+2.46$ \, {\footnotesize$[+2.07, +2.85]$} \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \caption{GTZAN, $993$ tracks. Rows for Beat This and~\cite{foscarin2026masked} are their published figures; ours is the mean over three seeds trained on all cross-validation data.}
+  \label{tab:gtzan}
+  \begin{tabular}{lrrrrrr}
+    \hline
+     & \multicolumn{3}{c}{Beat} & \multicolumn{3}{c}{Downbeat} \\
+     & F & CMLt & AMLt & F & CMLt & AMLt \\
+    \hline
+    Beat This~\cite{foscarin2024beat}   & 89.1 & 79.8 & 89.8 & 78.3 & 67.3 & 79.1 \\
+    \cite{foscarin2026masked}           & 89.7 & 82.9 & 92.5 & 79.5 & 76.4 & 88.5 \\
+    Ours                                & 88.7 & 79.3 & 90.2 & 77.3 & 70.4 & 82.5 \\
+    \hline
+  \end{tabular}
+\end{table}

@@ -15,29 +15,30 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from alignbeat.classes import BACKGROUND, BEAT, DOWNBEAT
-from alignbeat.criterion import SubsetCriterion
-from alignbeat.decode import decode_events, decode_events_metrical
-from alignbeat.head import monotonic_times
+from alignbeat.constants import CLASS_BACKGROUND, CLASS_BEAT, CLASS_DOWNBEAT
+from alignbeat.training.criterion import SubsetCriterion
+from alignbeat.inference.decode import decode_events, decode_events_metrical
+from alignbeat.model.head import monotonic_times
 
 DATA_PRIOR = {"downbeat": 0.28532, "beat": 0.71468}
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
 METER_PRIOR = {2: 0.09928, 3: 0.05, 4: 0.7943, 5: 0.01, 6: 0.03, 8: 0.01642}
 
 
 def criterion():
-    return SubsetCriterion(data_prior=DATA_PRIOR, meter_prior=METER_PRIOR)
+    return SubsetCriterion(data_prior=DATA_PRIOR, window_seconds=WINDOW_SECONDS, meter_prior=METER_PRIOR)
 
 
 def head_output(N=188, seed=0, event_bias=3.0):
     """Random logits, biased so a decent share of candidates clear the detector."""
     g = torch.Generator().manual_seed(seed)
     logits = torch.randn(N, 3, generator=g)
-    logits[:, BACKGROUND] -= event_bias
+    logits[:, CLASS_BACKGROUND] -= event_bias
     return logits, monotonic_times(torch.randn(N, generator=g))
 
 
 def downbeat_gaps(classes):
-    pos = (classes == DOWNBEAT).nonzero(as_tuple=False).flatten().numpy()
+    pos = (classes == CLASS_DOWNBEAT).nonzero(as_tuple=False).flatten().numpy()
     return np.diff(pos)
 
 
@@ -60,9 +61,9 @@ def test_no_two_adjacent_downbeats(seed):
 
 @pytest.mark.parametrize("seed", range(8))
 def test_every_emitted_class_is_an_event(seed):
-    """Stage 2 labels events; BACKGROUND must never survive into the output."""
+    """Stage 2 labels events; CLASS_BACKGROUND must never survive into the output."""
     classes, _t, _s = decode_events_metrical(*head_output(seed=seed), criterion())
-    assert (classes != BACKGROUND).all()
+    assert (classes != CLASS_BACKGROUND).all()
 
 
 def test_the_per_candidate_rule_violates_what_this_guarantees():
@@ -102,12 +103,12 @@ def test_too_few_events_for_any_meter_still_decodes():
     real detections and must be emitted, not dropped."""
     crit = criterion()
     logits = torch.full((188, 3), -10.0)
-    logits[:, BACKGROUND] = 10.0                          # everything is background...
+    logits[:, CLASS_BACKGROUND] = 10.0                          # everything is background...
     logits[:2] = torch.tensor([2.0, 1.0, -10.0])          # ...except exactly two events
     classes, times, _s = decode_events_metrical(logits, monotonic_times(torch.zeros(188)),
                                                 crit, tau=0.5)
     assert times.numel() == 2
-    assert (classes != BACKGROUND).all()
+    assert (classes != CLASS_BACKGROUND).all()
 
 
 def test_pattern_matches_the_hypothesis_that_won():
@@ -118,7 +119,7 @@ def test_pattern_matches_the_hypothesis_that_won():
     logits, t_hat = head_output(seed=5)
     log_p = torch.log_softmax(logits, dim=-1)
     p = torch.softmax(logits, dim=-1)
-    keep = (1.0 - torch.softmax(logits, -1)[:, BACKGROUND]) >= 0.5
+    keep = (1.0 - torch.softmax(logits, -1)[:, CLASS_BACKGROUND]) >= 0.5
     resolved = crit.infer_pattern(p[keep])
     assert resolved is not None
     classes, omega, meter = resolved
@@ -129,8 +130,8 @@ def test_pattern_matches_the_hypothesis_that_won():
 
     i0 = torch.arange(int(keep.sum()))
     assert torch.equal(classes, torch.where(((omega + i0) % meter) == 0,
-                                            torch.full_like(i0, DOWNBEAT),
-                                            torch.full_like(i0, BEAT)))
+                                            torch.full_like(i0, CLASS_DOWNBEAT),
+                                            torch.full_like(i0, CLASS_BEAT)))
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +145,7 @@ def planted(M, omega, meter, confidence=0.9, N=188, seed=0):
     on the first M candidates, with the rest firmly background."""
     g = torch.Generator().manual_seed(seed)
     logits = torch.full((N, 3), -20.0)
-    logits[:, BACKGROUND] = 20.0
+    logits[:, CLASS_BACKGROUND] = 20.0
     i0 = torch.arange(M)
     is_db = ((omega + i0) % meter) == 0
     p_db = torch.where(is_db, confidence, 1.0 - confidence)
@@ -166,7 +167,7 @@ def test_recovers_the_planted_meter_and_phase(meter, omega):
     classes, got_omega, got_meter = resolved
     assert (got_meter, got_omega) == (meter, omega)
     i0 = torch.arange(M)
-    assert torch.equal(classes == DOWNBEAT, ((omega + i0) % meter) == 0)
+    assert torch.equal(classes == CLASS_DOWNBEAT, ((omega + i0) % meter) == 0)
 
 
 @pytest.mark.parametrize("meter,omega", [(4, 0), (4, 2), (3, 1), (6, 5)])
@@ -178,7 +179,7 @@ def test_end_to_end_decode_recovers_the_pattern(meter, omega):
     classes, times, _s = decode_events_metrical(logits, t_hat, criterion(), tau=0.5)
     assert times.numel() == M, "stage 1 should detect exactly the planted events"
     i0 = torch.arange(M)
-    assert torch.equal(classes == DOWNBEAT, ((omega + i0) % meter) == 0)
+    assert torch.equal(classes == CLASS_DOWNBEAT, ((omega + i0) % meter) == 0)
 
 
 def test_recovery_survives_a_wrong_event():
@@ -200,5 +201,5 @@ def test_first_downbeat_index_matches_the_spec():
     M, meter, omega = 24, 4, 3
     logits, _t = planted(M, omega, meter)
     classes, _o, _m = criterion().infer_pattern(torch.softmax(logits, -1)[:M])
-    first = int((classes == DOWNBEAT).nonzero()[0])
+    first = int((classes == CLASS_DOWNBEAT).nonzero()[0])
     assert first == (meter - omega) % meter == 1

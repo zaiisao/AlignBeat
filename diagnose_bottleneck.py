@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from alignbeat.classes import BACKGROUND, DOWNBEAT
-from alignbeat.dp import subset_select_dp
+from alignbeat.constants import CLASS_BACKGROUND, CLASS_DOWNBEAT
+from alignbeat.training.dp import subset_select_dp
 from beat_this.dataset import BeatDataModule
 from beat_this.model.pl_module import PLBeatThis
 
@@ -101,19 +101,19 @@ for path in paths:
             loc += int((np.abs(gt_t - t_hat[sigma]) <= TOL).sum())
 
             predicted = logits[index].argmax(-1).numpy()[sigma]
-            active = predicted != BACKGROUND
+            active = predicted != CLASS_BACKGROUND
             fired += int(active.sum())
             right += int((predicted[active] == gt_c[active]).sum())
-            downbeat = gt_c == DOWNBEAT
+            downbeat = gt_c == CLASS_DOWNBEAT
             db_n += int(downbeat.sum())
-            db_ok += int((predicted[downbeat] == DOWNBEAT).sum())
-            db_bg += int((predicted[downbeat] == BACKGROUND).sum())
+            db_ok += int((predicted[downbeat] == CLASS_DOWNBEAT).sum())
+            db_bg += int((predicted[downbeat] == CLASS_BACKGROUND).sum())
             # ...and how many of the DOWNBEATS IT CLAIMS are real: raising omega_DB buys
             # recall by calling more things downbeats, so recall alone cannot say whether
             # it helped.
-            claimed = predicted == DOWNBEAT
+            claimed = predicted == CLASS_DOWNBEAT
             db_claimed += int(claimed.sum())
-            db_true += int((gt_c[claimed] == DOWNBEAT).sum())
+            db_true += int((gt_c[claimed] == CLASS_DOWNBEAT).sum())
 
     stacked = np.stack(times)
     uniform = np.arange(1, stacked.shape[1] + 1) / stacked.shape[1]

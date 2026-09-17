@@ -1,0 +1,23 @@
+\begin{table}[t]
+  \centering
+  \caption{GTZAN, $993$ tracks. Coherency is the per-track count of consecutive
+  downbeats and of tempo doubling or halving events, lower being better; the GTZAN
+  annotations contain $0.000$ and $0.036$ respectively. Beat This is scored
+  by us and reproduces the figures quoted in~\cite{foscarin2026masked}; the
+  masked-diffusion row (MDM) is quoted from that paper, where it is obtained
+  from an ensemble of three models at eight inference steps.}
+  \label{tab:gtzan}
+  \footnotesize
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}l rr rrr rrr@{}}
+    \hline
+    & \multicolumn{2}{c}{Coherency} & \multicolumn{3}{c}{Beat} & \multicolumn{3}{c}{Downbeat} \\
+    \cline{2-3}\cline{4-6}\cline{7-9}
+    & \makecell{consecutive\\downbeats} & \makecell{tempo\\$\times2$} & F & CMLt & AMLt & F & CMLt & AMLt \\
+    \hline
+    Beat This~\cite{foscarin2024beat} & 1.71 & 0.98 & 89.1 & 79.8 & 89.8 & 78.3 & 67.2 & 79.1 \\
+    MDM~\cite{foscarin2026masked} & 0.02 & \textbf{0.12} & \textbf{89.7} & \textbf{82.9} & \textbf{92.5} & \textbf{79.5} & \textbf{76.4} & \textbf{88.5} \\
+    Ours & \textbf{0.00} & 0.93 & 88.7 & 79.3 & 90.2 & 77.3 & 70.4 & 82.5 \\
+    \hline
+  \end{tabular}
+\end{table}

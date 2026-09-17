@@ -3,9 +3,6 @@ Model definitions for the Beat This! beat tracker.
 """
 
 import contextlib
-
-from alignbeat.downsample import Downsample
-from alignbeat.head import SubsetSelectionHead
 from collections import OrderedDict
 
 import torch
@@ -15,11 +12,29 @@ from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
 from beat_this.model import roformer
+from alignbeat.model.head import SubsetHead
 from beat_this.utils import replace_state_dict_key
 
 
 class BeatThis(nn.Module):
-    """A neural network model for beat tracking. It is composed of three main components:"""
+    """
+    A neural network model for beat tracking. It is composed of three main components:
+    - a frontend that processes the input spectrogram,
+    - a series of transformer blocks that process the output of the frontend,
+    - a head that produces the final beat and downbeat predictions.
+
+    Args:
+        spect_dim (int): The dimension of the input spectrogram (default: 128).
+        transformer_dim (int): The dimension of the main transformer blocks (default: 512).
+        ff_mult (int): The multiplier for the feed-forward dimension in the transformer blocks (default: 4).
+        n_layers (int): The number of transformer blocks (default: 6).
+        head_dim (int): The dimension of each attention head for the partial transformers in the frontend and the transformer blocks (default: 32).
+        stem_dim (int): The out dimension of the stem convolutional layer (default: 32).
+        dropout (dict): A dictionary specifying the dropout rates for different parts of the model
+            (default: {"frontend": 0.1, "transformer": 0.2}).
+        sum_head (bool): Whether to use a SumHead for the final predictions (default: True) or plain independent projections.
+        partial_transformers (bool): Whether to include partial frequency- and time-transformers in the frontend (default: True)
+    """
 
     def __init__(
         self,
@@ -32,13 +47,7 @@ class BeatThis(nn.Module):
         dropout: dict = {"frontend": 0.1, "transformer": 0.2},
         sum_head: bool = True,
         partial_transformers: bool = True,
-        head_type: str = "dense",
-        num_candidates: int = None,
-        attention_layers: int = 0,
-        time_param: str = "bounded",
-        train_length: int = 1500,
-        fps: int = 50,
-        downsample_stages: int = None,
+        subset_arch: dict | None = None,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -90,17 +99,10 @@ class BeatThis(nn.Module):
         )
 
         # create the output heads
-        if head_type == "subset":
-            if num_candidates is None:
-                raise ValueError(
-                    "head_type='subset' needs num_candidates; launch_scripts/train.py "
-                    "derives it from --bpm_max and --train_length")
-            # JA: This is the bridge to our AlignBeat architecture
-            self.task_heads = SubsetHead(
-                transformer_dim, num_candidates=num_candidates,
-                attention_layers=attention_layers, time_param=time_param,
-                train_length=train_length, fps=fps,
-                downsample_stages=downsample_stages)
+        if subset_arch is not None:
+            # AlignBeat: a candidate grid and an order-preserving head, in place of the
+            # frame-wise one. Everything it needs rides in subset_arch.
+            self.task_heads = SubsetHead(transformer_dim, **subset_arch)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:
@@ -108,10 +110,8 @@ class BeatThis(nn.Module):
 
         # init all weights
         self.apply(self._init_weights)
-
         # ...then restore the subset head's own initialisation, which the generic pass
-        # above would otherwise overwrite: the class prior on the classifier bias, the
-        # zeroed regression and class weights.
+        # above would otherwise overwrite: the zeroed regression and class weights.
         if isinstance(self.task_heads, SubsetHead):
             self.task_heads.head._initialize_weights()
 
@@ -309,42 +309,6 @@ class PartialFTTransformer(nn.Module):
         x = x + self.ffT(x)
         x = rearrange(x, "(b f) t c -> b c f t", b=b)
         return x
-
-
-class SubsetHead(nn.Module):
-    """Progressive downsample T -> N, then the order-preserving alignment head."""
-
-    def __init__(self, input_dim, num_candidates, attention_layers=0, time_param="bounded",
-                 train_length=1500, fps=50,
-                 downsample_stages=None):
-        super().__init__()
-
-        self.downsample = Downsample(input_dim, num_candidates,
-                                     fragment_frames=train_length,
-                                     stages=downsample_stages)
-
-        # One token out of the downsample is one candidate into the heads, so there is a
-        # single N. The halvings decide it (1500 -> 188) and the tempo floor is only a
-        # lower bound they must clear, not a target to pool down to -- tempo augmentation
-        # can push a 30 s window past the floor's 170 events, so the slack above it is
-        # useful rather than waste. The criterion reads N from the logits' shape.
-        self.num_candidates = self.downsample.num_candidates
-
-        self.head = SubsetSelectionHead(
-            feature_size=input_dim, attention_layers=attention_layers, time_param=time_param,
-            window_seconds=train_length / float(fps))
-
-    def forward(self, x):
-        z = self.downsample(x) # (B, T, dim) -> (B, N, dim)
-        out = self.head(z.transpose(1, 2))     # the head wants channel-first
-
-        # The candidate grid spans padded_length frames, so on a short input t_hat is
-        # relative to the padding rather than to x. Rescale so callers can keep reading
-        # it as a fraction of what they passed in; candidates past 1.0 sit in the pad.
-        downsample_factor = self.downsample.time_scale(x.shape[1])
-        t_hat = out[1] if downsample_factor == 1.0 else out[1] * downsample_factor
-
-        return {"class_logits": out[0], "t_hat": t_hat}
 
 
 class SumHead(nn.Module):

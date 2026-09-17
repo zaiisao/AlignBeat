@@ -20,7 +20,9 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 from beat_this.dataset import BeatDataModule
-from alignbeat.downsample import BPM_MAX, halved_candidates, stages_from_tempo
+from alignbeat.model.downsample import BPM_MAX, halved_candidates, stages_from_tempo
+from alignbeat.training.priors import (apply_downbeat_dropout, get_train_class_prior,
+                               get_train_meter_prior, get_train_positive_weights)
 from beat_this.model.pl_module import PLBeatThis
 
 
@@ -81,8 +83,7 @@ def main(args):
         hung_data=args.hung_data,
         no_val=not args.val,
         fold=args.fold,
-        downbeat_dropout=args.downbeat_dropout,
-    )
+            )
 
     # Parsed before setup so the meter prior below is measured over exactly the
     # candidate set the criterion will marginalise over.
@@ -90,8 +91,16 @@ def main(args):
 
     datamodule.setup(stage="fit")
 
+    # Before any prior is measured: the annotation-coverage ablation hides downbeats
+    # from training, and a prior read off the unmasked split would describe data the
+    # model never sees.
+    if args.downbeat_dropout:
+        dropped = apply_downbeat_dropout(datamodule.train_dataset, args.downbeat_dropout)
+        print(f"[downbeat-dropout] {args.downbeat_dropout:g}: hid downbeats on "
+              f"{dropped} pieces", flush=True)
+
     # compute positive weights
-    pos_weights = datamodule.get_train_positive_weights(widen_target_mask=3)
+    pos_weights = get_train_positive_weights(datamodule, widen_target_mask=3)
     print("Using positive weights: ", pos_weights)
 
     meter_prior = data_prior = None
@@ -106,8 +115,8 @@ def main(args):
 
         # pi_M from THIS fold's training split, so no validation or test track informs a
         # prior the model then uses.
-        meter_prior = datamodule.get_train_meter_prior(candidates=meter_candidates)
-        data_prior = datamodule.get_train_class_prior()
+        meter_prior = get_train_meter_prior(datamodule.train_dataset, candidates=meter_candidates)
+        data_prior = get_train_class_prior(datamodule.train_dataset)
         print("Using meter prior: ", {L: round(p, 5) for L, p in sorted(meter_prior.items())})
         print("Using data prior:  ", {k: round(v, 5) for k, v in data_prior.items()})
 
@@ -146,12 +155,12 @@ def main(args):
         eval_trim_beats=args.eval_trim_beats,
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
-        head_type=args.head_type,
-        # Everything the subset head needs travels in one dict; pl_module splits it
-        # into architecture and criterion halves. A knob implemented but with no path
-        # from the CLI is worse than one that is absent: an ablation of it shows no
-        # difference and reads as "the idea does not help", when in fact it never ran.
-        subset_kwargs={
+        # Everything the alignment head needs travels in one dict, which pl_module
+        # routes to the head, to itself, and to the criterion. A knob implemented but
+        # with no path from the CLI is worse than one that is absent: an ablation of it
+        # shows no difference and reads as "the idea does not help", when in fact it
+        # never ran.
+        subset_kwargs=None if args.head_type != "subset" else {
             # architecture and decode
             "num_candidates": num_candidates,
             "train_length": args.train_length,
@@ -169,6 +178,7 @@ def main(args):
             "match_event_cost": args.match_event_cost,
         },
     )
+
     # --- frozen-encoder head swap -------------------------------------------------
     # Isolates "is the encoder good enough" from "is the head lossy". Both arms share
     # the identical frontend + transformer_blocks and differ only in task_heads, so

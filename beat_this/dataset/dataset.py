@@ -1,11 +1,8 @@
-import collections
 import concurrent.futures
 import itertools
 import json
 import re
 from pathlib import Path
-
-import hashlib
 
 import numpy as np
 import pandas as pd
@@ -47,9 +44,7 @@ class BeatTrackingDataset(Dataset):
         deterministic=False,
         augmentations={},
         length_based_oversampling_factor=0,
-        downbeat_dropout: float = 0.0,
     ):
-        self.downbeat_dropout = downbeat_dropout
         self.spect_basepath = data_folder / "audio" / "spectrograms"
         self.annotation_basepath = data_folder / "annotations"
         self.fps = spect_fps
@@ -137,17 +132,6 @@ class BeatTrackingDataset(Dataset):
 
         # create a downbeat mask to handle the case where the downbeat is not annotated
         downbeat_mask = self.dataset_info[dataset]["has_downbeats"]
-
-        # Annotation-coverage ablation: pretend a fraction of the downbeat-annotated
-        # pieces were never downbeat-annotated. Both heads read this same flag -- the
-        # dense arm masks its downbeat loss, the subset arm routes the fragment to the
-        # beat-only branch -- so one knob drives the comparison. Deterministic in the
-        # piece name, NOT resampled per epoch: a per-epoch draw would leak every
-        # piece's downbeats eventually and measure augmentation rather than coverage.
-        if downbeat_mask and self.downbeat_dropout > 0.0:
-            digest = hashlib.md5(str(item_name).encode()).hexdigest()[:8]
-            if int(digest, 16) / 0xFFFFFFFF < self.downbeat_dropout:
-                downbeat_mask = False
         # take care of different subsections of rwc for the dataset name
         if dataset == "rwc":
             dataset = "rwc_" + stem.split("_", 2)[1]
@@ -298,7 +282,6 @@ class BeatDataModule(pl.LightningDataModule):
         length_based_oversampling_factor=0,
         fold=None,
         predict_datasplit="test",
-        downbeat_dropout: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -316,7 +299,6 @@ class BeatDataModule(pl.LightningDataModule):
         self.no_val = no_val
         self.spect_fps = spect_fps
         self.length_based_oversampling_factor = length_based_oversampling_factor
-        self.downbeat_dropout = downbeat_dropout
         self.fold = fold
         self.predict_datasplit = predict_datasplit
 
@@ -409,8 +391,6 @@ class BeatDataModule(pl.LightningDataModule):
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
-                # training only: validation and test keep every annotation they have
-                downbeat_dropout=self.downbeat_dropout,
             )
             print(
                 "Training set:",
@@ -490,93 +470,6 @@ class BeatDataModule(pl.LightningDataModule):
             self.predict_dataset, batch_size=1, num_workers=self.num_workers
         )
 
-
-    def get_train_class_prior(self, weight="stream"):
-        """pi_data: the DB:B balance in the data the class head is trained on, this fold.
-
-        Section 1.3's calibration assumption is that cross-entropy drives p_hat_j toward
-        the training set's own posterior, whose implicit prior is this. Measured from
-        train_dataset.items -- fold-excluded and oversampled, i.e. what the head
-        actually saw -- so no validation or test track informs a prior the model uses.
-
-        Only items carrying downbeat annotations are counted: those are the fragments
-        trained by plain cross-entropy against an observed class. Beat-only fragments
-        train the same head through the EM surrogate with soft r_i weights that move
-        during training, so the head's true implicit prior is a mixture and this is an
-        approximation of it -- a close one, labelled items being ~82% of the corpus.
-
-        weight: "stream" counts items as the loader presents them, with the length-based
-                oversampling; "track" counts each distinct piece once.
-        """
-        if weight not in ("stream", "track"):
-            raise ValueError(f"weight must be 'stream' or 'track', got {weight!r}")
-        downbeats = beats = 0
-        seen = set()
-        for item in self.train_dataset.items:
-            if not item["downbeat_mask"]:
-                continue
-            if weight == "track":
-                key = str(item["spect_path"])
-                if key in seen:
-                    continue
-                seen.add(key)
-            values = np.asarray(item["beat_value"]).astype(int)
-            downbeats += int((values == 1).sum())
-            beats += len(values)
-        if not beats:
-            raise ValueError("no labelled training beats; cannot estimate pi_data")
-        share = downbeats / beats
-        return {"downbeat": share, "beat": 1.0 - share}
-
-    def get_train_meter_prior(self, candidates=(2, 3, 4, 5, 6, 8),
-                              weight="stream", floor=1e-4):
-        """pi_M(L): the meter distribution of THIS fold's own training split.
-
-        weight:     "stream" counts train_dataset.items as they are, i.e. with the
-                    length-based oversampling the head actually sees; "track" counts
-                    each distinct piece once, as METER_DISTRIBUTION.md does.
-        floor:      every candidate's share is raised to at least this before
-                    renormalising, so a meter absent from a fold is improbable rather
-                    than impossible (an unfloored zero gives log pi_M = -inf, which
-                    removes it from the support outright).
-
-        Returns {L: probability} over `candidates`, summing to 1.
-        """
-        if weight not in ("stream", "track"):
-            raise ValueError(f"weight must be 'stream' or 'track', got {weight!r}")
-
-        counts = collections.Counter()
-        seen = set()
-        n_labelled = n_outside = 0
-        for item in self.train_dataset.items:
-            if not item["downbeat_mask"]:
-                continue
-            if weight == "track":
-                key = str(item["spect_path"])
-                if key in seen:
-                    continue
-                seen.add(key)
-            downbeats = np.flatnonzero(np.asarray(item["beat_value"]).astype(int) == 1)
-            if len(downbeats) < 2:
-                continue
-            meter = int(np.bincount(np.diff(downbeats)).argmax())
-            n_labelled += 1
-            if meter in candidates:
-                counts[meter] += 1
-            else:
-                n_outside += 1
-
-        if not counts:
-            raise ValueError(
-                "no training track has a modal meter among "
-                f"{tuple(candidates)}; cannot estimate pi_M")
-
-        observed = sum(counts[L] for L in candidates)
-        floored = {int(L): max(floor, counts[L] / observed) for L in candidates}
-        total = sum(floored.values())
-        prior = {L: p / total for L, p in floored.items()}
-        return prior
-
     def get_train_positive_weights(self, widen_target_mask=3):
         """
         Computes the relation of negative targets to positive targets.
@@ -607,16 +500,12 @@ class BeatDataModule(pl.LightningDataModule):
                     / beat_frames
                 )
             ),
-            # downbeat_frames == 0 when every downbeat annotation has been dropped
-            # (--downbeat_dropout 1.0). The dense head then has no positive downbeat
-            # example to weight, and the subset head does not read this at all, so any
-            # finite value is inert; 1 keeps the loss well defined.
             "downbeat": int(
                 np.round(
                     (all_frames_db - downbeat_frames * (widen_target_mask * 2 + 1))
                     / downbeat_frames
                 )
-            ) if downbeat_frames > 0 else 1,
+            ),
         }
 
 

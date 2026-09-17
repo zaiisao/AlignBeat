@@ -27,15 +27,16 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from alignbeat.classes import BEAT, DOWNBEAT
-from alignbeat.criterion import SubsetCriterion
+from alignbeat.constants import CLASS_BEAT, CLASS_DOWNBEAT
+from alignbeat.training.criterion import SubsetCriterion
 
 DATA_PRIOR = {"downbeat": 0.28532, "beat": 0.71468}     # fold 0, as measured
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
 METER_PRIOR = {2: 0.09928, 3: 0.05, 4: 0.7943, 5: 0.01, 6: 0.03, 8: 0.01642}
 
 
 def criterion():
-    return SubsetCriterion(data_prior=DATA_PRIOR, meter_prior=METER_PRIOR).double()
+    return SubsetCriterion(data_prior=DATA_PRIOR, window_seconds=WINDOW_SECONDS, meter_prior=METER_PRIOR).double()
 
 
 def logits(M, seed):
@@ -148,7 +149,7 @@ def test_single_em_step_is_monotone():
 # and check the identity survives it.
 # ---------------------------------------------------------------------------
 
-from alignbeat.classes import CLASS_UNKNOWN
+from alignbeat.constants import CLASS_UNKNOWN
 
 
 def beat_only_batch(M=20, N=188, seed=0):

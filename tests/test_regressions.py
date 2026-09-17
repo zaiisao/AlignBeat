@@ -8,10 +8,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alignbeat.classes import METER_PRIOR
-from alignbeat.criterion import SubsetCriterion
+from alignbeat.training.criterion import SubsetCriterion
 
 DATA_PRIOR = {"downbeat": 0.2853, "beat": 0.7147}   # fold-0 pi_data, measured
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
 
 def prior_over(candidates):
     """pi_M restricted to `candidates` and renormalised -- what the datamodule's
@@ -20,7 +20,12 @@ def prior_over(candidates):
     total = sum(METER_PRIOR[L] for L in candidates)
     return {L: METER_PRIOR[L] / total for L in candidates}
 
-from alignbeat.dp import subset_posterior_marginals, subset_select_dp, subset_select_logsumexp
+from alignbeat.training.dp import subset_posterior_marginals, subset_select_dp, subset_select_logsumexp
+
+# Corpus meter distribution, from docs/METER_DISTRIBUTION.md. A fixture only: the
+# model is trained on a per-fold prior measured by get_train_meter_prior, which
+# excludes the held-out pieces and so differs from this.
+METER_PRIOR = {2: 0.0447, 3: 0.0838, 4: 0.8612, 5: 0.0011, 6: 0.0068, 8: 0.0017}
 
 
 def _targets(M=40, seed=0):
@@ -36,7 +41,7 @@ def _targets(M=40, seed=0):
 def test_class_term_has_gradient():
     """The class term must differentiate into the CLASS logits."""
     logits, t_hat, tg = _targets()
-    losses, _ = SubsetCriterion(DATA_PRIOR)(logits, t_hat, tg)
+    losses, _ = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS, WINDOW_SECONDS)(logits, t_hat, tg)
     assert losses['class'].requires_grad, "class term is detached"
     g = torch.autograd.grad(losses['class'], logits, retain_graph=True)[0]
     assert float(g.abs().mean()) > 1e-6, "no gradient reaches the class logits"
@@ -62,7 +67,7 @@ def test_flags_reach_the_criterion():
     """Flags have silently failed to arrive at the criterion before. Check the plumbing."""
     from beat_this.model.pl_module import PLBeatThis
     m = PLBeatThis(
-        head_type="subset", transformer_dim=64, n_layers=2,
+        transformer_dim=64, n_layers=2,
         subset_kwargs=dict(num_candidates=188, data_prior=DATA_PRIOR,
                            meter_prior=prior_over((2, 3, 4, 6)), gamma=0.25))
     c = m.subset_criterion
@@ -87,7 +92,7 @@ def test_defaults_are_the_three_shipped_terms():
     """v1 ships class + time + background and nothing else; continuity and periodicity
     are retired, so their absence is the property to hold, not their being zero."""
     logits, t_hat, tg = _targets()
-    losses, _ = SubsetCriterion(DATA_PRIOR)(logits, t_hat, tg)
+    losses, _ = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS, WINDOW_SECONDS)(logits, t_hat, tg)
     assert set(losses) == {'class', 'time', 'background', 'total'}, sorted(losses)
     assert all(torch.isfinite(v) for v in losses.values())
 
