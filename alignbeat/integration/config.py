@@ -14,7 +14,6 @@ SUBSET_ARCH_DEFAULTS = {
     "downsample_stages": None,
     "stitch_border": None,
     "attention_layers": 0,
-    "time_param": "bounded",
     "tau": 0.2,           # decode_events: the winning class's own probability
     "detect_tau": 0.5,    # Algorithm 3 line 5: event mass, 1 - p(empty)
     "decode": "detect",

@@ -281,7 +281,7 @@ def test_criterion_gradients_flow_only_where_expected():
 
 
 def test_head_shapes_and_monotonicity_end_to_end():
-    head = SubsetSelectionHead(WINDOW_SECONDS, feature_size=32)
+    head = SubsetSelectionHead(feature_size=32)
     logits, t_hat = head(torch.randn(2, 32, 160))
     assert logits.shape == (2, 160, 3)
     assert t_hat.shape == (2, 160)

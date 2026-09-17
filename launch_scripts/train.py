@@ -20,7 +20,8 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 from beat_this.dataset import BeatDataModule
-from alignbeat.model.downsample import BPM_MAX, halved_candidates, stages_from_tempo
+from alignbeat.constants import BPM_MAX
+from alignbeat.model.downsample import stages_from_tempo
 from alignbeat.training.priors import (apply_downbeat_dropout, get_train_class_prior,
                                get_train_meter_prior, get_train_positive_weights)
 from beat_this.model.pl_module import PLBeatThis
@@ -160,6 +161,7 @@ def main(args):
         # with no path from the CLI is worse than one that is absent: an ablation of it
         # shows no difference and reads as "the idea does not help", when in fact it
         # never ran.
+        subset_head=args.head_type == "subset",
         subset_kwargs=None if args.head_type != "subset" else {
             # architecture and decode
             "num_candidates": num_candidates,
@@ -170,7 +172,6 @@ def main(args):
             "decode": args.decode,
             "detect_tau": args.detect_tau,
             "attention_layers": args.attention_layers,
-            "time_param": args.time_param,
             # criterion
             "gamma": args.gamma,
             "meter_prior": meter_prior,
@@ -362,13 +363,6 @@ if __name__ == "__main__":
     parser.add_argument("--tau", type=float, default=0.2,
                         help="detection threshold. algorithm5_hard-1 Algorithm 3 line 5 "
                              "keeps candidates whose 1 - p_j(empty) clears it")
-    parser.add_argument("--time_param", choices=("paper", "bounded", "floored"),
-                        default="bounded",
-                        help="how t_hat is produced. paper: eq.(1) cumsum of softplus. "
-                             "bounded: per-candidate offset from the cell centre "
-                             "(current). floored: eq.(1) with each increment floored at "
-                             "2x the metric tolerance, so no two detections can share a "
-                             "reference beat")
     parser.add_argument("--attention_layers", type=int, default=2,
                         help="candidate self-attention layers in the classification "
                              "branch. 0 = per-candidate MLP, each candidate blind to "

@@ -67,7 +67,7 @@ def test_flags_reach_the_criterion():
     """Flags have silently failed to arrive at the criterion before. Check the plumbing."""
     from beat_this.model.pl_module import PLBeatThis
     m = PLBeatThis(
-        transformer_dim=64, n_layers=2,
+        transformer_dim=64, n_layers=2, subset_head=True,
         subset_kwargs=dict(num_candidates=188, data_prior=DATA_PRIOR,
                            meter_prior=prior_over((2, 3, 4, 6)), gamma=0.25))
     c = m.subset_criterion

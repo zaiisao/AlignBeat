@@ -51,10 +51,10 @@ def subset_targets(module, batch):
     return targets
 
 
-def subset_decode(module, batch, model_prediction):
+def subset_decode(module, batch, model_prediction, *, decode, tau, detect_tau):
     """Inference per excerpt, returned as predicted TIMES in seconds.
 
-    Either decoding rule, selected by module.decode: the per-candidate argmax of
+    Either decoding rule, selected by decode: the per-candidate argmax of
     decode_events, or Algorithm 3's two stages. Everything after the call -- the
     seconds conversion, the padding-mask restriction, the sort -- is shared, so the
     two rules differ in exactly one thing: which candidates are emitted with which
@@ -63,44 +63,47 @@ def subset_decode(module, batch, model_prediction):
     window_seconds = num_frames / module.fps
     padding_mask = batch.get("padding_mask")
     beats, downbeats = [], []
+
     for index in range(len(batch["spect"])):
         logits = model_prediction["class_logits"][index].float()
         candidate_times = model_prediction["t_hat"][index].float()
-        if module.decode == "metrical":
+
+        if decode == "metrical":
             # Algorithm 3. One fragment per call is exactly the condition section 3
             # states its stage 2 for: a single (omega, L) spans this window.
-            classes, times, _scores = decode_events_metrical(
-                logits, candidate_times, module.subset_criterion, module.detect_tau)
-        elif module.decode == "detect":
-            classes, times, _scores = decode_events_detect(
-                logits, candidate_times, module.detect_tau)
+            classes, times, _ = decode_events_metrical(
+                logits, candidate_times, module.subset_criterion, detect_tau)
+        elif decode == "detect":
+            classes, times, _ = decode_events_detect(
+                logits, candidate_times, detect_tau)
         else:
-            classes, times, _scores = decode_events(
-                logits, candidate_times, module.tau)
+            classes, times, _ = decode_events(
+                logits, candidate_times, tau)
+
         seconds = (times * window_seconds).detach().cpu().numpy()
         classes = classes.detach().cpu().numpy()
+
         if padding_mask is not None:
-            # The dense arm passes padding_mask to its postprocessor; without the
-            # same restriction here, candidates landing in an excerpt's zero-padded
-            # tail are emitted as detections that no ground-truth event can match
-            # (truth_orig_* stops at the real end), so they are pure false positives
-            # charged to one arm of the A/B only.
             valid_seconds = float(padding_mask[index].sum()) / module.fps
             keep = seconds < valid_seconds
             seconds, classes = seconds[keep], classes[keep]
+
         beats.append(np.sort(seconds))
         downbeats.append(np.sort(seconds[classes == CLASS_DOWNBEAT]))
+
     return tuple(beats), tuple(downbeats)
 
 
-def subset_predict_piece(module, batch, chunk_size):
+def subset_predict_piece(module, batch, chunk_size, *,
+                         
+                         decode, tau, detect_tau, stitch_border):
     """Whole-piece decoding for the alignment head (Section 9.3)."""
     def forward_fn(batch_mel):
         with torch.no_grad():
             out = module.model(batch_mel)
         return out["class_logits"].float(), out["t_hat"].float()
 
-    border = module.stitch_border
+    border = stitch_border
     if border is None:
         # A subset run has no beat_loss at all, and nn.Module.__getattr__ raises
         # before getattr's default can apply, so guard the module as well.
@@ -108,13 +111,13 @@ def subset_predict_piece(module, batch, chunk_size):
 
     # Same rule as subset_decode uses per excerpt, so whole-piece inference and
     # validation cannot disagree about how candidates are emitted.
-    decode_fn, tau = None, module.tau
-    if module.decode == "metrical":
-        tau = module.detect_tau
+    decode_fn = None
+    if decode == "metrical":
+        tau = detect_tau
         def decode_fn(logits, t_hat, tau):
             return decode_events_metrical(logits, t_hat, module.subset_criterion, tau)
-    elif module.decode == "detect":
-        tau = module.detect_tau
+    elif decode == "detect":
+        tau = detect_tau
         decode_fn = decode_events_detect
     classes, frames, _scores = stitch_piece(
         batch["spect"][0], forward_fn, chunk_size, border, tau,

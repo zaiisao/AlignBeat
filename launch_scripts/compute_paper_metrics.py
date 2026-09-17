@@ -217,9 +217,14 @@ def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu):
         checkpoint["hyper_parameters"]["use_dbn"] = dbn
 
     hparams = dict(checkpoint["hyper_parameters"])
-    # Checkpoints predating the subset_kwargs discriminator record head_type; it is
-    # vestigial now. Drop when those are retrained.
-    hparams.pop("head_type", None)
+    # Checkpoints predating subset_head record head_type instead. Translate, rather than
+    # dropping it: without it they would silently rebuild with the dense head.
+    head_type = hparams.pop("head_type", None)
+    hparams.setdefault("subset_head", head_type == "subset")
+    # time_param is gone: every checkpoint recorded "bounded", the only rule left.
+    if hparams.get("subset_kwargs"):
+        hparams["subset_kwargs"] = {k: v for k, v in hparams["subset_kwargs"].items()
+                                    if k != "time_param"}
     model = PLBeatThis(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
     # set correct device and accelerator

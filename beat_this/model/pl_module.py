@@ -42,6 +42,9 @@ class PLBeatThis(LightningModule):
         eval_trim_beats=5,
         sum_head=True,
         partial_transformers=True,
+
+        # JA: Additional parameters added for AlignBeat
+        subset_head=False,
         subset_kwargs=None,
     ):
         super().__init__()
@@ -49,13 +52,14 @@ class PLBeatThis(LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
+
         # create model
-        # AlignBeat's settings ride in one dict, routed to the head, to this module,
-        # and to the criterion.
-        head_arch, decode_arch, criterion_kwargs = split_subset_kwargs(subset_kwargs)
-        self.decode, self.tau = decode_arch["decode"], decode_arch["tau"]
-        self.detect_tau = decode_arch["detect_tau"]
-        self.stitch_border = decode_arch["stitch_border"]
+        if subset_head and subset_kwargs is None:
+            raise ValueError("subset_head=True needs subset_kwargs")
+
+        head_kwargs, decode_kwargs, criterion_kwargs = split_subset_kwargs(subset_kwargs)
+
+        self.subset_decode_kwargs = decode_kwargs if subset_head else None
 
         self.model = BeatThis(
             spect_dim=spect_dim,
@@ -67,16 +71,19 @@ class PLBeatThis(LightningModule):
             dropout=dropout,
             sum_head=sum_head,
             partial_transformers=partial_transformers,
-            subset_arch=({**head_arch, "fps": fps}
-                         if subset_kwargs is not None else None),
+
+            # JA: Additional parameters added for AlignBeat
+            subset_head=subset_head,
+            subset_head_kwargs=head_kwargs if subset_head else None,
         )
-        # The head owns the window a normalised time of 1.0 spans -- it built the
-        # candidate grid over it. Read it back rather than deriving it twice, so
-        # lambda_L1 is calibrated to the same excerpt the head actually laid out.
-        self.subset_criterion = (
-            SubsetCriterion(**criterion_kwargs,
-                            window_seconds=self.model.task_heads.head.window_seconds)
-            if subset_kwargs is not None else None)
+        if subset_head:
+            self.subset_criterion = SubsetCriterion(
+                **criterion_kwargs,
+                window_seconds=head_kwargs["train_length"] / fps
+            )
+        else:
+            self.subset_criterion = None
+
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         # set up the losses
@@ -117,8 +124,10 @@ class PLBeatThis(LightningModule):
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
     def _compute_loss(self, batch, model_prediction):
+        # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
             return subset_loss(self, batch, model_prediction)
+
         beat_mask = batch["padding_mask"]
         beat_loss = self.beat_loss(
             model_prediction["beat"], batch["truth_beat"].float(), beat_mask
@@ -232,8 +241,11 @@ class PLBeatThis(LightningModule):
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
         # postprocess the predictions
+
+        # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
-            postp_beat, postp_downbeat = subset_decode(self, batch, model_prediction)
+            postp_beat, postp_downbeat = subset_decode(
+                self, batch, model_prediction, **self.subset_decode_kwargs)
         else:
             postp_beat, postp_downbeat = self.postprocessor(
                 model_prediction["beat"],
@@ -282,8 +294,12 @@ class PLBeatThis(LightningModule):
             raise ValueError(
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
+
+        # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
-            return subset_predict_piece(self, batch, chunk_size)
+            return subset_predict_piece(
+                self, batch, chunk_size, **self.subset_decode_kwargs)
+
         # compute border size according to the loss type
         if hasattr(
             self.beat_loss, "tolerance"

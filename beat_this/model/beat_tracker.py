@@ -47,7 +47,10 @@ class BeatThis(nn.Module):
         dropout: dict = {"frontend": 0.1, "transformer": 0.2},
         sum_head: bool = True,
         partial_transformers: bool = True,
-        subset_arch: dict | None = None,
+
+        # JA: Additional parameters added for AlignBeat
+        subset_head: bool = False,
+        subset_head_kwargs: dict | None = None,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -99,10 +102,12 @@ class BeatThis(nn.Module):
         )
 
         # create the output heads
-        if subset_arch is not None:
-            # AlignBeat: a candidate grid and an order-preserving head, in place of the
-            # frame-wise one. Everything it needs rides in subset_arch.
-            self.task_heads = SubsetHead(transformer_dim, **subset_arch)
+        if subset_head:
+            # JA: This block was added for AlignBeat
+            if subset_head_kwargs is None:
+                raise ValueError("subset_head=True needs subset_head_kwargs; "
+                                 "PLBeatThis builds them from subset_kwargs")
+            self.task_heads = SubsetHead(transformer_dim, **subset_head_kwargs)
         elif sum_head:
             self.task_heads = SumHead(transformer_dim)
         else:

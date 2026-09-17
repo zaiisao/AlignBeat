@@ -24,7 +24,7 @@ WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixt
 
 def head(layers, seed=1):
     torch.manual_seed(seed)
-    h = SubsetSelectionHead(WINDOW_SECONDS, feature_size=256, attention_layers=layers).eval()
+    h = SubsetSelectionHead(feature_size=256, attention_layers=layers).eval()
     # class_head is deliberately zero-initialised, which makes every logit constant and
     # any sensitivity probe vacuously zero. Undo it so the test measures something.
     torch.nn.init.normal_(h.class_head.weight, std=0.05)

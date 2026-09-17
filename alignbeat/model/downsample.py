@@ -4,14 +4,7 @@ import math
 import torch.nn.functional as F
 from torch import nn
 
-# Fastest tempo the corpus contains, in BPM. Only an upper bound is needed:
-# overshooting costs a few extra candidates that get classified as background, which
-# the formulation expects anyway, while undershooting is unrecoverable -- an
-# order-preserving injection needs N >= M, and SubsetCriterion skips any fragment where
-# it does not hold. 15 of 5555 tracks exceed this, all of them asap, whose MIDI-derived
-# annotations are note-level rather than beat-level (the densest has a 0.005 s gap,
-# i.e. 11521 BPM); those are bad annotations, not fast music.
-BPM_MAX = 340.0
+from alignbeat.constants import BPM_MAX
 
 
 def n_candidates_from_tempo(fragment_frames: int, fps: float,
@@ -51,11 +44,8 @@ class Downsample(nn.Module):
         self.padded_length = num_candidates * math.prod(self.strides)
 
         if mode == "learned":
-            # Reduce the length in several small strided steps (1500 -> 750 -> 250)
-            # instead of collapsing T/N frames in one: the same receptive field with
-            # fewer parameters and a nonlinearity in between. The strides must MULTIPLY
-            # to T/N exactly -- rounding to powers of two instead would pad the window
-            # with silence and silently rescale what t_hat = 1 means.
+            # JA: Reduce the length in several small strided steps (1500 -> 750 -> 250)
+            # instead of collapsing T/N frames in one
             layers = []
             for i, stride in enumerate(self.strides):
                 if i > 0: layers.append(nn.GELU())
@@ -91,19 +81,11 @@ class Downsample(nn.Module):
         return z.transpose(1, 2)                 # (B, N, d)
 
     def time_scale(self, input_frames: int) -> float:
-        """Frames-of-input per unit of t_hat, as a fraction of the input.
-
-        The candidate grid spans padded_length frames, so a head reading it emits times
-        relative to THAT, not to the caller's input. Whenever the two differ -- a short
-        final chunk, a piece below one window -- t_hat must be multiplied by this to
-        become input-relative, and candidates landing beyond 1.0 sit in the padding and
-        are not real detections.
-        """
+        """Frames-of-input per unit of t_hat, as a fraction of the input."""
         if input_frames == self.padded_length:
             return 1.0
 
         return self.padded_length / float(input_frames)
-
 
 def halved_candidates(fragment_frames: int, stages: int) -> int:
     """N after `stages` halvings of T, rounding up at each odd length."""
@@ -116,20 +98,12 @@ def stages_from_tempo(fragment_frames: int, fps: float,
                       bpm_max: float = BPM_MAX) -> tuple:
     """Most halvings of T whose N still covers the tempo floor.
 
-    N only has to be >= the densest event count a window can hold; beyond that every
-    extra candidate is a background classification, and the slack is what absorbs a
-    tempo-augmented window holding more events than the nominal ceiling allows. So halve
-    until one more halving would drop below that floor: T=1500 at 50 fps floors at 170,
-    and 750 -> 375 -> 188 all clear it while 94 does not, giving 3 stages.
-
-    Returns (stages, N, tempo_floor). N is what the downsample emits and what the heads
-    read -- there is only one N -- while tempo_floor is the bound N had to clear, useful
-    for reporting and nothing else.
-    """
+    Returns (stages, N, tempo_floor)."""
     tempo_floor = n_candidates_from_tempo(fragment_frames, fps, bpm_max)
     stages = 0
     while halved_candidates(fragment_frames, stages + 1) >= tempo_floor:
         stages += 1
+
     return stages, halved_candidates(fragment_frames, stages), tempo_floor
 
 def factor_strides(fragment_frames: int, num_candidates: int) -> list:
