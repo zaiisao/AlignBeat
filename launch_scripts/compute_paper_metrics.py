@@ -224,6 +224,9 @@ def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu, read_out=None):
     # dropping it: without it they would silently rebuild with the dense head.
     head_type = hparams.pop("head_type", None)
     hparams.setdefault("subset_head", head_type == "subset")
+    # A training-only knob the all-data checkpoints recorded and the module no longer
+    # takes; nothing about inference reads a learning rate.
+    hparams.pop("head_lr", None)
     # Knobs retired since these were trained: every checkpoint recorded the only
     # value that survived, so dropping them changes nothing.
     RETIRED = {"time_param", "tau", "stitch_border", "decode", "loss_event_term",
