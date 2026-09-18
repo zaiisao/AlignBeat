@@ -46,8 +46,15 @@ def logits(M, seed):
 
 def marginal_nll(crit, log_p):
     """-log sum_h exp(s_h): the incomplete-data negative log-likelihood line 52's
-    surrogate stands in for, with (omega, L) marginalised out."""
-    scores = crit._log_meter_phase_scores(crit._class_log_posterior(log_p))
+    surrogate stands in for, with (omega, L) marginalised out.
+
+    The scores are the raw head's, which is what _beat_only_term builds its surrogate
+    from. Taking them from _class_log_posterior instead would renormalise each event
+    over {DB, B}, subtracting sum_i log(p_db + p_b): constant across hypotheses, so pi
+    is unchanged, but its gradient is not, and the identity would fail by exactly that
+    derivative rather than by anything wrong with the M-step.
+    """
+    scores = crit._log_meter_phase_scores((log_p[:, CLASS_DOWNBEAT], log_p[:, CLASS_BEAT]))
     return -torch.logsumexp(torch.cat([scores[L] for L in scores]), dim=0)
 
 
@@ -56,7 +63,12 @@ def surrogate(crit, log_p, pi):
 
 
 def frozen_pi(crit, log_p):
-    """pi_{omega,L} exactly as the E-step forms it (Algorithm 1 lines 39-41)."""
+    """pi_{omega,L} exactly as the E-step forms it (Algorithm 1 lines 39-41).
+
+    The E-step's own renormalisation, kept: it shifts every score by the same constant
+    and so leaves pi identical to within 3e-08, which is what lets the surrogate and the
+    marginal above be built from the raw head without changing the hypothesis weights.
+    """
     with torch.no_grad():
         scores = crit._log_meter_phase_scores(crit._class_log_posterior(log_p))
         return torch.softmax(torch.cat([scores[L] for L in scores]), dim=0)

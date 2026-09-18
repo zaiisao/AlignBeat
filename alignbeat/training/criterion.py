@@ -43,7 +43,11 @@ class SubsetCriterion(nn.Module):
                                     dtype=torch.float32)
 
         # JA: We are assuming for now that the document's pi_data is the same as pi_C
-        self.class_prior = data_priors
+        # A buffer, not a bare attribute, so .double() and .cuda() reach it: left as a
+        # plain tensor it stays float32 on the CPU while the rest of the E-step runs in
+        # float64, which put a float32 epsilon into pi and broke Fisher's identity at
+        # the 1e-08 level. Not persistent: no checkpoint records it.
+        self.register_buffer("class_prior", data_priors.clone(), persistent=False)
 
         self.register_buffer("data_prior", data_priors / data_priors.sum())
 
