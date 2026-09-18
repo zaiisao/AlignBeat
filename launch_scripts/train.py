@@ -167,9 +167,6 @@ def main(args):
             "num_candidates": num_candidates,
             "train_length": args.train_length,
             "downsample_stages": downsample_stages,
-            "stitch_border": args.stitch_border,
-            "tau": args.tau,
-            "decode": args.decode,
             "detect_tau": args.detect_tau,
             "attention_layers": args.attention_layers,
             # criterion
@@ -360,9 +357,6 @@ if __name__ == "__main__":
                         choices=["dense", "subset"])
     parser.add_argument("--train_length", type=int, default=1500,
                         help="T, the excerpt length in frames; N is derived from it")
-    parser.add_argument("--tau", type=float, default=0.2,
-                        help="detection threshold. algorithm5_hard-1 Algorithm 3 line 5 "
-                             "keeps candidates whose 1 - p_j(empty) clears it")
     parser.add_argument("--attention_layers", type=int, default=2,
                         help="candidate self-attention layers in the classification "
                              "branch. 0 = per-candidate MLP, each candidate blind to "
@@ -378,18 +372,6 @@ if __name__ == "__main__":
                              "1 - p(empty), used by --decode metrical and detect. "
                              "Separate from --tau, which gates decode_events' winning "
                              "class probability instead (default: %(default)s)")
-    parser.add_argument("--decode", choices=("argmax", "metrical", "detect"),
-                        default="detect",
-                        help="argmax: per-candidate argmax over {DB, B, empty}. "
-                             "metrical: Algorithm 3, one (omega, L) resolved jointly "
-                             "across the detected events, so the emitted pattern is "
-                             "metrically consistent by construction (section 3.1). "
-                             "Note Algorithm 3 names tau=0.5 and thresholds event mass "
-                             "1 - p(empty), where argmax thresholds the winning class.")
-    parser.add_argument("--stitch_border", type=int, default=None,
-                        help="frames discarded either side of a chunk seam at whole-piece "
-                             "inference; defaults to the dense arm's 2*tolerance so both "
-                             "A/B arms decode under the same edge convention")
     parser.add_argument("--meter_candidates", type=str, default="2,3,4,5,6,8",
                         help="candidate meters M the beat-only E-step marginalises "
                              "over, e.g. 2,3,4,6; pi_M is the corpus table in "

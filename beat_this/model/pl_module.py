@@ -57,9 +57,9 @@ class PLBeatThis(LightningModule):
         if subset_head and subset_kwargs is None:
             raise ValueError("subset_head=True needs subset_kwargs")
 
-        head_kwargs, decode_kwargs, criterion_kwargs = split_subset_kwargs(subset_kwargs)
+        head_kwargs, detect_tau, criterion_kwargs = split_subset_kwargs(subset_kwargs)
 
-        self.subset_decode_kwargs = decode_kwargs if subset_head else None
+        self.detect_tau = detect_tau if subset_head else None
 
         self.model = BeatThis(
             spect_dim=spect_dim,
@@ -126,7 +126,7 @@ class PLBeatThis(LightningModule):
     def _compute_loss(self, batch, model_prediction):
         # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
-            return subset_loss(self, batch, model_prediction)
+            return subset_loss(self.subset_criterion, batch, model_prediction, self.fps)
 
         beat_mask = batch["padding_mask"]
         beat_loss = self.beat_loss(
@@ -245,7 +245,7 @@ class PLBeatThis(LightningModule):
         # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
             postp_beat, postp_downbeat = subset_decode(
-                self, batch, model_prediction, **self.subset_decode_kwargs)
+                batch, model_prediction, self.fps, detect_tau=self.detect_tau)
         else:
             postp_beat, postp_downbeat = self.postprocessor(
                 model_prediction["beat"],
@@ -297,8 +297,10 @@ class PLBeatThis(LightningModule):
 
         # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
-            return subset_predict_piece(
-                self, batch, chunk_size, **self.subset_decode_kwargs)
+            beats, downbeats = subset_predict_piece(
+                self.model, batch, chunk_size, self.fps, detect_tau=self.detect_tau)
+            metrics = self._compute_metrics(batch, beats, downbeats, step="test")
+            return metrics, None, batch["dataset"], batch["spect_path"]
 
         # compute border size according to the loss type
         if hasattr(

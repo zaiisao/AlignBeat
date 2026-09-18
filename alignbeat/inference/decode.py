@@ -89,26 +89,9 @@ def intervals_to_events(annotations, num_frames):
     return {'classes': classes, 'times': frames.float() / float(num_frames)}
 
 
-# ---------------------------------------------------------------------------
-# Inference (section 9.2, Algorithm 10)
-# ---------------------------------------------------------------------------
-
-def decode_events(class_logits, t_hat, tau=0.2):
-    """Per-candidate argmax over {DB, B, empty}, kept when it clears tau."""
-    probabilities = F.softmax(class_logits, dim=-1)
-    scores, predicted = probabilities.max(dim=-1)
-    keep = (predicted != CLASS_BACKGROUND) & (scores >= tau)
-    return predicted[keep], t_hat[keep], scores[keep]
-
 
 def _stage1(class_logits, t_hat, tau):
-    """Algorithm 3 lines 5-7: keep J = {j : 1 - p_j(empty) >= tau}, sorted by t_hat.
-
-    Thresholds the event mass, not the winning class, so a candidate split between DB
-    and B still counts. The sort is performed rather than assumed: t_hat is monotonic in
-    the candidate index in fp32 but not under autocast, and c_i(omega, L) is indexed by
-    position, so an inversion would mislabel everything after it.
-    """
+    """Algorithm 3 lines 5-7: keep J = {j : 1 - p_j(empty) >= tau}, sorted by t_hat."""
     probabilities = F.softmax(class_logits, dim=-1)
     event_mass = 1.0 - probabilities[..., CLASS_BACKGROUND]             # line 5
     index = torch.nonzero(event_mass >= tau, as_tuple=False).flatten()
@@ -117,36 +100,9 @@ def _stage1(class_logits, t_hat, tau):
 
 
 def decode_events_detect(class_logits, t_hat, tau=0.5):
-    """Algorithm 3 stage 1, then a per-candidate argmax over {DB, B}. The default.
-
-    Deviates from stage 2 deliberately: c_i(omega, L) is indexed by rank, so one missed
-    detection inverts the phase for the rest of the fragment -- 25.9 downbeat F1 per
-    deleted event, measured. Below ~99% detection the true labelling is not in that
-    hypothesis class at all, so no resolver recovers it.
-    """
+    """Algorithm 3 stage 1, then a per-candidate argmax over {DB, B}."""
     probabilities, index, event_mass = _stage1(class_logits, t_hat, tau)
     p = probabilities[index]
     # CLASS_DOWNBEAT = 0, CLASS_BEAT = 1, so the argmax over those two columns is the class id.
     classes = p[:, [CLASS_DOWNBEAT, CLASS_BEAT]].argmax(dim=-1)
-    return classes, t_hat[index], event_mass[index]
-
-
-def decode_events_metrical(class_logits, t_hat, criterion, tau=0.5):
-    """Algorithm 5: detect events, then label them all from one jointly-chosen (omega, L).
-
-    Every emitted label is c_i(omega_hat, L_hat), so the output is metrically consistent
-    by construction -- no two adjacent downbeats. Costs 2.81 downbeat F against
-    decode_events_detect on the 8-fold protocol; see that function for why.
-    """
-    probabilities, index, event_mass = _stage1(class_logits, t_hat, tau)
-    p = probabilities[index]
-    resolved = criterion.infer_pattern(p)
-
-    if resolved is None:
-        # No meter candidate was viable, so there is no hypothesis to maximise over.
-        # Fall back to the per-candidate argmax rather than drop the fragment.
-        classes = p[:, [CLASS_DOWNBEAT, CLASS_BEAT]].argmax(dim=-1)
-    else:
-        classes, _omega_hat, _meter_hat = resolved
-
     return classes, t_hat[index], event_mass[index]

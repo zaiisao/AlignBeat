@@ -12,22 +12,19 @@ SUBSET_ARCH_DEFAULTS = {
     "num_candidates": None,
     "train_length": 1500,
     "downsample_stages": None,
-    "stitch_border": None,
     "attention_layers": 0,
-    "tau": 0.2,           # decode_events: the winning class's own probability
-    "detect_tau": 0.5,    # Algorithm 3 line 5: event mass, 1 - p(empty)
-    "decode": "detect",
+    "detect_tau": 0.5,    # stage 1: keep candidates whose event mass clears this
 }
 
-DECODE_RULES = ("argmax", "metrical", "detect")
 
 
 def split_subset_kwargs(subset_kwargs):
-    """Route subset_kwargs to its three consumers: head, Lightning module, criterion.
+    """Route subset_kwargs to the head and the criterion, plus the detection threshold.
 
     Membership is read off each consumer's own signature, so adding a parameter to
     SubsetHead or SubsetCriterion routes it without editing a list here. Only the
     default value still has to be written down, in SUBSET_ARCH_DEFAULTS.
+    Returns (head_kwargs, detect_tau, criterion_kwargs).
     """
     given = dict(subset_kwargs or {})
     criterion_keys = set(inspect.signature(SubsetCriterion.__init__).parameters)
@@ -39,10 +36,10 @@ def split_subset_kwargs(subset_kwargs):
         raise TypeError(f"unknown subset_kwargs: {', '.join(sorted(unknown))}")
     arch = {**SUBSET_ARCH_DEFAULTS, **arch}
 
-    if arch["decode"] not in DECODE_RULES:
-        raise ValueError(f"decode must be one of {DECODE_RULES}, got {arch['decode']!r}")
 
     head = {k: v for k, v in arch.items() if k in head_keys}
-    module = {k: v for k, v in arch.items() if k not in head_keys}
     criterion = {k: v for k, v in given.items() if k in criterion_keys}
-    return head, module, criterion
+    leftover = set(arch) - head_keys - {"detect_tau"}
+    if leftover:
+        raise TypeError(f"subset_kwargs no consumer takes: {', '.join(sorted(leftover))}")
+    return head, arch["detect_tau"], criterion

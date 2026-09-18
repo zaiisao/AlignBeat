@@ -221,10 +221,12 @@ def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu):
     # dropping it: without it they would silently rebuild with the dense head.
     head_type = hparams.pop("head_type", None)
     hparams.setdefault("subset_head", head_type == "subset")
-    # time_param is gone: every checkpoint recorded "bounded", the only rule left.
+    # Knobs retired since these were trained: every checkpoint recorded the only
+    # value that survived, so dropping them changes nothing.
+    RETIRED = {"time_param", "decode", "tau", "stitch_border"}
     if hparams.get("subset_kwargs"):
         hparams["subset_kwargs"] = {k: v for k, v in hparams["subset_kwargs"].items()
-                                    if k != "time_param"}
+                                    if k not in RETIRED}
     model = PLBeatThis(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
     # set correct device and accelerator

@@ -5,7 +5,7 @@ metric the paper reports. A single oracle only gives the ceiling, so instead han
 model one true quantity at a time and watch F climb. Each rung differs from the one
 above it by exactly one oracle, so the step between them is that stage's price:
 
-  real      decode_events: the model picks its own events by threshold, then each
+  real      decode_events_detect: the model picks its own events by threshold, then each
             candidate independently takes argmax over DB/B. What we ship.
   real+lat  the model's OWN detected events, with downbeats from the bar-constrained
             posterior instead of the per-candidate argmax. No ground truth of any kind
@@ -46,7 +46,15 @@ def load(ckpt_path, device):
     import inspect
     from beat_this.model.pl_module import PLBeatThis
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    hp = {k: v for k, v in ck.get("hyper_parameters", {}).items()
+    raw = dict(ck.get("hyper_parameters", {}))
+    # Checkpoints predating subset_head record head_type, and carry a time_param the
+    # head no longer takes. Translate rather than drop: without this they rebuild dense.
+    head_type = raw.pop("head_type", None)
+    raw.setdefault("subset_head", head_type == "subset")
+    if raw.get("subset_kwargs"):
+        raw["subset_kwargs"] = {k: v for k, v in raw["subset_kwargs"].items()
+                                if k not in ("time_param", "decode", "tau", "stitch_border")}
+    hp = {k: v for k, v in raw.items()
           if k in set(inspect.signature(PLBeatThis.__init__).parameters)}
     m = PLBeatThis(**hp)
     missing, _ = m.load_state_dict(ck["state_dict"], strict=False)
@@ -93,7 +101,8 @@ def downbeat_call(model, class_logits, t_hat, target, sigma, meter=None):
 
 @torch.no_grad()
 def run(model, loader, device):
-    from alignbeat.inference.decode import decode_events
+    from alignbeat.inference.decode import decode_events_detect
+    from alignbeat.integration.subset import subset_targets
     # Deferred: latent_meter imports load() from here, so a module-level import cycles.
     from launch_scripts.latent_meter import downbeat_mass
     rows = []
@@ -104,7 +113,7 @@ def run(model, loader, device):
         pred = {k: v.float() for k, v in pred.items()}
         n_frames = batch["truth_beat"].shape[-1]
         window = n_frames / model.fps
-        targets = model._subset_targets(batch)
+        targets = subset_targets(model, batch)
 
         for i, target in enumerate(targets):
             truth_b = np.frombuffer(batch["truth_orig_beat"][i])
@@ -142,7 +151,7 @@ def run(model, loader, device):
             real_latent_is_db = None
             probs = torch.softmax(pred["class_logits"][i].float(), dim=-1)
             top, arg = probs.max(dim=-1)
-            keep = (arg != CLASS_BACKGROUND) & (top >= model.tau)
+            keep = (arg != CLASS_BACKGROUND) & (top >= model.subset_decode_kwargs["tau"])
             if int(keep.sum()) >= 4:
                 span_r = log_p[keep]
                 scores_h = crit._log_meter_phase_scores(crit._class_log_posterior(span_r))
@@ -155,8 +164,8 @@ def run(model, loader, device):
                                        * window).cpu().numpy()
 
             # REAL: the model's own decode, its own events and its own classes
-            cls, times, _ = decode_events(pred["class_logits"][i].float(),
-                                          pred["t_hat"][i].float(), model.tau)
+            cls, times, _ = decode_events_detect(pred["class_logits"][i].float(),
+                                          pred["t_hat"][i].float(), model.subset_decode_kwargs["tau"])
             real_sec = (times * window).cpu().numpy()
             real_is_db = (cls == CLASS_DOWNBEAT).cpu().numpy()
 

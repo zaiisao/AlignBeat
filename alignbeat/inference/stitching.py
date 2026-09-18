@@ -1,7 +1,7 @@
 """Piece-level inference by stitching overlapping fragments (Section 9.3)."""
 import torch
 
-from alignbeat.inference.decode import decode_events
+from alignbeat.inference.decode import decode_events_detect
 
 
 def fragment_offsets(total_frames, fragment_frames, border_frames):
@@ -20,15 +20,6 @@ def fragment_offsets(total_frames, fragment_frames, border_frames):
             break
         offset += stride
 
-    # Zero padding in the LAST fragment is padding in the one fragment that decodes the
-    # end of the piece, against an input the model never saw in training. Whenever the
-    # tail is short of a full D, slide that fragment left to end exactly at the piece
-    # end so it is all real audio -- the same strategy as beat_this.inference.split_piece
-    # (avoid_short_end), which is what the dense arm has always done. The price is that
-    # it then overlaps its predecessor by more than 2*beta, so the offsets are no longer
-    # uniformly strided and the keep regions below have to be clamped to a high-water
-    # mark to stay a partition. Padding survives only for a piece shorter than D, where
-    # there is no earlier audio to slide into.
     if len(offsets) > 1 and total_frames - offsets[-1] < fragment_frames:
         offsets[-1] = total_frames - fragment_frames
 
@@ -48,24 +39,11 @@ def fragment_offsets(total_frames, fragment_frames, border_frames):
     return fragments
 
 
-def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
-                 tau=0.2, decode_fn=None):
-    """Section 9.3 over one piece.
-
-    decode_fn selects the rule, exactly as _subset_decode does per excerpt: None keeps
-    decode_events' per-candidate argmax, and a callable (class_logits, t_hat, tau) ->
-    (classes, times, scores) lets the caller pass Algorithm 3 instead. Without this the
-    whole-piece path was pinned to argmax and --decode metrical silently did nothing
-    here, so the two paths could disagree on the same checkpoint."""
+def stitch_piece(mel, forward_fn, fragment_frames, border_frames, tau=0.5):
+    """Section 9.3 over one piece."""
     total_frames, num_mels = mel.shape
     fragments = fragment_offsets(total_frames, fragment_frames, border_frames)
 
-    # Build every fragment first, then run them through the model as ONE batch.
-    # Decoding is per fragment either way, but the forward is not: one call at batch B
-    # replaces B calls at batch 1, which on a transformer this size is the difference
-    # between saturating the GPU and paying kernel-launch overhead B times over. This
-    # is numerically identical -- the model is in eval mode and uses LayerNorm, so no
-    # statistic crosses the batch axis.
     batch = []
     for offset, _keep_start, _keep_end in fragments:
         fragment = mel[offset:offset + fragment_frames]
@@ -80,8 +58,7 @@ def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
 
     all_classes, all_frames, all_scores = [], [], []
     for index, (offset, keep_start, keep_end) in enumerate(fragments):
-        decode = decode_fn if decode_fn is not None else decode_events
-        classes, times, scores = decode(
+        classes, times, scores = decode_events_detect(
             batched_class_logits[index], batched_t_hat[index], tau)
 
         if classes.numel() == 0:
@@ -89,21 +66,7 @@ def stitch_piece(mel, forward_fn, fragment_frames, border_frames,
 
         # t_hat is normalised to (0, 1] within the fragment -> absolute frames
         absolute = offset + times * fragment_frames
-        # Algorithm 11 line 9 writes a CLOSED keep region for every fragment, and at an
-        # interior seam keep_end == the next fragment's keep_start exactly, so a detection
-        # landing on a seam is claimed by both and appended twice -- contradicting the
-        # paper's own claim that the keep regions make every time the responsibility of
-        # exactly one fragment. This is not a measure-zero worry: candidates sit on a
-        # regular grid (t_hat_j = j/N under equation (1) for uniform increments) and the
-        # seams are integer frames, so exact hits are routine, not accidental -- a closed
-        # test duplicates real detections in test_every_event_reported_exactly_once.
-        # Interior seams are therefore half-open [keep_start, keep_end), which assigns the
-        # seam to the fragment on its right.
-        #
-        # The LAST fragment keeps the paper's closed upper bound: keep_end there is the
-        # piece end, no neighbour can claim it, and t_hat_N == 1.0 exactly by equation (1)
-        # means a candidate always lands on it -- a strict < dropped the final candidate of
-        # every piece (audit finding, confirmed).
+
         is_last = keep_end == total_frames
         upper_ok = (absolute <= keep_end) if is_last else (absolute < keep_end)
         inside = (absolute >= keep_start) & upper_ok

@@ -28,30 +28,16 @@ class SubsetCriterion(nn.Module):
         super(SubsetCriterion, self).__init__()
 
         self.window_seconds = float(window_seconds)
-        # Algorithm 1's weight on the timing term, which is what makes a distance in
-        # normalised time commensurable with a class cost in nats. Read the timing term
-        # as a Laplace of scale b, whose NLL is |dt| / b, and take b = eps/2 where eps is
-        # the F-measure tolerance in those same units: lambda_L1 = 1/b = 2/eps. So being
-        # half a tolerance out in time costs one nat of class log-probability, and the
-        # Laplace puts 1 - e^-2 = 86% of its mass inside the tolerance.
-        #
-        # Fixed from the tolerance rather than estimated by eq. (5): that EMA ran
-        # 73 -> 28 ms over one run, steepening the exchange rate into a gate as the
-        # regression sharpened.
+
         self.lambda_l1 = 2.0 * self.window_seconds / F_MEASURE_TOLERANCE
         self.gamma = gamma
-        # Algorithm 1 line 10's -log(1 - p(empty)) in the matching cost. False is the
-        # algorithm as originally written; our runs set it True.
+
         self.match_event_cost = match_event_cost
         self.meter_candidates = tuple(sorted(int(L) for L in meter_prior)) if meter_prior else ()
         self.meter_prior = meter_prior
 
         self._call_count = 0
 
-        # pi_data(c): the DB:B balance the head was trained on, measured per fold by
-        # BeatDataModule.get_train_class_prior. Section 1.3 divides it out of the raw
-        # head before pi_C is applied, so the desired prior REPLACES the training set's
-        # own rather than layering on top of it.
         data_priors = torch.tensor([data_prior["downbeat"], data_prior["beat"]],
                                     dtype=torch.float32)
 
@@ -294,25 +280,12 @@ class SubsetCriterion(nn.Module):
         return posterior
 
     def _log_likelihood(self, log_p):
-        """Algorithm 1 line 7: l_hat_j(x | c) := p_hat_j(c | x) / pi_data(c).
-
-        The raw head is a posterior, so it carries the training set's own prior
-        uninvited. Dividing that out leaves a likelihood-shaped ratio for pi_C to
-        multiply; applying pi_C without this division would double-count a prior.
-        Returns (log l_hat(DB), log l_hat(B)), unnormalised as a likelihood is.
-        """
+        """Algorithm 1 line 7: l_hat_j(x | c) := p_hat_j(c | x) / pi_data(c)."""
         return (log_p[:, CLASS_DOWNBEAT] - self.data_prior[CLASS_DOWNBEAT].log(),
                 log_p[:, CLASS_BEAT] - self.data_prior[CLASS_BEAT].log())
 
     def _class_log_posterior(self, log_p):
-        """Algorithm 1 line 10: Bayes over {DB, B}, in logs. The support excludes empty
-        because matching has already established the event is a real beat.
-
-        Both consumers must use this same quantity: pi_{omega,L} is frozen from the
-        hypothesis scores and the M-step surrogate is its expectation, so Fisher's
-        identity holds only if both are built from one complete-data log-likelihood
-        (tests/test_phase.py catches a divergence).
-        """
+        """Algorithm 1 line 10: Bayes over {DB, B}, in logs."""
         log_l_db, log_l_b = self._log_likelihood(log_p)
         log_db = log_l_db + self.class_prior[CLASS_DOWNBEAT].log()
         log_b = log_l_b + self.class_prior[CLASS_BEAT].log()
@@ -334,48 +307,10 @@ class SubsetCriterion(nn.Module):
             surrogate = -(pi * meter_phase_scores).sum()
         return surrogate
 
-    def infer_pattern(self, p):
-        """Algorithm 5 stage 2: score every (omega, L), then label from the joint mode.
-
-        p is the head's probabilities at the DETECTED candidates, ordered by increasing
-        t_hat. Returns (classes, omega_hat, L_hat), or None when no meter candidate is
-        viable -- which means there is no hypothesis to maximise over, not that the
-        answer is beats. _meter_phase_scores is the E-step's own function, so training
-        and inference score a hypothesis identically.
-        """
-        scores_by_meter = self._meter_phase_scores(p)
-        if not scores_by_meter:
-            return None
-        meters = list(scores_by_meter)
-        flat = torch.cat([scores_by_meter[meter] for meter in meters])
-        joint_posterior = flat / flat.sum()
-
-        # Each meter holds one entry per phase, in phase order, so the flat argmax
-        # decomposes into (L_hat, omega_hat) by walking the concatenation.
-        best = int(torch.argmax(joint_posterior))
-        start = 0
-        for meter in meters:
-            width = scores_by_meter[meter].shape[0]
-            if best < start + width:
-                omega_hat, meter_hat = best - start, meter
-                break
-            start += width
-
-        events = torch.arange(p.shape[0], device=p.device)
-        is_downbeat = ((omega_hat + events) % meter_hat) == 0
-        classes = torch.where(is_downbeat, torch.full_like(events, CLASS_DOWNBEAT),
-                              torch.full_like(events, CLASS_BEAT))
-        return classes, int(omega_hat), int(meter_hat)
 
 
     def _meter_phase_scores(self, matched_class_probs):
-        """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
-        One entry per (omega, L), grouped by meter, in the order line 40 sums over.
-        The product over M events underflows float32 at M ~ 50 -- q_i is the raw head
-        output, so a hypothesis that assigns an unlikely class somewhere contributes a
-        very small factor, and 1e-38 arrives quickly. float64 carries the same fragment
-        to 1e-173 at M = 200. Cast here rather than at the call sites: infer_pattern has
-        the same exposure, and pi = scores / scores.sum() silently becomes 0/0 = NaN."""
+        """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L))."""
         matched_class_probs = matched_class_probs.double()
         q_db = matched_class_probs[:, CLASS_DOWNBEAT]
         q_b = matched_class_probs[:, CLASS_BEAT]
@@ -385,12 +320,6 @@ class SubsetCriterion(nn.Module):
 
         for meter in self.meter_candidates:
             meter = int(meter)
-            # Line 16 loops over every L in M unconditionally, so no meter is dropped
-            # for being larger than the event count: c_i(omega, L) is defined for any L,
-            # and at M < L the phases merely generate patterns the events cannot tell
-            # apart, which the product scores honestly rather than discards. A meter of 1
-            # would carry no phase to infer, but the candidate set never contains it;
-            # this guard is defensive, not a filter on the fragment.
             if meter <= 1:
                 continue
 
@@ -422,12 +351,6 @@ class SubsetCriterion(nn.Module):
 
         for meter in self.meter_candidates:
             meter = int(meter)
-            # Line 16 loops over every L in M unconditionally, so no meter is dropped
-            # for being larger than the event count: c_i(omega, L) is defined for any L,
-            # and at M < L the phases merely generate patterns the events cannot tell
-            # apart, which the product scores honestly rather than discards. A meter of 1
-            # would carry no phase to infer, but the candidate set never contains it;
-            # this guard is defensive, not a filter on the fragment.
             if meter <= 1:
                 continue
 

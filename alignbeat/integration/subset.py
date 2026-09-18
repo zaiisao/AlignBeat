@@ -8,25 +8,25 @@ import numpy as np
 import torch
 
 from alignbeat.constants import CLASS_UNKNOWN, CLASS_DOWNBEAT, CLASS_BEAT
-from alignbeat.inference.decode import (decode_events, decode_events_detect,
-                              decode_events_metrical)
+from alignbeat.inference.decode import decode_events_detect
 from alignbeat.inference.stitching import stitch_piece
+from alignbeat.training.criterion import SubsetCriterion
 
 
 
-def subset_loss(module, batch, model_prediction):
-    losses, _stats = module.subset_criterion(
+def subset_loss(criterion: SubsetCriterion, batch, model_prediction, fps):
+    losses, _stats = criterion(
         model_prediction["class_logits"].float(),
         model_prediction["t_hat"].float(),
-        subset_targets(module, batch))
+        subset_targets(batch, fps))
     return {"class": losses["class"], "time": losses["time"],
             "total": losses["total"]}
 
 
-def subset_targets(module, batch):
+def subset_targets(batch, fps):
     """Ground-truth events for the alignment head, from this batch's own annotations."""
     num_frames = batch["truth_beat"].shape[-1]
-    window_seconds = num_frames / module.fps
+    window_seconds = num_frames / fps
     device = batch["spect"].device
     targets = []
     for index in range(len(batch["spect"])):
@@ -51,40 +51,23 @@ def subset_targets(module, batch):
     return targets
 
 
-def subset_decode(module, batch, model_prediction, *, decode, tau, detect_tau):
-    """Inference per excerpt, returned as predicted TIMES in seconds.
-
-    Either decoding rule, selected by decode: the per-candidate argmax of
-    decode_events, or Algorithm 3's two stages. Everything after the call -- the
-    seconds conversion, the padding-mask restriction, the sort -- is shared, so the
-    two rules differ in exactly one thing: which candidates are emitted with which
-    classes."""
+def subset_decode(batch, model_prediction, fps, *, detect_tau):
+    """Inference per excerpt, returned as predicted TIMES in seconds."""
     num_frames = batch["truth_beat"].shape[-1]
-    window_seconds = num_frames / module.fps
+    window_seconds = num_frames / fps
     padding_mask = batch.get("padding_mask")
     beats, downbeats = [], []
 
     for index in range(len(batch["spect"])):
-        logits = model_prediction["class_logits"][index].float()
-        candidate_times = model_prediction["t_hat"][index].float()
-
-        if decode == "metrical":
-            # Algorithm 3. One fragment per call is exactly the condition section 3
-            # states its stage 2 for: a single (omega, L) spans this window.
-            classes, times, _ = decode_events_metrical(
-                logits, candidate_times, module.subset_criterion, detect_tau)
-        elif decode == "detect":
-            classes, times, _ = decode_events_detect(
-                logits, candidate_times, detect_tau)
-        else:
-            classes, times, _ = decode_events(
-                logits, candidate_times, tau)
+        classes, times, _ = decode_events_detect(
+            model_prediction["class_logits"][index].float(),
+            model_prediction["t_hat"][index].float(), detect_tau)
 
         seconds = (times * window_seconds).detach().cpu().numpy()
         classes = classes.detach().cpu().numpy()
 
         if padding_mask is not None:
-            valid_seconds = float(padding_mask[index].sum()) / module.fps
+            valid_seconds = float(padding_mask[index].sum()) / fps
             keep = seconds < valid_seconds
             seconds, classes = seconds[keep], classes[keep]
 
@@ -94,39 +77,26 @@ def subset_decode(module, batch, model_prediction, *, decode, tau, detect_tau):
     return tuple(beats), tuple(downbeats)
 
 
-def subset_predict_piece(module, batch, chunk_size, *,
-                         
-                         decode, tau, detect_tau, stitch_border):
-    """Whole-piece decoding for the alignment head (Section 9.3)."""
+def subset_predict_piece(model, batch, chunk_size, fps, *, detect_tau):
+    """Whole-piece decoding for the alignment head (Section 9.3).
+
+    Returns (beats, downbeats) in seconds; the caller scores them, so nothing here
+    reaches into the Lightning module.
+    """
     def forward_fn(batch_mel):
         with torch.no_grad():
-            out = module.model(batch_mel)
+            out = model(batch_mel)
         return out["class_logits"].float(), out["t_hat"].float()
 
-    border = stitch_border
-    if border is None:
-        # A subset run has no beat_loss at all, and nn.Module.__getattr__ raises
-        # before getattr's default can apply, so guard the module as well.
-        border = 2 * getattr(getattr(module, "beat_loss", None), "tolerance", 3)
+    # Section 9.3 leaves beta free but recommends tying it to the candidate spacing
+    # D/N rather than to something outside the architecture: one cell is the
+    # resolution at which this head can place an event at all.
+    border = round(chunk_size / model.task_heads.num_candidates)
 
-    # Same rule as subset_decode uses per excerpt, so whole-piece inference and
-    # validation cannot disagree about how candidates are emitted.
-    decode_fn = None
-    if decode == "metrical":
-        tau = detect_tau
-        def decode_fn(logits, t_hat, tau):
-            return decode_events_metrical(logits, t_hat, module.subset_criterion, tau)
-    elif decode == "detect":
-        tau = detect_tau
-        decode_fn = decode_events_detect
     classes, frames, _scores = stitch_piece(
-        batch["spect"][0], forward_fn, chunk_size, border, tau,
-        decode_fn=decode_fn)
+        batch["spect"][0], forward_fn, chunk_size, border, detect_tau)
 
-    seconds = (frames / module.fps).detach().cpu().numpy()
+    seconds = (frames / fps).detach().cpu().numpy()
     classes = classes.detach().cpu().numpy()
-    beats = (seconds,)
-    downbeats = (seconds[classes == CLASS_DOWNBEAT],)
-    metrics = module._compute_metrics(batch, beats, downbeats, step="test")
-    return metrics, None, batch["dataset"], batch["spect_path"]
+    return (seconds,), (seconds[classes == CLASS_DOWNBEAT],)
 

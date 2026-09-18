@@ -63,7 +63,7 @@ def score(gpu):
             "    _init(self, *a, **k)\n"
             "    if self.subset_decode_kwargs is not None:\n"
             "        self.subset_decode_kwargs = dict(self.subset_decode_kwargs,\n"
-            "                                        decode='detect', detect_tau=0.5)\n"
+            "                                        detect_tau=0.5)\n"
             "PLBeatThis.__init__ = _patched\n"
             "sys.argv = ['compute_paper_metrics.py'] + sys.argv[1:]\n"
             f"runpy.run_path({os.path.join(REPO, 'launch_scripts', 'compute_paper_metrics.py')!r},"

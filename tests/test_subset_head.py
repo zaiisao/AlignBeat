@@ -21,7 +21,7 @@ def prior_over(candidates):
     total = sum(METER_PRIOR[L] for L in candidates)
     return {L: METER_PRIOR[L] / total for L in candidates}
 
-from alignbeat.inference.decode import decode_events, intervals_to_events, targets_to_events
+from alignbeat.inference.decode import decode_events_detect, intervals_to_events, targets_to_events
 from alignbeat.training.dp import subset_select_dp, subset_select_logsumexp
 from alignbeat.model.head import SubsetSelectionHead, monotonic_times
 
@@ -303,34 +303,13 @@ def test_downsample_reaches_n_exactly():
     print("ok: every downsample mode emits exactly N candidates")
 
 
-def test_decode_matches_algorithm_10_literally():
-    """The shipped decode must be Algorithm 10, transcribed from the pseudocode."""
-    torch.manual_seed(0)
-    for _ in range(50):
-        N, tau = 64, 0.2
-        logits = torch.randn(N, 3) * 2.0
-        t_hat = monotonic_times(torch.randn(N))
-
-        p = torch.softmax(logits, dim=-1)
-        want_c, want_t = [], []
-        for j in range(N):                                    # lines 3-8
-            c = int(p[j].argmax())
-            if c != CLASS_BACKGROUND and float(p[j, c]) >= tau:
-                want_c.append(c); want_t.append(float(t_hat[j]))
-
-        got_c, got_t, _ = decode_events(logits, t_hat, tau)
-        assert [int(c) for c in got_c] == want_c
-        assert torch.allclose(got_t, torch.tensor(want_t), atol=0) if want_t else got_t.numel() == 0
-        assert torch.all(got_t[1:] > got_t[:-1]) if got_t.numel() > 1 else True
-    print("ok: decode is Algorithm 10 line for line, ascending, no NMS")
-
 
 def test_decode_no_duplicates_and_sorted():
     N = 64
     torch.manual_seed(3)
     logits = torch.randn(N, 3) * 3
     t_hat = monotonic_times(torch.randn(N))
-    classes, times, scores = decode_events(logits, t_hat, 0.2)
+    classes, times, scores = decode_events_detect(logits, t_hat, 0.5)
     assert torch.all(times[1:] > times[:-1]), "decoded times must be strictly increasing"
     assert torch.all(classes != CLASS_BACKGROUND)
     assert len(torch.unique(times)) == len(times), "no duplicate times possible"
