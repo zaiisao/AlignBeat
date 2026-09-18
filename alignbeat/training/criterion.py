@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from alignbeat.constants import (CLASS_BACKGROUND, CLASS_BEAT, CLASS_UNKNOWN, CLASS_DOWNBEAT,
                                F_MEASURE_TOLERANCE)
+from alignbeat.inference.decode import meter_phase_scores
 from alignbeat.training.dp import subset_select_dp
 
 DIAGNOSTIC_EVERY = 200
@@ -98,15 +99,14 @@ class SubsetCriterion(nn.Module):
                 matched_class_posterior = class_posterior[sigma]
 
                 # Line 39: the numerator, pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L)).
-                scores_by_meter = self._meter_phase_scores(matched_class_posterior)
+                scores_by_meter = meter_phase_scores(
+                    matched_class_posterior, self.meter_candidates, self.meter_prior)
                 if scores_by_meter:
                     # Line 40: pi_{omega,L} <- that numerator over its own sum across every
                     # (omega, L) pair. This is the E-step's whole output. Everything the M-step needs
                     # is a function of pi and of theta, so nothing else crosses the boundary.
-                    meter_phase_scores = torch.cat(
-                        [scores_by_meter[meter] for meter in scores_by_meter])
-
-                    pi = meter_phase_scores / meter_phase_scores.sum()
+                    flat = torch.cat([scores_by_meter[meter] for meter in scores_by_meter])
+                    pi = flat / flat.sum()
 
             return Match(sigma, pi)
             
@@ -302,46 +302,16 @@ class SubsetCriterion(nn.Module):
         if pi is not None:
             scores_by_meter = self._log_meter_phase_scores(
                 (matched_log[:, CLASS_DOWNBEAT], matched_log[:, CLASS_BEAT]))
-            meter_phase_scores = torch.cat(
-                [scores_by_meter[meter] for meter in scores_by_meter])
-            surrogate = -(pi * meter_phase_scores).sum()
+            flat = torch.cat([scores_by_meter[meter] for meter in scores_by_meter])
+            surrogate = -(pi * flat).sum()
         return surrogate
 
 
 
-    def _meter_phase_scores(self, matched_class_probs):
-        """Algorithm 1 line 39: pi_M(L) pi_omega(omega) prod_i q_i(c_i(omega, L))."""
-        matched_class_probs = matched_class_probs.double()
-        q_db = matched_class_probs[:, CLASS_DOWNBEAT]
-        q_b = matched_class_probs[:, CLASS_BEAT]
-        M = q_db.shape[0]
-        events = torch.arange(M, device=q_db.device)
-        scores_by_meter = {}
-
-        for meter in self.meter_candidates:
-            meter = int(meter)
-            if meter <= 1:
-                continue
-
-            # pi_M(L) pi_omega(omega), the same under every phase of a given meter.
-            meter_prior = self.meter_prior.get(meter, 0.0)
-            omega_prior = 1.0 / meter
-            prior = meter_prior * omega_prior
-
-            phases = torch.arange(meter, device=q_db.device)
-            # is_db[p, i]: event i is a downbeat under phi_0 = p, i.e. (p + i) % L == 0.
-            is_db = ((phases[:, None] + events[None, :]) % meter) == 0
-
-            # q_i(c_i(omega, L)) for every event, then the product over events.
-            factors = torch.where(is_db, q_db[None, :], q_b[None, :])
-            scores_by_meter[meter] = prior * factors.prod(dim=1)
-
-        return scores_by_meter or None
-
     def _log_meter_phase_scores(self, matched_class_probs):
         """Algorithm 2 line 52's bracket, in the logs that line writes itself:
         log pi_M(L) + log pi_omega + sum_i log P_hat(C_i = c_i(omega, L)). Agreeing with
-        _meter_phase_scores up to exp is what makes Fisher's identity hold across E/M."""
+        meter_phase_scores up to exp is what makes Fisher's identity hold across E/M."""
         log_db, log_b = matched_class_probs
         M = log_db.shape[0]
         device = log_db.device

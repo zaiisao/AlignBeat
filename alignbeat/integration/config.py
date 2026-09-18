@@ -14,6 +14,7 @@ SUBSET_ARCH_DEFAULTS = {
     "downsample_stages": None,
     "attention_layers": 0,
     "detect_tau": 0.5,    # stage 1: keep candidates whose event mass clears this
+    "read_out": "per_event",  # per_event | map | duration; see decode()
 }
 
 
@@ -24,7 +25,7 @@ def split_subset_kwargs(subset_kwargs):
     Membership is read off each consumer's own signature, so adding a parameter to
     SubsetHead or SubsetCriterion routes it without editing a list here. Only the
     default value still has to be written down, in SUBSET_ARCH_DEFAULTS.
-    Returns (head_kwargs, detect_tau, criterion_kwargs).
+    Returns (head_kwargs, decode_kwargs, criterion_kwargs).
     """
     given = dict(subset_kwargs or {})
     criterion_keys = set(inspect.signature(SubsetCriterion.__init__).parameters)
@@ -39,7 +40,8 @@ def split_subset_kwargs(subset_kwargs):
 
     head = {k: v for k, v in arch.items() if k in head_keys}
     criterion = {k: v for k, v in given.items() if k in criterion_keys}
-    leftover = set(arch) - head_keys - {"detect_tau"}
+    decode = {k: arch[k] for k in ("detect_tau", "read_out")}
+    leftover = set(arch) - head_keys - set(decode)
     if leftover:
         raise TypeError(f"subset_kwargs no consumer takes: {', '.join(sorted(leftover))}")
-    return head, arch["detect_tau"], criterion
+    return head, decode, criterion

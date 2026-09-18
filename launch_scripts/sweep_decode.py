@@ -1,4 +1,4 @@
-"""Sweep decode_events' threshold tau on a trained checkpoint.
+"""Sweep decode's threshold tau on a trained checkpoint.
 
 tau has been 0.2 since decode.py was written and was never tuned. The oracle ladder
 says why that matters: handing over the event SET takes beat F from 0.898 to 0.990, and
@@ -13,7 +13,7 @@ candidate whose event evidence is within b nats of background is emitted too. b 
 current behaviour; this sweeps it to trace the detection precision/recall trade the
 ladder says is worth 0.09 beat F.
 
-Both knobs live entirely inside decode_events, downstream of the encoder and the head, so
+Both knobs live entirely inside decode, downstream of the encoder and the head, so
 nothing about training changes; this only asks what the trained model would score if
 asked a different question at decode time. Scoring is byte-identical to
 score_fold0_subset.py -- same loader, same autocast, same skip rules, same per-piece
@@ -34,19 +34,18 @@ import beat_this.model.pl_module
 from alignbeat.constants import CLASS_BACKGROUND
 from launch_scripts.score_fold0_subset import build_loader, load_model, score
 
-_decode = alignbeat.inference.decode.decode_events
+_decode = alignbeat.inference.decode.decode
 
 
 def set_background_bias(bias):
-    """Shift the background channel wherever decode_events is looked up. Patching the
+    """Shift the background channel wherever decode is looked up. Patching the
     module attributes rather than the function keeps the shipped decode untouched."""
     def patched(class_logits, t_hat, tau=0.2):
         if bias:
             class_logits = class_logits.clone()
             class_logits[..., CLASS_BACKGROUND] = class_logits[..., CLASS_BACKGROUND] - bias
         return _decode(class_logits, t_hat, tau)
-    beat_this.model.pl_module.decode_events = patched
-    alignbeat.inference.stitching.decode_events = patched
+    alignbeat.inference.decode.decode = patched
 
 BEAT_ONLY = ("simac", "smc")
 

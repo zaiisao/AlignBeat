@@ -57,9 +57,9 @@ class PLBeatThis(LightningModule):
         if subset_head and subset_kwargs is None:
             raise ValueError("subset_head=True needs subset_kwargs")
 
-        head_kwargs, detect_tau, criterion_kwargs = split_subset_kwargs(subset_kwargs)
+        head_kwargs, decode_kwargs, criterion_kwargs = split_subset_kwargs(subset_kwargs)
 
-        self.detect_tau = detect_tau if subset_head else None
+        self.decode_kwargs = decode_kwargs if subset_head else None
 
         self.model = BeatThis(
             spect_dim=spect_dim,
@@ -245,7 +245,8 @@ class PLBeatThis(LightningModule):
         # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
             postp_beat, postp_downbeat = subset_decode(
-                batch, model_prediction, self.fps, detect_tau=self.detect_tau)
+                self.subset_criterion, batch, model_prediction, self.fps,
+                **self.decode_kwargs)
         else:
             postp_beat, postp_downbeat = self.postprocessor(
                 model_prediction["beat"],
@@ -298,7 +299,8 @@ class PLBeatThis(LightningModule):
         # JA: This block was added for AlignBeat
         if self.subset_criterion is not None:
             beats, downbeats = subset_predict_piece(
-                self.model, batch, chunk_size, self.fps, detect_tau=self.detect_tau)
+                self.model, self.subset_criterion, batch, chunk_size, self.fps,
+                **self.decode_kwargs)
             metrics = self._compute_metrics(batch, beats, downbeats, step="test")
             return metrics, None, batch["dataset"], batch["spect_path"]
 

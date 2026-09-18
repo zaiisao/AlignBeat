@@ -5,7 +5,7 @@ metric the paper reports. A single oracle only gives the ceiling, so instead han
 model one true quantity at a time and watch F climb. Each rung differs from the one
 above it by exactly one oracle, so the step between them is that stage's price:
 
-  real      decode_events_detect: the model picks its own events by threshold, then each
+  real      decode: the model picks its own events by threshold, then each
             candidate independently takes argmax over DB/B. What we ship.
   real+lat  the model's OWN detected events, with downbeats from the bar-constrained
             posterior instead of the per-candidate argmax. No ground truth of any kind
@@ -53,7 +53,7 @@ def load(ckpt_path, device):
     raw.setdefault("subset_head", head_type == "subset")
     if raw.get("subset_kwargs"):
         raw["subset_kwargs"] = {k: v for k, v in raw["subset_kwargs"].items()
-                                if k not in ("time_param", "decode", "tau", "stitch_border")}
+                                if k not in ("time_param", "tau", "stitch_border", "decode")}
     hp = {k: v for k, v in raw.items()
           if k in set(inspect.signature(PLBeatThis.__init__).parameters)}
     m = PLBeatThis(**hp)
@@ -101,7 +101,7 @@ def downbeat_call(model, class_logits, t_hat, target, sigma, meter=None):
 
 @torch.no_grad()
 def run(model, loader, device):
-    from alignbeat.inference.decode import decode_events_detect
+    from alignbeat.inference.decode import decode
     from alignbeat.integration.subset import subset_targets
     # Deferred: latent_meter imports load() from here, so a module-level import cycles.
     from launch_scripts.latent_meter import downbeat_mass
@@ -164,8 +164,9 @@ def run(model, loader, device):
                                        * window).cpu().numpy()
 
             # REAL: the model's own decode, its own events and its own classes
-            cls, times, _ = decode_events_detect(pred["class_logits"][i].float(),
-                                          pred["t_hat"][i].float(), model.subset_decode_kwargs["tau"])
+            cls, times, _ = decode(pred["class_logits"][i].float(),
+                                   pred["t_hat"][i].float(),
+                                   tau=model.decode_kwargs["detect_tau"])
             real_sec = (times * window).cpu().numpy()
             real_is_db = (cls == CLASS_DOWNBEAT).cpu().numpy()
 

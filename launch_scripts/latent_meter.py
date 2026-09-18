@@ -150,7 +150,7 @@ def main():
             ev_fn += int((~called & is_db).sum()); ev_tn += int((~called & ~is_db).sum())
             r_on_db += r[is_db].tolist(); r_on_b += r[~is_db].tolist()
 
-            # What decode_events does today: each matched candidate independently takes
+            # What decode does today: each matched candidate independently takes
             # argmax over DB/B, with no bar-phase constraint tying the events together.
             span = log_p[torch.from_numpy(m.sigma).to(device)]
             head = span[:, CLASS_DOWNBEAT] > span[:, CLASS_BEAT]
@@ -201,7 +201,7 @@ def main():
     print(f"     precision {prec:.1f}%   recall {rec:.1f}%   (tp {ev_tp} fp {ev_fp} fn {ev_fn})")
     hacc = 100 * (hd_tp + hd_tn) / max(ev, 1)
     hprec = 100 * hd_tp / max(hd_tp + hd_fp, 1); hrec = 100 * hd_tp / max(hd_tp + hd_fn, 1)
-    print(f"\n3  the head's own argmax on the same events -- what decode_events uses")
+    print(f"\n3  the head's own argmax on the same events -- what decode uses")
     print(f"     accuracy {hacc:.1f}%   precision {hprec:.1f}%   recall {hrec:.1f}%"
           f"   (tp {hd_tp} fp {hd_fp} fn {hd_fn})")
     print(f"     r_i - head: {acc - hacc:+.1f} pts")

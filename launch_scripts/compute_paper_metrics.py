@@ -37,7 +37,8 @@ def main(args):
         datamodule = datamodule_setup(checkpoint, args.num_workers, args.datasplit)
         # create model and trainer
         model, trainer = plmodel_setup(
-            checkpoint, args.eval_trim_beats, args.dbn, args.gpu
+            checkpoint, args.eval_trim_beats, args.dbn, args.gpu,
+            args.read_out
         )
         # predict
         metrics, dataset, preds, piece = compute_predictions(
@@ -83,7 +84,8 @@ def main(args):
             for checkpoint_path in args.models:
                 checkpoint = load_checkpoint(checkpoint_path)
                 model, trainer = plmodel_setup(
-                    checkpoint, args.eval_trim_beats, args.dbn, args.gpu
+                    checkpoint, args.eval_trim_beats, args.dbn, args.gpu,
+                    args.read_out
                 )
 
                 metrics, dataset, preds, piece = compute_predictions(
@@ -123,7 +125,8 @@ def main(args):
                 )
                 # create model and trainer
                 model, trainer = plmodel_setup(
-                    checkpoint, args.eval_trim_beats, args.dbn, args.gpu
+                    checkpoint, args.eval_trim_beats, args.dbn, args.gpu,
+                    args.read_out
                 )
                 # predict
                 metrics, dataset, preds, piece = compute_predictions(
@@ -197,7 +200,7 @@ def datamodule_setup(checkpoint, num_workers, datasplit):
     return datamodule
 
 
-def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu):
+def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu, read_out=None):
     """
     Set up the pytorch lightning model and trainer for evaluation.
 
@@ -223,10 +226,14 @@ def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu):
     hparams.setdefault("subset_head", head_type == "subset")
     # Knobs retired since these were trained: every checkpoint recorded the only
     # value that survived, so dropping them changes nothing.
-    RETIRED = {"time_param", "decode", "tau", "stitch_border"}
+    RETIRED = {"time_param", "tau", "stitch_border", "decode", "loss_event_term",
+               "refine_meter", "duration_conditioned"}
     if hparams.get("subset_kwargs"):
         hparams["subset_kwargs"] = {k: v for k, v in hparams["subset_kwargs"].items()
                                     if k not in RETIRED}
+        # Postdates every checkpoint, so it can only come from the command line.
+        if read_out is not None:
+            hparams["subset_kwargs"]["read_out"] = read_out
     model = PLBeatThis(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
     # set correct device and accelerator
@@ -315,6 +322,16 @@ if __name__ == "__main__":
         choices=("mean-std", "k-fold"),
         default="mean-std",
         help="Type of aggregation to use for multiple models; ignored if only one model is given",
+    )
+    parser.add_argument(
+        "--read-out",
+        type=str,
+        choices=("per_event", "map", "duration"),
+        default=None,
+        help="Which read-out to decode with, overriding the checkpoint: per_event is "
+        "each candidate's own argmax and what the paper's tables report, map is "
+        "Algorithm 5's joint mode over (omega, L), duration advances bar position by "
+        "the elapsed time (see alignbeat.inference.decode.decode)",
     )
     parser.add_argument(
         "--dump-piece-metrics",

@@ -368,10 +368,9 @@ if __name__ == "__main__":
                              "annotated. Deterministic in the piece name. Affects both "
                              "head types identically (default: %(default)s)")
     parser.add_argument("--detect_tau", type=float, default=0.5,
-                        help="Algorithm 3 line 5's own threshold on the event mass "
-                             "1 - p(empty), used by --decode metrical and detect. "
-                             "Separate from --tau, which gates decode_events' winning "
-                             "class probability instead (default: %(default)s)")
+                        help="Algorithm 5 line 3's own threshold on the event mass "
+                             "1 - p(empty), which decides which candidates are emitted "
+                             "as events at all (default: %(default)s)")
     parser.add_argument("--meter_candidates", type=str, default="2,3,4,5,6,8",
                         help="candidate meters M the beat-only E-step marginalises "
                              "over, e.g. 2,3,4,6; pi_M is the corpus table in "

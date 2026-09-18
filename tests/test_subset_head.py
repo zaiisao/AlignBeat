@@ -21,7 +21,7 @@ def prior_over(candidates):
     total = sum(METER_PRIOR[L] for L in candidates)
     return {L: METER_PRIOR[L] / total for L in candidates}
 
-from alignbeat.inference.decode import decode_events_detect, intervals_to_events, targets_to_events
+from alignbeat.inference.decode import decode, intervals_to_events, targets_to_events
 from alignbeat.training.dp import subset_select_dp, subset_select_logsumexp
 from alignbeat.model.head import SubsetSelectionHead, monotonic_times
 
@@ -309,7 +309,7 @@ def test_decode_no_duplicates_and_sorted():
     torch.manual_seed(3)
     logits = torch.randn(N, 3) * 3
     t_hat = monotonic_times(torch.randn(N))
-    classes, times, scores = decode_events_detect(logits, t_hat, 0.5)
+    classes, times, scores = decode(logits, t_hat, tau=0.5)
     assert torch.all(times[1:] > times[:-1]), "decoded times must be strictly increasing"
     assert torch.all(classes != CLASS_BACKGROUND)
     assert len(torch.unique(times)) == len(times), "no duplicate times possible"

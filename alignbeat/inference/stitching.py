@@ -1,8 +1,6 @@
 """Piece-level inference by stitching overlapping fragments (Section 9.3)."""
 import torch
 
-from alignbeat.inference.decode import decode_events_detect
-
 
 def fragment_offsets(total_frames, fragment_frames, border_frames):
     """Offsets o_1 = 0, o_2 = D - 2*beta, ... covering [0, total_frames)."""
@@ -39,9 +37,17 @@ def fragment_offsets(total_frames, fragment_frames, border_frames):
     return fragments
 
 
-def stitch_piece(mel, forward_fn, fragment_frames, border_frames, tau=0.5):
-    """Section 9.3 over one piece."""
-    total_frames, num_mels = mel.shape
+def _forward_fragments(mel, model, fragment_frames, border_frames):
+    """Run the model over the overlapping fragments covering one piece.
+
+    Section 9.3 leaves the border beta free but recommends tying it to the candidate
+    spacing D/N rather than to something outside the architecture: one cell is the
+    resolution at which this head can place an event at all.
+    """
+    if border_frames is None:
+        border_frames = round(fragment_frames / model.task_heads.num_candidates)
+
+    total_frames, _num_mels = mel.shape
     fragments = fragment_offsets(total_frames, fragment_frames, border_frames)
 
     batch = []
@@ -54,35 +60,42 @@ def stitch_piece(mel, forward_fn, fragment_frames, border_frames, tau=0.5):
                 fragment, (0, 0, 0, fragment_frames - fragment.shape[0]))
 
         batch.append(fragment)
-    batched_class_logits, batched_t_hat = forward_fn(torch.stack(batch))
 
-    all_classes, all_frames, all_scores = [], [], []
+    with torch.no_grad():
+        out = model(torch.stack(batch))
+
+    return fragments, out["class_logits"].float(), out["t_hat"].float()
+
+
+def stitch_candidates(mel, model, fragment_frames, border_frames=None):
+    """Every candidate the piece produces, trimmed to its owning fragment and ordered.
+
+    Candidates rather than decoded events, so a read-out needing the whole piece at once
+    -- a local tempo, a bar phase carried across fragment seams -- can run after the
+    stitching rather than inside it. Returns which fragment each candidate came from as
+    well, since Algorithm 5 requires a fragment and so has to be decoded within one.
+    """
+    fragments, batched_class_logits, batched_t_hat = _forward_fragments(
+        mel, model, fragment_frames, border_frames)
+    total_frames = mel.shape[0]
+
+    kept_logits, kept_frames, kept_fragment = [], [], []
     for index, (offset, keep_start, keep_end) in enumerate(fragments):
-        classes, times, scores = decode_events_detect(
-            batched_class_logits[index], batched_t_hat[index], tau)
+        absolute = offset + batched_t_hat[index] * fragment_frames
+        inside = _inside(absolute, keep_start, keep_end, total_frames)
+        kept_logits.append(batched_class_logits[index][inside])
+        kept_frames.append(absolute[inside])
+        kept_fragment.append(torch.full((int(inside.sum()),), index,
+                                        dtype=torch.long, device=mel.device))
 
-        if classes.numel() == 0:
-            continue
-
-        # t_hat is normalised to (0, 1] within the fragment -> absolute frames
-        absolute = offset + times * fragment_frames
-
-        is_last = keep_end == total_frames
-        upper_ok = (absolute <= keep_end) if is_last else (absolute < keep_end)
-        inside = (absolute >= keep_start) & upper_ok
-        if not bool(inside.any()):
-            continue
-        all_classes.append(classes[inside])
-        all_frames.append(absolute[inside])
-        all_scores.append(scores[inside])
-
-    if not all_frames:
-        empty_long = torch.zeros(0, dtype=torch.long, device=mel.device)
-        empty_float = torch.zeros(0, device=mel.device)
-        return empty_long, empty_float, empty_float
-
-    classes = torch.cat(all_classes)
-    frames = torch.cat(all_frames)
-    scores = torch.cat(all_scores)
+    frames = torch.cat(kept_frames)
     order = torch.argsort(frames)
-    return classes[order], frames[order], scores[order]
+    return (torch.cat(kept_logits)[order], frames[order],
+            torch.cat(kept_fragment)[order])
+
+
+def _inside(absolute, keep_start, keep_end, total_frames):
+    """The half-open interior seam: the final fragment owns its own last frame."""
+    is_last = keep_end == total_frames
+    upper_ok = (absolute <= keep_end) if is_last else (absolute < keep_end)
+    return (absolute >= keep_start) & upper_ok
