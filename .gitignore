@@ -135,3 +135,7 @@ beat_this.egg-info/
 
 # local-only working material (drafts, papers, notes); never pushed
 /private/
+
+# Session artifacts: training and scoring output, not source
+logs/
+cache/
