@@ -148,6 +148,38 @@
             "justMyCode": false
         },
         {
+            // Stepping through the decoder itself: loads one cached piece, no GPU and no
+            // Lightning, so a breakpoint in _elapsed_beats or _viterbi hits in a second.
+            // Edit PIECE in the script to pick a different one.
+            "name": "debug: decode_piece on one cached piece",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/debug_decode_piece.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            // The whole inference path on fold 0: stitching, the fragment seams, and
+            // subset_predict_piece. --read-out is the only way to reach anything but
+            // per_event, since no checkpoint records the setting.
+            "name": "score: fold 0, duration-conditioned decoding",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/launch_scripts/compute_paper_metrics.py",
+            "cwd": "${workspaceFolder}",
+            "env": {"PYTHONPATH": "${workspaceFolder}"},
+            "args": [
+                "--models", "/tmp/ours_ckpt/R_f0.ckpt",
+                "--datasplit", "val", "--aggregation-type", "k-fold",
+                "--read-out", "duration",
+                "--gpu", "0", "--num_workers", "0"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
             "name": "Python: Current File",
             "type": "debugpy",
             "request": "launch",
