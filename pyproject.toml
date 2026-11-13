@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alignbeat"
+version = "1.0.0"
+description = "AlignBeat: beat and downbeat tracking with latent order-preserving alignment, built on Beat This!"
+readme = "README.md"
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: Python :: 3",
+]
+authors = [
+    {name = "Jaehoon Ahn"},
+    {name = "Tae Gum Hwang"},
+    {name = "Moon-Ryul Jung"},
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.20",
+    "torch>=2",
+    "torchaudio",
+    "einops",
+    "rotary-embedding-torch",
+    "soxr",
+    "librosa",
+]
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+train = [
+    "pytorch-lightning",
+    "pandas",
+    "mir_eval",
+    "wandb",
+    "numba",
+]
+preprocess = [
+    "pedalboard",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+include = ["beat_this*", "alignbeat*"]
+
+[project.urls]
+Repository = "https://github.com/zaiisao/AlignBeat"
+Paper = "https://arxiv.org/abs/2510.14391v3"
+Upstream = "https://github.com/CPJKU/beat_this"
+
+[project.scripts]
+beat_this = "beat_this.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "integration: exercises pretrained inference or external backends",
+    "slow: may take substantially longer than the unit tests",
+]

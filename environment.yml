@@ -1,0 +1,20 @@
+# Lean environment for the training, evaluation, and preprocessing workflows.
+# Create it from the repository root with:
+#   conda env create -f environment.yml
+#   conda activate alignbeat
+#
+# The PyTorch build matches the tested Linux CUDA 11.8 environment. For CPU or
+# another CUDA build, install the matching torch and torchaudio wheels instead.
+name: alignbeat
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  # Audio decoding used by preprocessing and inference.
+  - ffmpeg
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.7.1+cu118
+      - torchaudio==2.7.1+cu118
+      - -e .[train,test,preprocess]

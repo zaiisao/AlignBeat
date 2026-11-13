@@ -1,0 +1,413 @@
+"""Correctness tests for the order-constrained subset selection head."""
+import itertools
+
+import numpy as np
+import torch
+
+from alignbeat.constants import F_MEASURE_TOLERANCE, CLASS_BACKGROUND, CLASS_BEAT, CLASS_DOWNBEAT
+from alignbeat.training.criterion import SubsetCriterion
+
+DATA_PRIOR = {"downbeat": 0.2853, "beat": 0.7147}   # fold-0 pi_data, measured
+WINDOW_SECONDS = 30.0   # 1500 frames at 50 fps, the training excerpt these fixtures assume
+
+def prior_over(candidates):
+    """pi_M restricted to `candidates` and renormalised -- what the datamodule's
+    get_train_meter_prior returns, built here from the corpus table so the tests do
+    not need a dataset."""
+    total = sum(METER_PRIOR[L] for L in candidates)
+    return {L: METER_PRIOR[L] / total for L in candidates}
+
+from alignbeat.inference.decode import decode, intervals_to_events, targets_to_events
+from alignbeat.training.dp import subset_select_dp, subset_select_logsumexp
+from alignbeat.model.head import SubsetSelectionHead, monotonic_times
+
+# Corpus meter distribution. A fixture only: the
+# model is trained on a per-fold prior measured by get_train_meter_prior, which
+# excludes the held-out pieces and so differs from this.
+METER_PRIOR = {2: 0.0447, 3: 0.0838, 4: 0.8612, 5: 0.0011, 6: 0.0068, 8: 0.0017}
+
+
+def brute_force_select(cost):
+    """Exhaustive minimisation over every order-preserving injection (equation 4)."""
+    M, N = cost.shape
+    best_cost, best_sigma = np.inf, None
+    for sigma in itertools.combinations(range(N), M):
+        total = sum(cost[i, sigma[i]] for i in range(M))
+        if total < best_cost:
+            best_cost, best_sigma = total, np.array(sigma, dtype=np.int64)
+    return best_cost, best_sigma
+
+
+def test_dp_matches_brute_force():
+    rng = np.random.default_rng(0)
+    for trial in range(300):
+        N = int(rng.integers(1, 10))
+        M = int(rng.integers(0, N + 1))
+        cost = rng.normal(size=(M, N))
+        sigma = subset_select_dp(cost)
+        assert len(sigma) == M
+        assert np.all(np.diff(sigma) > 0), "sigma must be strictly increasing"
+        assert np.all(sigma >= 0) and np.all(sigma < N)
+        dp_cost = sum(cost[i, sigma[i]] for i in range(M))
+        expected, _ = brute_force_select(cost)
+        assert np.isclose(dp_cost, expected), (
+            f"trial {trial}: DP {dp_cost} != brute force {expected}")
+    print("ok: DP == brute force over 300 random instances")
+
+
+def test_dp_prefers_obvious_diagonal():
+    """A cost matrix with a clear cheap diagonal must recover exactly that diagonal."""
+    N, M = 12, 4
+    cost = np.ones((M, N)) * 10.0
+    truth = [1, 4, 7, 10]
+    for i, j in enumerate(truth):
+        cost[i, j] = 0.0
+    assert list(subset_select_dp(cost)) == truth
+    print("ok: DP recovers a planted diagonal")
+
+
+def test_background_correction_is_selection_invariant_under_uniform_shift():
+    """Adding the same constant to every g_j must not change sigma."""
+    rng = np.random.default_rng(1)
+    M, N = 5, 14
+    base = rng.normal(size=(M, N))
+    g = rng.normal(size=N)
+    gamma = 0.5
+    a = subset_select_dp(base - gamma * g[None, :])
+    b = subset_select_dp(base - gamma * (g + 3.7)[None, :])
+    assert list(a) == list(b)
+    print("ok: corrected cost is invariant to a uniform background shift")
+
+
+def test_background_correction_actually_changes_selection():
+    """...but a non-uniform g must be able to change sigma, else it is a no-op."""
+    M, N = 1, 3
+    base = np.array([[1.0, 0.9, 1.0]])
+    without = subset_select_dp(base)
+    g = np.array([0.0, 0.0, 10.0])
+    with_correction = subset_select_dp(base - 0.5 * g[None, :])
+    assert list(without) == [1]
+    assert list(with_correction) == [2]
+    print("ok: the background correction can change the selection")
+
+
+def test_infeasible_raises():
+    try:
+        subset_select_dp(np.zeros((5, 4)))
+    except ValueError as exc:
+        assert "infeasible" in str(exc)
+        print("ok: M > N raises")
+        return
+    raise AssertionError("expected ValueError for M > N")
+
+
+def test_monotonicity_invariant():
+    """The bounded offset is strictly increasing for every r, at every scale."""
+    torch.manual_seed(0)
+    from alignbeat.model.head import MAX_OFFSET
+    N = 160
+    floor = (1.0 - 2.0 * MAX_OFFSET) / N            # the smallest gap any r can produce
+    for scale in (1e-3, 0.1, 1.0, 2.0, 20.0, 1000.0):
+        r = torch.randn(8, N) * scale
+        t = monotonic_times(r)
+        gaps = t[:, 1:] - t[:, :-1]
+        assert torch.all(gaps >= floor - 1e-6), (
+            f"gap below the architectural floor at scale {scale} (min {gaps.min():.3e})")
+        assert torch.all(t > 0) and torch.all(t < 1.0), "clocks live strictly inside (0, 1)"
+        assert torch.isfinite(t).all()
+
+    # r == 0 gives the cell-centre grid the head is initialised to
+    t0 = monotonic_times(torch.zeros(1, 8))
+    assert torch.allclose(t0[0], (torch.arange(8, dtype=torch.float32) + 0.5) / 8.0, atol=1e-6)
+
+    # each clock moves on its own r and reaches exactly +-MAX_OFFSET of a cell: a change
+    # to r_j moves t_hat_j and nothing else
+    r = torch.zeros(1, 8); r[0, 3] = 50.0
+    t = monotonic_times(r)
+    assert abs(float(t[0, 3] - t0[0, 3]) - MAX_OFFSET / 8.0) < 1e-6
+    assert torch.allclose(t[0, [0, 1, 2, 4, 5, 6, 7]], t0[0, [0, 1, 2, 4, 5, 6, 7]])
+    print("ok: bounded offset is strictly increasing at every scale, local, and centred at r=0")
+
+
+def test_logsumexp_dp_bounds_the_min():
+    """log Z >= -min_cost: the marginalised objective must upper-bound the single best"""
+    rng = np.random.default_rng(2)
+    for _ in range(20):
+        N = int(rng.integers(2, 8))
+        M = int(rng.integers(1, N + 1))
+        cost = rng.normal(size=(M, N))
+        sigma = subset_select_dp(cost)
+        best = sum(cost[i, sigma[i]] for i in range(M))
+        log_z = float(subset_select_logsumexp(torch.tensor(cost)))
+        assert log_z >= -best - 1e-6, f"log Z {log_z} < -min cost {-best}"
+        # and it must equal brute-force logsumexp exactly
+        totals = [sum(cost[i, s[i]] for i in range(M))
+                  for s in itertools.combinations(range(N), M)]
+        expected = float(torch.logsumexp(-torch.tensor(totals), dim=0))
+        assert np.isclose(log_z, expected, atol=1e-6), f"{log_z} != {expected}"
+    print("ok: logsumexp DP == brute-force marginal")
+
+
+def test_targets_to_events_class_exclusivity():
+    """Every downbeat is set in both channels by the dataloader; downbeat must win."""
+    T = 100
+    target = torch.zeros(2, T)
+    beats = [10, 20, 30, 40]
+    downbeats = [10, 30]
+    target[0, beats] = 1
+    target[1, downbeats] = 1
+    events = targets_to_events(target)
+    assert list(events['classes']) == [CLASS_DOWNBEAT, CLASS_BEAT, CLASS_DOWNBEAT, CLASS_BEAT]
+    assert torch.allclose(events['times'], torch.tensor([0.10, 0.20, 0.30, 0.40]))
+    assert torch.all(events['times'][1:] > events['times'][:-1]), "times must be sorted"
+    empty = targets_to_events(torch.zeros(2, T))
+    assert empty['classes'].numel() == 0
+    print("ok: target conversion is exclusive, sorted and normalised")
+
+
+def test_intervals_to_events_is_the_real_data_path():
+    """The real data path is make_intervals() output, not the frame grid."""
+    T = 1280
+    # downbeats at 100/200/300, beats at 100/140/180/220 (every downbeat is a beat too)
+    rows = [[100., 200., 0.], [200., 300., 0.],
+            [100., 140., 1.], [140., 180., 1.], [180., 220., 1.]]
+    annot = torch.ones(1, 8, 3) * -1
+    annot[0, :len(rows)] = torch.tensor(rows)
+
+    events = intervals_to_events(annot, T)[0]
+    assert list(events['classes']) == [CLASS_DOWNBEAT, CLASS_BEAT, CLASS_BEAT, CLASS_DOWNBEAT, CLASS_BEAT, CLASS_DOWNBEAT], (
+        "downbeat must win where a frame is both; the final interval END must appear")
+    expected = torch.tensor([100., 140., 180., 200., 220., 300.]) / T
+    assert torch.allclose(events['times'], expected)
+    assert torch.all(events['times'][1:] > events['times'][:-1])
+
+    # fully padded fragment -> no events, not a crash
+    empty = intervals_to_events(torch.ones(1, 4, 3) * -1, T)[0]
+    assert empty['classes'].numel() == 0 and empty['times'].numel() == 0
+
+    # batch form returns one dict per fragment
+    batch = intervals_to_events(torch.cat([annot, torch.ones(1, 8, 3) * -1]), T)
+    assert len(batch) == 2 and batch[0]['classes'].numel() == 6 and batch[1]['classes'].numel() == 0
+    print("ok: interval annotations round-trip to events, endpoints preserved")
+
+
+def test_intervals_to_events_matches_grid_conversion():
+    """The interval path and the grid path must agree on the same underlying data."""
+    T = 400
+    beat_frames = list(range(20, 380, 17))
+    downbeat_frames = beat_frames[::4]
+    grid = torch.zeros(2, T)
+    grid[0, beat_frames] = 1
+    grid[1, downbeat_frames] = 1
+
+    rows = [[float(a), float(b), 0.] for a, b in zip(downbeat_frames, downbeat_frames[1:])]
+    rows += [[float(a), float(b), 1.] for a, b in zip(beat_frames, beat_frames[1:])]
+    annot = torch.tensor(rows).unsqueeze(0)
+
+    from_grid = targets_to_events(grid, num_frames=T)
+    from_intervals = intervals_to_events(annot, T)[0]
+    assert torch.equal(from_grid['classes'], from_intervals['classes'])
+    assert torch.allclose(from_grid['times'], from_intervals['times'])
+    print("ok: interval and grid conversions agree")
+
+
+def test_criterion_rewards_a_perfect_prediction():
+    """A perfect prediction drives every loss term to its floor."""
+    torch.manual_seed(0)
+    N = 32
+    # times chosen to land exactly on the uniform candidate grid t_hat[k] = (k+1)/N,
+    # so a perfect prediction really does have zero residual
+    times = torch.tensor([4.0, 8.0, 12.0, 16.0]) / N
+    classes = torch.tensor([CLASS_DOWNBEAT, CLASS_BEAT, CLASS_BEAT, CLASS_BEAT])
+    targets = [{'classes': classes, 'times': times}]
+
+    criterion = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS, gamma=0.5)
+
+    # Perfect: uniform grid t_hat = j/N puts candidates exactly on 0.1/0.2/0.3/0.4
+    # (indices 2, 5, 8, 11 with N=32 -> 3/32... so instead force r to place them).
+    t_hat = torch.linspace(1.0 / N, 1.0, N).unsqueeze(0)
+    matched = [int(round(float(t) * N)) - 1 for t in times]
+    logits = torch.full((1, N, 3), -6.0)
+    logits[0, :, CLASS_BACKGROUND] = 6.0
+    for slot, cls in zip(matched, classes):
+        logits[0, slot, CLASS_BACKGROUND] = -6.0
+        logits[0, slot, int(cls)] = 6.0
+
+    good, good_stats = criterion(logits, t_hat, targets)
+    bad, _ = criterion(torch.zeros(1, N, 3), t_hat, targets)
+    good_loss, bad_loss = float(good['total']), float(bad['total'])
+    assert good_loss < bad_loss, (good_loss, bad_loss)
+    assert torch.allclose(good['total'], good['class'] + good['time'] + good['background'])
+    assert good_stats['residual_mean'] < 1e-3
+    assert good_stats['infeasible'] == 0
+    print(f"ok: perfect={good_loss:.4f} < uniform={bad_loss:.4f}, components sum to total")
+
+
+def test_criterion_handles_empty_and_infeasible_fragments():
+    N = 16
+    logits = torch.zeros(2, N, 3)
+    t_hat = torch.linspace(1.0 / N, 1.0, N).unsqueeze(0).repeat(2, 1)
+    targets = [
+        {'classes': torch.zeros(0, dtype=torch.long), 'times': torch.zeros(0)},
+        {'classes': torch.full((N + 5,), CLASS_BEAT, dtype=torch.long),
+         'times': torch.linspace(0, 1, N + 5)},
+    ]
+    criterion = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS)
+    losses, stats = criterion(logits, t_hat, targets)
+    assert torch.isfinite(losses['total'])
+    assert stats['infeasible'] == 1
+    print("ok: empty and over-dense fragments do not crash")
+
+
+def test_criterion_gradients_flow_only_where_expected():
+    """sigma is detached, so gradient must reach the class logits of every candidate"""
+    N = 16
+    torch.manual_seed(0)
+    r = torch.randn(1, N, requires_grad=True)
+    logits = torch.randn(1, N, 3, requires_grad=True)
+    t_hat = monotonic_times(r)
+    targets = [{'classes': torch.tensor([CLASS_BEAT, CLASS_DOWNBEAT]),
+                'times': torch.tensor([0.25, 0.75])}]
+    losses, _ = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS)(logits, t_hat, targets)
+    losses['total'].backward()
+    assert logits.grad is not None and torch.any(logits.grad != 0)
+    assert r.grad is not None and torch.any(r.grad != 0)
+    assert torch.isfinite(logits.grad).all() and torch.isfinite(r.grad).all()
+    print("ok: gradients flow and are finite")
+
+
+def test_head_shapes_and_monotonicity_end_to_end():
+    head = SubsetSelectionHead(feature_size=32)
+    logits, t_hat = head(torch.randn(2, 32, 160))
+    assert logits.shape == (2, 160, 3)
+    assert t_hat.shape == (2, 160)
+    assert torch.all(t_hat[:, 1:] > t_hat[:, :-1])
+    # at initialization the regression head is zeroed -> uniform candidate grid
+    assert torch.allclose(t_hat[0], (torch.arange(160, dtype=torch.float32) + 0.5) / 160.0, atol=1e-5)
+    print("ok: head shapes correct, uniform grid at init")
+
+
+def test_downsample_reaches_n_exactly():
+    """Whatever the window length, the downsample must emit exactly N candidates."""
+    from alignbeat.model.downsample import Downsample
+    for mode in ("learned", "avg", "max"):
+        for T in (1440, 1281, 160):
+            # One N: the tokens the downsample emits are the candidates the head
+            # reads, and every mode must agree on how many that is.
+            z = Downsample(8, 160, mode, fragment_frames=T)(torch.randn(1, T, 8))
+            assert z.shape == (1, 160, 8), f"{mode} at T={T} gave {tuple(z.shape)}"
+    print("ok: every downsample mode emits exactly N candidates")
+
+
+
+def test_decode_no_duplicates_and_sorted():
+    N = 64
+    torch.manual_seed(3)
+    logits = torch.randn(N, 3) * 3
+    t_hat = monotonic_times(torch.randn(N))
+    classes, times, scores = decode(logits, t_hat, tau=0.5)
+    assert torch.all(times[1:] > times[:-1]), "decoded times must be strictly increasing"
+    assert torch.all(classes != CLASS_BACKGROUND)
+    assert len(torch.unique(times)) == len(times), "no duplicate times possible"
+    print(f"ok: decode gives {len(times)} strictly ordered, unique detections")
+
+
+# --------------------------------------------------------------------------------
+# Section 7.1: beat-only datasets (SMC), where the B/DB distinction is not annotated
+# --------------------------------------------------------------------------------
+
+def test_beat_only_events_pay_active_event_mass_cost():
+    """A beat-only event pays the negative log probability of either active class,
+    while a labelled event pays its own class NLL."""
+    from alignbeat.constants import CLASS_UNKNOWN
+    N = 8
+    log_p = torch.log(torch.tensor([[0.25, 0.6, 0.15]]).repeat(N, 1))
+    t_hat = torch.linspace(0.0, 1.0, N)
+    crit = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS)
+
+    gt_t = t_hat[:1].clone()
+    unknown = crit.build_l_match(log_p, t_hat, torch.tensor([CLASS_UNKNOWN]), gt_t)
+    time_only = crit.lambda_l1 * (t_hat[None, :] - gt_t[:, None]).abs()
+    active_mass_cost = -torch.logsumexp(log_p[:, [CLASS_DOWNBEAT, CLASS_BEAT]], dim=-1)
+    assert torch.allclose(unknown, time_only + active_mass_cost[None, :], atol=1e-6)
+
+    without_event_cost = SubsetCriterion(
+        DATA_PRIOR, WINDOW_SECONDS, match_event_cost=False)
+    unknown_without_cost = without_event_cost.build_l_match(
+        log_p, t_hat, torch.tensor([CLASS_UNKNOWN]), gt_t)
+    assert torch.allclose(unknown_without_cost, time_only, atol=1e-6)
+
+    known = crit.build_l_match(log_p, t_hat, torch.tensor([CLASS_DOWNBEAT]), gt_t)
+    assert np.isclose(float((known - time_only)[0, 0]), -np.log(0.25), atol=1e-5)
+    print("ok: beat-only matching pays active event mass; labelled events pay class NLL")
+
+
+def test_beat_only_cost_is_invariant_to_b_db_split():
+    """The matching cost for an unlabelled event stays phase- and meter-blind, as line
+    14 requires: nothing about how the head splits its mass between B and DB can move
+    it."""
+    from alignbeat.constants import CLASS_UNKNOWN
+    crit = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS)
+    t_hat, gt_t = torch.tensor([0.5]), torch.tensor([0.5])
+    unknown = torch.tensor([CLASS_UNKNOWN])
+    a = torch.log(torch.tensor([[0.10, 0.75, 0.15]]))
+    b = torch.log(torch.tensor([[0.75, 0.10, 0.15]]))
+    ca = crit.build_l_match(a, t_hat, unknown, gt_t)
+    cb = crit.build_l_match(b, t_hat, unknown, gt_t)
+    assert np.isclose(float(ca), float(cb), atol=1e-6)
+    print("ok: the unlabelled cost is invariant to how active mass splits")
+
+
+def test_beat_only_end_to_end_trains_without_crashing():
+    from alignbeat.constants import CLASS_UNKNOWN
+    N = 32
+    torch.manual_seed(0)
+    logits = torch.randn(1, N, 3, requires_grad=True)
+    r = torch.randn(1, N, requires_grad=True)
+    targets = [{'classes': torch.full((6,), CLASS_UNKNOWN, dtype=torch.long),
+                'times': torch.linspace(0.1, 0.9, 6)}]
+    # Beat-only fragments impute their class from the meter posterior (section 8.7),
+    # so the candidate set is part of the contract, as the CLI default supplies.
+    crit = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS, meter_prior=prior_over((2, 3, 4, 5, 6, 8)))
+    t_hat_r = monotonic_times(r)
+    losses, stats = crit(logits, t_hat_r, targets)
+    losses['total'].backward()
+    assert torch.isfinite(losses['total'])
+    assert stats['unlabelled_events'] == 6
+    assert torch.isfinite(logits.grad).all() and torch.any(logits.grad != 0)
+    print(f"ok: beat-only fragment trains end-to-end, {stats['unlabelled_events']} unlabelled events")
+
+
+def test_log_prob_floor_keeps_dp_cost_finite():
+    """A confident model underflows p(background) to 0; the section 7.2 correction then"""
+    N = 16
+    logits = torch.zeros(1, N, 3)
+    logits[0, :, CLASS_BEAT] = 400.0          # p(background) underflows to exactly 0
+    logits[0, :, CLASS_BACKGROUND] = -400.0
+    t_hat = monotonic_times(torch.zeros(1, N))
+    targets = [{'classes': torch.tensor([CLASS_BEAT, CLASS_BEAT]), 'times': torch.tensor([0.25, 0.75])}]
+    losses, stats = SubsetCriterion(DATA_PRIOR, WINDOW_SECONDS)(logits, t_hat, targets)
+    assert torch.isfinite(losses['total']), "clamping must keep the loss finite"
+    assert stats['infeasible'] == 0, "must not lose the batch"
+    print("ok: extreme logits no longer produce a non-finite DP cost")
+
+
+
+def test_monotonic_times_survives_overflow_scale_r():
+    """Bounded offset stays finite and ordered at overflow-scale r, of either sign."""
+    from alignbeat.model.head import MAX_OFFSET
+    N = 160
+    centre = (torch.arange(N, dtype=torch.float32) + 0.5) / N
+    for value in (1e30, -1e30):
+        t = monotonic_times(torch.full((1, N), value))
+        assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
+        # tanh saturates: every clock sits at its centre +- exactly MAX_OFFSET of a cell
+        assert torch.allclose(t[0], centre + (1.0 if value > 0 else -1.0) * MAX_OFFSET / N, atol=1e-6)
+
+    # A lone spike moves one clock to its bound and leaves every other clock in place;
+    # there is no normaliser for it to crowd the rest through.
+    mixed = torch.zeros(1, N); mixed[0, 0] = 1e30
+    t = monotonic_times(mixed)
+    assert torch.isfinite(t).all() and torch.all(t[:, 1:] > t[:, :-1])
+    assert torch.allclose(t[0, 1:], centre[1:], atol=1e-6)
+    print("ok: bounded offset is ordered and finite at overflow-scale r of either sign")
